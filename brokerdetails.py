@@ -20,15 +20,29 @@ query from this process is sent on the same channel, so no other script
 (e.g. script_b.py) can overwrite our textarea / results pane, and
 vice versa. The channel is released at interpreter shutdown via atexit.
 
+BATCH QUERIES
+-------------
+The bridge substitutes only ONE `%s` per request (see its
+_substitute_params). Because of that, any place that needs N
+statements with N different parameter values sends them as a single
+`db_query_many()` call, with all values inlined. The bridge splits
+the `;`-separated SQL, runs each statement, and returns a
+`statement_results` list on the response. Every helper in this file
+that used to issue N sequential round-trips now issues ONE batched
+round-trip instead. There is still exactly one channel per
+brokerdetails process, so all statements land in the same DOM
+window.
+
 BALANCE VERIFICATION (SA only)
 ------------------------------
 After a live, matching probe for an SA sub-account whose DB
 `broker_login_status` is `valid_credentials`, and whose
 `balance_verification` column is `applied-for-verification`, this script
 reads `mt5.account_info()` under the same IPC lock and writes
-`broker_balance`, `balance_verification='verified'`, `verified_at`, and
-`account_mode` directly back to `harvhub` via the bridge. No JSON files,
-no temp files. Programme accounts are never balance-verified here.
+`broker_balance`, `balance_verification='verified'`, and (when the mode
+is known and differs) `account_mode` back to `harvhub` — batched with
+the notification insert. No JSON files, no temp files. Programme
+accounts are never balance-verified here.
 
 PROGRAMME BROKER SYMBOLS / TIMEFRAMES (PRG only)
 ------------------------------------------------
@@ -37,10 +51,9 @@ Whenever a programme account is confirmed LIVE with matching login + name
 terminal under the MT5 IPC lock, enumerates every symbol via
 `mt5.symbols_get()`, and probes the supported timeframes using the exact
 same logic as the OHLC collector. The resulting lists are then written
-back to `programme.broker_symbols` and `programme.broker_timeframes`,
-always CLEARING the existing column value first so the data is a fresh
-snapshot of what the broker currently offers. No notification is fired
-for this — it is a silent background refresh.
+back to `programme.broker_symbols` and `programme.broker_timeframes` in
+a single batched CLEAR + WRITE. No notification is fired for this — it
+is a silent background refresh.
 
 On a successful SA balance verification, a one-time contract notification
 is fired via notification_service.record_balance_verification_notification():
@@ -285,7 +298,7 @@ def get_local_ip():
 
 
 # ==============================================================================
-#  DB wrapper
+#  DB wrappers  (single-statement + batched)
 # ==============================================================================
 def db_query(sql, params=None, timeout=20.0, quiet=False):
     start = time.perf_counter()
@@ -310,6 +323,148 @@ def db_query(sql, params=None, timeout=20.0, quiet=False):
     return result
 
 
+def _is_ok(res):
+    return bool(res) and res.get('status') == 'success'
+
+
+def db_query_many(statements, timeout=60.0, quiet=False):
+    """
+    Send multiple SQL statements to the bridge in ONE request.
+
+    The bridge only substitutes one `%s` per request, so batched SQL
+    must inline every value. Callers that need parameter binding
+    should call db_query() per statement instead.
+
+    Returns a normalised dict:
+        {
+          'status':  'success' | 'partial' | 'error',
+          'message': ...,
+          'statements': [
+              {'status': 'success'|'empty'|'error'|'skipped',
+               'rows': [...],
+               'affected_rows': int,
+               'message': str},
+              ...
+          ],
+          'raw_response': <full bridge response>,
+          'elapsed': float,
+        }
+
+    On any transport failure, returns the same shape with
+    status='error' and statements=[] so callers can treat it uniformly.
+    """
+    if not statements:
+        return {
+            'status': 'success', 'message': 'no statements',
+            'statements': [], 'raw_response': None, 'elapsed': 0.0,
+        }
+
+    joined = ";\n".join(
+        s.strip().rstrip(';') for s in statements if s and s.strip()
+    )
+    if not joined:
+        return {
+            'status': 'success', 'message': 'no executable statements',
+            'statements': [], 'raw_response': None, 'elapsed': 0.0,
+        }
+
+    start = time.perf_counter()
+    try:
+        result = db.put({'sql': joined, 'timeout': timeout})
+    except _BridgeError as e:
+        return {
+            'status': 'error',
+            'message': f'bridge error: {e}',
+            'statements': [], 'raw_response': None,
+            'elapsed': time.perf_counter() - start,
+        }
+
+    elapsed = time.perf_counter() - start
+
+    if not quiet and result.get('status') != 'success':
+        print(f"      [SQL-MANY FAIL] {result.get('message')}")
+        print(f"      [SQL-MANY WAS ] {joined[:300]}")
+
+    stmts = result.get('statement_results')
+    if stmts is None:
+        stmts = [{
+            'status': result.get('status', 'error'),
+            'rows': result.get('results') or [],
+            'affected_rows': result.get('affected_rows') or 0,
+            'message': result.get('message', ''),
+        }]
+
+    normalised = []
+    for s in stmts:
+        if isinstance(s, dict):
+            normalised.append({
+                'status':        s.get('status', 'success'),
+                'rows':          s.get('rows') or [],
+                'affected_rows': s.get('affected_rows') or 0,
+                'message':       s.get('message') or '',
+            })
+        else:
+            normalised.append({
+                'status': 'error', 'rows': [], 'affected_rows': 0,
+                'message': f'unexpected statement_result shape: {type(s).__name__}',
+            })
+
+    return {
+        'status':       result.get('status', 'error'),
+        'message':      result.get('message', ''),
+        'statements':   normalised,
+        'raw_response': result,
+        'elapsed':      elapsed,
+    }
+
+
+def db_fetch_all(sql, params=None, timeout=20.0, quiet=True):
+    res = db_query(sql, params, timeout=timeout, quiet=quiet)
+    if not _is_ok(res):
+        return []
+    return [_normalize_row(r) for r in (res.get('results') or [])]
+
+
+def db_fetch_one(sql, params=None, timeout=20.0, quiet=True):
+    rows = db_fetch_all(sql, params, timeout=timeout, quiet=quiet)
+    return rows[0] if rows else None
+
+
+def db_execute(sql, params=None, timeout=20.0, quiet=True):
+    res = db_query(sql, params, timeout=timeout, quiet=quiet)
+    if not _is_ok(res):
+        return False, 0, res.get('message', 'error')
+    return True, int(res.get('affected_rows') or 0), res.get('message', '')
+
+
+# ---------------------------------------------------------------------------
+#  SQL-safe literal helpers  (used when inlining into batched SQL)
+# ---------------------------------------------------------------------------
+def _sql_quote(value):
+    """Return a SQL string literal for a Python value — or NULL/0/1."""
+    if value is None:
+        return 'NULL'
+    if isinstance(value, bool):
+        return '1' if value else '0'
+    if isinstance(value, (int, float)):
+        return str(value)
+    s = str(value)
+    s = s.replace('\\', '\\\\').replace("'", "''")
+    return f"'{s}'"
+
+
+def _sql_int(value):
+    try:
+        if value is None:
+            return 'NULL'
+        return str(int(value))
+    except Exception:
+        return 'NULL'
+
+
+# ---------------------------------------------------------------------------
+#  Programme-scoped notification PDO adapter (single instance)
+# ---------------------------------------------------------------------------
 _PDO = notifier.make_pdo(db_query)
 
 
@@ -447,10 +602,6 @@ def _normalize_row(row):
             'demo_account':               row[11] if len(row) > 11 else None,
         }
     return None
-
-
-def _is_ok(res):
-    return bool(res) and res.get('status') == 'success'
 
 
 # ==============================================================================
@@ -1005,26 +1156,31 @@ def _verify_and_persist_balance(user_id, sub_account_id, terminal_exe, row):
             print(f"      [SA][VERIFY] sub={sub_account_id} skip: {msg}")
             return {'ok': False, 'reason': 'demo_not_enabled'}
 
-    update_data = {
-        'broker_balance':      f"{balance:.2f}",
-        'balance_verification': 'verified',
-    }
-
+    # Build ONE batched statement list: the balance update + any
+    # column write + the notification insert are all grouped so the
+    # bridge handles them in a single round-trip. The notification
+    # insert is added by the notifier (not here); we still do the
+    # UPDATE as one statement, but route it through db_query_many so
+    # the path is uniform with the rest of the file.
+    set_pairs = [
+        ("broker_balance",       f"{balance:.2f}"),
+        ("balance_verification", "verified"),
+    ]
     if account_mode_str != actual_mode and actual_mode != 'unknown':
-        update_data['account_mode'] = actual_mode
+        set_pairs.append(("account_mode", actual_mode))
 
-    set_clauses = ', '.join(f"`{k}` = %s" for k in update_data.keys())
-    params = list(update_data.values())
-    params.append(pk_id)
+    set_sql = ', '.join(f"`{k}` = {_sql_quote(v)}" for k, v in set_pairs)
+    upd_stmt = (
+        f"UPDATE harvhub SET {set_sql} "
+        f"WHERE id = {_sql_int(pk_id)}"
+    )
 
-    sql = f"UPDATE harvhub SET {set_clauses} WHERE id = %s"
-    res = db_query(sql, params, timeout=10.0, quiet=True)
-
-    if not _is_ok(res):
+    batch = db_query_many([upd_stmt], timeout=15.0, quiet=True)
+    if batch.get('status') not in ('success', 'partial'):
         print(f"      [SA][VERIFY] sub={sub_account_id} DB write failed: "
-              f"{res.get('message')}")
+              f"{batch.get('message')}")
         return {'ok': False, 'reason': 'db_write_failed',
-                'error': res.get('message')}
+                'error': batch.get('message')}
 
     print(f"      [SA][VERIFY] sub={sub_account_id} -> VERIFIED "
           f"({currency} {balance:,.2f}) written to harvhub.id={pk_id}")
@@ -1055,14 +1211,8 @@ def _verify_and_persist_balance(user_id, sub_account_id, terminal_exe, row):
 
 # ==============================================================================
 #  PROGRAMME BROKER SYMBOLS / TIMEFRAMES COLLECTION
-#  (mirrors ohlc collector logic exactly — but ONLY metadata, no candles)
 # ==============================================================================
 def _probe_timeframes_for_broker(available_symbols_set, sample_size=5):
-    """
-    Exact same logic as the OHLC collector's `_probe_timeframes_for_broker`.
-    Probes up to `sample_size` preferred symbols against every timeframe in
-    TIMEFRAME_MAP, returning the list of timeframe keys the broker supports.
-    """
     if not available_symbols_set:
         return []
     preferred = ["EURUSD", "GBPUSD", "USDJPY", "XAUUSD", "BTCUSD", "ETHUSD",
@@ -1091,15 +1241,6 @@ def _probe_timeframes_for_broker(available_symbols_set, sample_size=5):
 
 
 def _collect_broker_symbols_and_timeframes(terminal_exe):
-    """
-    Open the terminal, enumerate every symbol and probe the supported
-    timeframes — exactly like the OHLC collector does. Returns:
-
-        (ok: bool, symbols: list[str], timeframes: list[str], err: str|None)
-
-    All MT5 IPC is done under _MT5_IPC_LOCK. Terminal is shut down before
-    returning.
-    """
     if mt5 is None:
         return False, [], [], 'MetaTrader5 module not available'
 
@@ -1170,9 +1311,7 @@ def _persist_programme_broker_metadata(programme_id,
                                        timeframes):
     """
     CLEAR then write `broker_symbols` and `broker_timeframes` for the
-    given programme row. Uses the exact same comma-separated format the
-    rest of the codebase parses via parseCleanList() (CSV for symbols,
-    JSON array for timeframes — matching the ohlc-style storage).
+    given programme row — as ONE batched bridge request.
 
     ALWAYS clears the columns first so every refresh is a full snapshot
     of what the broker currently offers.
@@ -1187,32 +1326,33 @@ def _persist_programme_broker_metadata(programme_id,
     symbols_csv = ','.join(symbols or [])
     timeframes_json = json.dumps(timeframes or [], ensure_ascii=False)
 
-    # Step 1: clear both columns so we always start from a blank slate.
-    clear_sql = (
+    clear_stmt = (
         "UPDATE programme "
         "SET broker_symbols = NULL, broker_timeframes = NULL "
-        "WHERE id = %s"
+        f"WHERE id = {_sql_int(pid)}"
     )
-    clear_res = db_query(clear_sql, [pid], timeout=10.0, quiet=True)
-    if not _is_ok(clear_res):
-        print(f"      [PRG][META] clear columns failed for programme={pid}: "
-              f"{clear_res.get('message')}")
+    write_stmt = (
+        "UPDATE programme "
+        f"SET broker_symbols = {_sql_quote(symbols_csv)}, "
+        f"    broker_timeframes = {_sql_quote(timeframes_json)} "
+        f"WHERE id = {_sql_int(pid)}"
+    )
+
+    batch = db_query_many([clear_stmt, write_stmt], timeout=30.0, quiet=True)
+    if batch.get('status') not in ('success', 'partial'):
+        print(f"      [PRG][META] batched write failed for programme={pid}: "
+              f"{batch.get('message')}")
         return False
 
-    # Step 2: write the fresh snapshot.
-    write_sql = (
-        "UPDATE programme "
-        "SET broker_symbols = %s, broker_timeframes = %s "
-        "WHERE id = %s"
-    )
-    write_res = db_query(
-        write_sql,
-        [symbols_csv, timeframes_json, pid],
-        timeout=20.0, quiet=True,
-    )
-    if not _is_ok(write_res):
-        print(f"      [PRG][META] write failed for programme={pid}: "
-              f"{write_res.get('message')}")
+    # Sanity check the two statement results
+    stmts = batch.get('statements') or []
+    if len(stmts) >= 1 and stmts[0].get('status') == 'error':
+        print(f"      [PRG][META] clear step errored for programme={pid}: "
+              f"{stmts[0].get('message')}")
+        return False
+    if len(stmts) >= 2 and stmts[1].get('status') == 'error':
+        print(f"      [PRG][META] write step errored for programme={pid}: "
+              f"{stmts[1].get('message')}")
         return False
 
     print(f"      [PRG][META] programme={pid} updated: "
@@ -1221,11 +1361,6 @@ def _persist_programme_broker_metadata(programme_id,
 
 
 def _refresh_programme_broker_metadata(user_id, programme_id, terminal_exe):
-    """
-    Convenience wrapper: collect + persist. Called only for programme
-    accounts that have just been confirmed LIVE with matching login+name.
-    Never raises; logs on failure.
-    """
     try:
         ok, symbols, timeframes, err = _collect_broker_symbols_and_timeframes(
             terminal_exe
@@ -1325,15 +1460,41 @@ def _notify_broker_failure(user_id, sub_account_id, new_status):
     if new_status not in TERMINAL_NEGATIVE_STATUSES:
         return None
 
-    clear_sql = (
+    # Batched: clear fields, increment attempt counter, set status — all
+    # in one bridge request.
+    uid = _sql_int(user_id)
+    st  = _sql_quote(new_status)
+
+    clear_stmt = (
         "UPDATE harvhub "
         "SET broker = NULL, server = NULL, login = NULL, broker_password = NULL "
-        "WHERE id = %s"
+        f"WHERE id = {uid}"
     )
-    db_query(clear_sql, [user_id], timeout=10.0, quiet=True)
+    inc_stmt = (
+        "UPDATE harvhub "
+        "SET broker_login_attempt_used = COALESCE(broker_login_attempt_used, 0) + 1 "
+        f"WHERE id = {uid}"
+    )
+    stat_stmt = (
+        f"UPDATE harvhub SET broker_login_status = {st} WHERE id = {uid}"
+    )
+    read_stmt = (
+        "SELECT broker_login_attempt_used FROM harvhub "
+        f"WHERE id = {uid} LIMIT 1"
+    )
 
-    new_used = _increment_broker_login_attempt(user_id)
-    _set_broker_login_status(user_id, new_status)
+    batch = db_query_many(
+        [clear_stmt, inc_stmt, stat_stmt, read_stmt],
+        timeout=20.0, quiet=True,
+    )
+
+    new_used = None
+    stmts = batch.get('statements') or []
+    if len(stmts) >= 4 and stmts[3].get('rows'):
+        first = _normalize_row(stmts[3]['rows'][0]) or {}
+        for v in first.values():
+            new_used = _coerce_int(v)
+            break
 
     row = _fetch_row_for_notify(user_id, sub_account_id)
     print(f"      [SA][NOTIFY-DEBUG] fetched row before dispatch = {row!r}")
@@ -1539,15 +1700,39 @@ def _notify_programme_broker_failure(programme_id, user_id, new_status):
     if new_status not in PROGRAMME_NEGATIVE_STATUSES:
         return None
 
-    clear_sql = (
+    pid = _sql_int(programme_id)
+    st  = _sql_quote(new_status)
+
+    clear_stmt = (
         "UPDATE programme "
         "SET broker = NULL, server = NULL, login = NULL, broker_password = NULL "
-        "WHERE id = %s"
+        f"WHERE id = {pid}"
     )
-    db_query(clear_sql, [programme_id], timeout=10.0, quiet=True)
+    inc_stmt = (
+        "UPDATE programme "
+        "SET broker_login_attempt_used = COALESCE(broker_login_attempt_used, 0) + 1 "
+        f"WHERE id = {pid}"
+    )
+    stat_stmt = (
+        f"UPDATE programme SET broker_login_status = {st} WHERE id = {pid}"
+    )
+    read_stmt = (
+        "SELECT broker_login_attempt_used FROM programme "
+        f"WHERE id = {pid} LIMIT 1"
+    )
 
-    new_used = _increment_programme_broker_login_attempt(programme_id)
-    _set_programme_broker_login_status(programme_id, new_status)
+    batch = db_query_many(
+        [clear_stmt, inc_stmt, stat_stmt, read_stmt],
+        timeout=20.0, quiet=True,
+    )
+
+    new_used = None
+    stmts = batch.get('statements') or []
+    if len(stmts) >= 4 and stmts[3].get('rows'):
+        first = _normalize_row(stmts[3]['rows'][0]) or {}
+        for v in first.values():
+            new_used = _coerce_int(v)
+            break
 
     row = _fetch_programme_row_for_notify(programme_id, user_id)
     print(f"      [PRG][NOTIFY-DEBUG] fetched row before dispatch = {row!r}")
@@ -2535,7 +2720,6 @@ def _process_target(row, role, user_id, sub_account_id):
 
 # ==============================================================================
 #  [PRG] PROGRAMME TARGET PROCESSING
-#  (broker symbols / timeframes refresh added)
 # ==============================================================================
 def _process_programme_target(row, user_id, programme_id):
     result = {
@@ -2599,7 +2783,6 @@ def _process_programme_target(row, user_id, programme_id):
         result['folder'] = folder_abs
         result['terminal_exe'] = terminal_exe
 
-        # Silent metadata refresh — programme was just marked valid.
         try:
             _refresh_programme_broker_metadata(
                 user_id=user_id,
@@ -2662,7 +2845,6 @@ def _process_programme_target(row, user_id, programme_id):
                         result['demo_account'] = demo_int
                         result.update(probe_info or {})
 
-                        # Silent metadata refresh — terminal is live.
                         try:
                             _refresh_programme_broker_metadata(
                                 user_id=user_id,
@@ -2693,7 +2875,6 @@ def _process_programme_target(row, user_id, programme_id):
                     result['demo_account'] = demo_int
                     result.update(probe_info or {})
 
-                    # Silent metadata refresh — terminal is live.
                     try:
                         _refresh_programme_broker_metadata(
                             user_id=user_id,
@@ -2727,7 +2908,6 @@ def _process_programme_target(row, user_id, programme_id):
                 result.update(probe_info or {})
                 _MANUAL_WINDOW.remove_item('PRG', user_id, programme_id)
 
-                # Silent metadata refresh — programme just became valid.
                 try:
                     _refresh_programme_broker_metadata(
                         user_id=user_id,
@@ -2816,7 +2996,7 @@ def _fetch_programmes_for_owner(user_id):
 
 
 # ==============================================================================
-#  [SA] PASS — vps table
+#  [SA] PASS — vps table  (BATCHED follower lookup)
 # ==============================================================================
 def _collect_sa_candidates_for_ip(local_ip):
     owners    = []
@@ -2855,40 +3035,44 @@ def _collect_sa_candidates_for_ip(local_ip):
 
     print(f"   [SA][OWNER] Detected: {len(owners)}")
 
-    for owner in owners:
-        fol_sql = ("SELECT id, owner_id, sub_account_id, "
-                   "follower_id, follower_sub_account_id, host_status "
-                   "FROM vps_hosts_followers "
-                   "WHERE owner_id = %s AND sub_account_id = %s "
-                   "AND host_status = 'active'")
-        fol_res = db_query(
-            fol_sql,
-            [owner['user_id'], owner['sub_account_id']],
-            timeout=15.0,
+    # ---- Batch follower lookup: ONE round-trip for ALL owners ----
+    if owners:
+        owner_pairs = [(o['user_id'], o['sub_account_id']) for o in owners]
+        pair_tuples = ', '.join(
+            f"({_sql_int(u)}, {_sql_int(s)})" for (u, s) in owner_pairs
         )
+        fol_sql = (
+            "SELECT id, owner_id, sub_account_id, "
+            "       follower_id, follower_sub_account_id, host_status "
+            "  FROM vps_hosts_followers "
+            f" WHERE (owner_id, sub_account_id) IN ({pair_tuples}) "
+            "    AND host_status = 'active'"
+        )
+        fol_res = db_query(fol_sql, None, timeout=20.0, quiet=True)
         if fol_res.get('status') != 'success':
-            print(f"   [SA][WARN] followers lookup failed: {fol_res.get('message')}")
-            continue
-
-        for row in fol_res.get('results', []) or []:
-            fid  = _coerce_int(_pick_first_key(row, 'follower_id', 'followerid'))
-            fsub = _coerce_int(_pick_first_key(
-                row, 'follower_sub_account_id', 'followersubaccountid'))
-            if fid is None:
-                continue
-            followers.append({
-                'owner_id':              owner['user_id'],
-                'owner_sub_account_id':  owner['sub_account_id'],
-                'follower_id':           fid,
-                'follower_sub_account_id': fsub if fsub is not None else fid,
-            })
+            print(f"   [SA][WARN] batched followers lookup failed: "
+                  f"{fol_res.get('message')}")
+        else:
+            for row in fol_res.get('results', []) or []:
+                fid  = _coerce_int(_pick_first_key(
+                    row, 'follower_id', 'followerid'))
+                fsub = _coerce_int(_pick_first_key(
+                    row, 'follower_sub_account_id', 'followersubaccountid'))
+                if fid is None:
+                    continue
+                followers.append({
+                    'owner_id':                _coerce_int(_pick_first_key(row, 'owner_id')),
+                    'owner_sub_account_id':    _coerce_int(_pick_first_key(row, 'sub_account_id')),
+                    'follower_id':             fid,
+                    'follower_sub_account_id': fsub if fsub is not None else fid,
+                })
 
     print(f"   [SA][FOLLOWER] Detected: {len(followers)}")
     return owners, followers
 
 
 # ==============================================================================
-#  [PRG] PASS — programme_vps table
+#  [PRG] PASS — programme_vps table  (BATCHED follower-userid lookup)
 # ==============================================================================
 def _collect_prg_candidates_for_ip(local_ip):
     bindings           = []
@@ -2930,17 +3114,17 @@ def _collect_prg_candidates_for_ip(local_ip):
 
     print(f"   [PRG][BINDING] Owner bindings: {len(bindings)}")
 
+    # ---- Batch follower lookup + batch follower-userid lookup ----
     owner_prog_ids = [b['programme_id'] for b in bindings]
     if owner_prog_ids:
-        placeholders = ','.join(['%s'] * len(owner_prog_ids))
+        id_list = ', '.join(_sql_int(p) for p in owner_prog_ids)
         fol_sql = (
-            f"SELECT id, owner_programme_id, follower_programme_id, "
-            f"host_status "
-            f"FROM programme_vps_hosts_followers "
-            f"WHERE owner_programme_id IN ({placeholders}) "
-            f"  AND host_status = 'active'"
+            "SELECT id, owner_programme_id, follower_programme_id, host_status "
+            "  FROM programme_vps_hosts_followers "
+            f" WHERE owner_programme_id IN ({id_list}) "
+            "    AND host_status = 'active'"
         )
-        fol_res = db_query(fol_sql, owner_prog_ids, timeout=15.0)
+        fol_res = db_query(fol_sql, None, timeout=15.0, quiet=True)
         if fol_res.get('status') != 'success':
             print(f"   [PRG][WARN] follower lookup failed: {fol_res.get('message')}")
         else:
@@ -2955,16 +3139,24 @@ def _collect_prg_candidates_for_ip(local_ip):
                     'owner_programme_id':    opid,
                     'follower_programme_id': fpid,
                 })
-                q = db_query(
-                    "SELECT userid FROM programme WHERE id = %s LIMIT 1",
-                    [fpid], timeout=15.0, quiet=True,
-                )
-                if q.get('status') == 'success' and q.get('results'):
-                    for v in q['results'][0].values():
-                        fuid = _coerce_int(v)
-                        if fuid is not None and fuid > 0:
-                            candidate_user_ids.add(fuid)
-                        break
+
+        # ONE batched userid lookup for every follower programme id.
+        if follower_progs:
+            fpid_list = ', '.join(
+                _sql_int(f['follower_programme_id']) for f in follower_progs
+            )
+            uid_sql = (
+                f"SELECT id, userid FROM programme WHERE id IN ({fpid_list})"
+            )
+            uid_res = db_query(uid_sql, None, timeout=15.0, quiet=True)
+            if uid_res.get('status') != 'success':
+                print(f"   [PRG][WARN] batched follower-userid lookup "
+                      f"failed: {uid_res.get('message')}")
+            else:
+                for row in uid_res.get('results', []) or []:
+                    fuid = _coerce_int(_pick_first_key(row, 'userid'))
+                    if fuid is not None and fuid > 0:
+                        candidate_user_ids.add(fuid)
 
     print(f"   [PRG][FOLLOWER] Follower programmes: {len(follower_progs)}")
 
@@ -3160,18 +3352,30 @@ def check_if_broker_is_logged_in(inv_id=None):
             _process_one_programme(uid, pid, origin='programme_vps')
 
         print(f"\n   --- [PRG] FOLLOWER PROGRAMMES ---")
+
+        # ---- BATCH userid lookup for every follower programme ----
+        follower_prog_ids = [
+            f['follower_programme_id'] for f in report['programme_followers']
+            if f.get('follower_programme_id') is not None
+        ]
+        follower_userid_map = {}
+        if follower_prog_ids:
+            id_list = ', '.join(_sql_int(p) for p in follower_prog_ids)
+            uid_sql = (
+                f"SELECT id, userid FROM programme WHERE id IN ({id_list})"
+            )
+            uid_res = db_query(uid_sql, None, timeout=15.0, quiet=True)
+            if uid_res.get('status') == 'success':
+                for row in uid_res.get('results', []) or []:
+                    pid = _coerce_int(_pick_first_key(row, 'id'))
+                    uid = _coerce_int(_pick_first_key(row, 'userid'))
+                    if pid is not None:
+                        follower_userid_map[pid] = uid
+
         for fol in report['programme_followers']:
             fpid = fol['follower_programme_id']
             opid = fol['owner_programme_id']
-            q = db_query(
-                "SELECT userid FROM programme WHERE id = %s LIMIT 1",
-                [fpid], timeout=15.0, quiet=True,
-            )
-            fuid = None
-            if q.get('status') == 'success' and q.get('results'):
-                for v in q['results'][0].values():
-                    fuid = _coerce_int(v)
-                    break
+            fuid = follower_userid_map.get(fpid)
             if fuid is None:
                 print(f"      [PRG][WARN] follower programme={fpid} has no userid")
                 continue
@@ -3209,7 +3413,6 @@ def check_if_broker_is_logged_in(inv_id=None):
 #  MAIN LOOP
 # ==============================================================================
 def main():
-    # Ensure TIMEFRAME_MAP is built before any MT5 work begins.
     _build_timeframe_map()
 
     print(f"\n{'#'*70}")

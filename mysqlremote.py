@@ -873,11 +873,34 @@ def _channel_read_message(cid):
 
 
 def _channel_collect_results(cid, is_read):
-    """Extract rows/affected from this channel's window."""
-    results = []
-    affected_rows = 0
+    """
+    Extract rows, affected rows, and per-statement results from this
+    channel's window.
+
+    Returns a 3-tuple:
+        (flat_rows, affected_rows, statement_results)
+
+    - flat_rows: a flat list[dict] of all rows from ALL successful read
+      statements. Preserved for backwards-compat with db_fetch_all().
+    - affected_rows: sum of "Affected rows: N" across all successful
+      write statements.
+    - statement_results: one entry per .stmt-block rendered by the PHP,
+      each shaped as:
+          {
+            'status': 'success' | 'empty' | 'error' | 'skipped',
+            'rows': list[dict],       # for read statements
+            'affected_rows': int,     # for write statements
+            'message': str,
+          }
+      This is what the caller inspects to derive the overall status.
+    """
+    flat_rows = []
+    affected_rows_total = 0
+    statement_results = []
+
     if _driver is None:
-        return results, affected_rows
+        return flat_rows, affected_rows_total, statement_results
+
     try:
         html = _driver.execute_script("""
             var w = document.querySelector(arguments[0]);
@@ -885,25 +908,58 @@ def _channel_collect_results(cid, is_read):
             var r = w.querySelector('.win-query-result');
             return r ? r.innerHTML : '';
         """, _channel_window_selector(cid))
+    except Exception as e:
+        _log(f"channel {cid}: collect results failed: {e}")
+        return flat_rows, affected_rows_total, statement_results
+
+    try:
         soup = BeautifulSoup(html, 'html.parser')
+    except Exception as e:
+        _log(f"channel {cid}: parse results failed: {e}")
+        return flat_rows, affected_rows_total, statement_results
 
-        if not is_read:
-            for blk in soup.select('.stmt-block[data-status="success"]'):
-                body = blk.find('div', class_='stmt-affected-body')
-                if body:
-                    m = re.search(r'Affected rows:\s*(\d+)', body.get_text())
-                    if m:
-                        affected_rows += int(m.group(1))
-            return results, affected_rows
+    blocks = soup.select('.stmt-block')
+    if not blocks:
+        # No per-statement blocks at all. Nothing to report.
+        return flat_rows, affected_rows_total, statement_results
 
-        for blk in soup.select('.stmt-block'):
-            blk_status = (blk.get('data-status') or '').strip().lower()
-            if blk_status != 'success':
-                continue
-            tbl = blk.find('table')
-            if not tbl:
-                continue
+    for blk in blocks:
+        blk_status = (blk.get('data-status') or '').strip().lower()
+        stmt_entry = {
+            'status':        blk_status or 'success',
+            'rows':          [],
+            'affected_rows': 0,
+            'message':       '',
+        }
+
+        # Capture a per-statement message if the template rendered one.
+        msg_el = blk.find(class_=re.compile(r'stmt-message|stmt-error|error'))
+        if msg_el:
+            stmt_entry['message'] = msg_el.get_text(strip=True)
+
+        if blk_status == 'error':
+            statement_results.append(stmt_entry)
+            continue
+
+        if blk_status == 'skipped':
+            statement_results.append(stmt_entry)
+            continue
+
+        # ---- write statement: look for "Affected rows: N" ----
+        affected_body = blk.find('div', class_='stmt-affected-body')
+        if affected_body:
+            m = re.search(r'Affected rows:\s*(\d+)',
+                          affected_body.get_text())
+            if m:
+                n = int(m.group(1))
+                stmt_entry['affected_rows'] = n
+                affected_rows_total += n
+
+        # ---- read statement: extract the table ----
+        tbl = blk.find('table')
+        if tbl:
             headers = [th.get_text(strip=True) for th in tbl.find_all('th')]
+            row_count = 0
             for tr in tbl.find_all('tr')[1:]:
                 tds = tr.find_all('td')
                 if not tds:
@@ -914,11 +970,16 @@ def _channel_collect_results(cid, is_read):
                     span = td.find('span', class_='cell-content')
                     row[key] = (span.get_text() if span
                                 else td.get_text(strip=True))
-                results.append(row)
-    except Exception as e:
-        _log(f"channel {cid}: collect results failed: {e}")
-    return results, affected_rows
+                stmt_entry['rows'].append(row)
+                flat_rows.append(row)
+                row_count += 1
+            # A read block that produced no rows is 'empty' (still success)
+            if not blk_status and row_count == 0 and not affected_body:
+                stmt_entry['status'] = 'empty'
 
+        statement_results.append(stmt_entry)
+
+    return flat_rows, affected_rows_total, statement_results
 
 # ==============================================================================
 #  QUERY CLASSIFICATION
@@ -949,7 +1010,18 @@ def _is_read_query(sql):
 #  SQL EXECUTION ON A SPECIFIC CHANNEL
 # ==============================================================================
 def _execute_sql_on_channel(ch, sql, timeout):
-    """Runs inside ch.lock. Assumes browser is alive."""
+    """
+    Runs inside ch.lock.
+
+    Handles both single-statement and multi-statement SQL. The PHP
+    already splits/schedules ';'-separated SQL, and the template
+    renders one .stmt-block per statement. We preserve that structure
+    in resp['statement_results'].
+
+    Backwards compatibility: for single-statement callers we still
+    return the flat 'results' list + 'affected_rows', so existing
+    db_query()/db_fetch_all()/db_execute() keep working unchanged.
+    """
     t_start = time.perf_counter()
     query_id = str(_uuid_module.uuid4().int)[:12]
 
@@ -959,6 +1031,7 @@ def _execute_sql_on_channel(ch, sql, timeout):
             'results': [], 'affected_rows': 0, 'query_id': query_id,
             'raw_sql': sql, 'elapsed': 0.0,
             'channel_id': ch.channel_id,
+            'statement_results': [],
         }
 
     # Make sure the window still exists; recreate if it vanished.
@@ -972,6 +1045,7 @@ def _execute_sql_on_channel(ch, sql, timeout):
                 'results': [], 'affected_rows': 0, 'query_id': query_id,
                 'raw_sql': sql, 'elapsed': 0.0,
                 'channel_id': ch.channel_id,
+                'statement_results': [],
             }
 
     try:
@@ -987,6 +1061,7 @@ def _execute_sql_on_channel(ch, sql, timeout):
             'results': [], 'affected_rows': 0, 'query_id': query_id,
             'raw_sql': sql, 'elapsed': time.perf_counter() - t_start,
             'channel_id': ch.channel_id,
+            'statement_results': [],
         }
 
     ready, _, reason = _channel_wait_completion(ch.channel_id, timeout)
@@ -998,50 +1073,52 @@ def _execute_sql_on_channel(ch, sql, timeout):
 
     is_read = _is_read_query(sql)
 
-    if state == 'error':
+    # Collect the per-statement blocks regardless of outcome.
+    flat_rows, affected_rows, statement_results = \
+        _channel_collect_results(ch.channel_id, is_read)
+
+    # If the PHP reported an error at the top level (banner state == 'error'),
+    # statement_results may still be populated (one block per failed stmt).
+    if state == 'error' and not statement_results:
         err_msg = _channel_read_message(ch.channel_id) or banner_label or "query failed"
         return {
             'status': 'error', 'message': err_msg,
             'results': [], 'affected_rows': 0, 'query_id': query_id,
             'raw_sql': sql, 'elapsed': time.perf_counter() - t_start,
             'channel_id': ch.channel_id,
+            'statement_results': [],
         }
 
-    if state == 'empty':
-        return {
-            'status': 'success',
-            'message': banner_label or 'Query executed successfully (0 rows)',
-            'results': [], 'affected_rows': 0, 'query_id': query_id,
-            'raw_sql': sql, 'elapsed': time.perf_counter() - t_start,
-            'channel_id': ch.channel_id,
-        }
+    # Derive overall status from the per-statement blocks.
+    any_error   = any(s['status'] == 'error'   for s in statement_results)
+    any_success = any(s['status'] == 'success' for s in statement_results)
+    any_empty   = any(s['status'] == 'empty'   for s in statement_results)
+    any_skipped = any(s['status'] == 'skipped' for s in statement_results)
 
-    results, affected_rows = _channel_collect_results(ch.channel_id, is_read)
+    if state == 'error' and any_error:
+        overall = 'error'
+    elif any_error or any_skipped:
+        overall = 'partial'
+    elif any_success:
+        overall = 'success'
+    elif any_empty:
+        overall = 'success'   # empty == ran fine, 0 rows
+    else:
+        overall = 'success' if state in ('success', 'empty') else 'error'
 
-    if not is_read:
-        if not affected_rows and banner_meta:
-            m = re.search(r'(\d+)\s*affected', banner_meta, re.IGNORECASE)
-            if m:
-                affected_rows = int(m.group(1))
-        return {
-            'status': 'success',
-            'message': banner_label or
-                       f'Write query executed ({affected_rows} row(s) affected)',
-            'results': [], 'affected_rows': affected_rows,
-            'query_id': query_id, 'raw_sql': sql,
-            'elapsed': time.perf_counter() - t_start,
-            'channel_id': ch.channel_id,
-        }
+    message = banner_label or f'{len(statement_results)} statement(s)'
 
     return {
-        'status': 'success',
-        'message': banner_label or f'Query executed successfully ({len(results)} rows)',
-        'results': results, 'affected_rows': affected_rows,
-        'query_id': query_id, 'raw_sql': sql,
-        'elapsed': time.perf_counter() - t_start,
-        'channel_id': ch.channel_id,
+        'status':             overall,
+        'message':            message,
+        'results':            flat_rows,
+        'affected_rows':      affected_rows,
+        'query_id':           query_id,
+        'raw_sql':            sql,
+        'elapsed':            time.perf_counter() - t_start,
+        'channel_id':         ch.channel_id,
+        'statement_results':  statement_results,
     }
-
 
 def _channel_exists(cid):
     if _driver is None:

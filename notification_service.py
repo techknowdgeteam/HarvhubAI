@@ -53,12 +53,20 @@ from typing import Any, Optional
 # ==============================================================================
 
 _TECH_WORDS = [
+    # Infrastructure / URLs / TLDs
+    'api', 'endpoint', 'http', 'https', 'url', 'www',
+    'com', 'net', 'org', 'io',
+
+    # SQL / schema jargon (all confirmed non-English)
+    'table', 'column', 'row', 'join', 'schema',
+
+    # Server-side / DB jargon (all confirmed non-English)
     'php', 'sql', 'mysql', 'pdo', 'database', 'db', 'query', 'script',
-    'array', 'json', 'html', 'css', 'js', 'javascript', 'code', 'function',
-    'class', 'method', 'variable', 'loop', 'if', 'else', 'echo', 'print',
-    'var', 'const', 'let', 'table', 'column', 'row', 'insert', 'update',
-    'delete', 'select', 'where', 'join', 'schema', 'api', 'endpoint',
-    'http', 'https', 'url', 'www', 'com', 'net', 'org', 'io',
+
+    # Code / serialization jargon (all confirmed non-English)
+    'array', 'json', 'html', 'css', 'js', 'javascript', 'code',
+    'function', 'class', 'method', 'variable', 'loop',
+    'echo', 'print', 'var', 'const', 'let',
 ]
 _TECH_RE = re.compile(
     r'\b(' + '|'.join(re.escape(w) for w in _TECH_WORDS) + r')\b',
@@ -1711,8 +1719,8 @@ def record_investor_unauthorized_action_notification(
 
     title = 'Unauthorized Actions Detected'
     message = (
-        f"We detected unauthorized actions on your programme "
-        f"'{programme_name}': {summary}. This means trading activity was "
+        f"We detected unauthorized actions on your {programme_name} programme:"
+        f"{summary}. This means trading activity was "
         f"observed outside the magic numbers issued by the programme. "
         f"Please stop any manual or third-party trading on this "
         f"sub-account immediately to avoid contract violations."
@@ -1781,7 +1789,7 @@ def record_programme_owner_unauthorized_action_notification(
     title = f'Contract Violation — Investor {investor_id}'
     message = (
         f"Investor {investor_id} (sub-account {sub_account_id}) on your "
-        f"programme '{programme_name}' has violated the contract "
+        f"{programme_name} programme has violated the contract "
         f"agreement: {summary}. The investor's trading activity is "
         f"outside the magic numbers your programme issued. Please review "
         f"and take the appropriate action."
@@ -1856,3 +1864,169 @@ def _unauth_summary_parts(unauthorized_types, unauthorized_pnl, unaccounted_defi
         )
 
     return parts
+
+# ==============================================================================
+# PROGRAMME CHART CONFIGURATION NOTIFICATIONS
+# ==============================================================================
+# Fires when brokercharts.py cannot proceed because the programme owner
+# has not finished configuring the chart pipeline. Three independent
+# notifications, deduplicated per programme:
+#
+#   * no selected symbols
+#   * no selected timeframes
+#   * no timezone
+#
+# All go to the programme owner only. The owner email is resolved by the
+# caller (programme.userid -> harvhub.email) and passed in.
+
+def record_programme_no_selected_symbols_notification(
+    pdo,
+    programme_id: int,
+    programme_name: str,
+    owner_email: str,
+) -> Optional[int]:
+    programme_id = int(programme_id or 0)
+    owner_email = (owner_email or '').strip().lower()
+    programme_name = (programme_name or '').strip() or f"programme {programme_id}"
+
+    if programme_id <= 0 or not owner_email or '@' not in owner_email:
+        print('[HarvHub Notification Service] no-selected-symbols: invalid identity')
+        return None
+
+    title = 'Chart Symbols Not Selected'
+    message = (
+        f"Your {programme_name} programme  has no symbols selected yet, "
+        f"so charts cannot be generated for it. Please open your dashboard settings and choose the symbols you want your programme charts to cover."
+    )
+
+    return record_programme_notification_once(
+        pdo,
+        programme_id,
+        owner_email,
+        {
+            'notification_key': f'prog-chart-no-symbols-{programme_id}',
+            'title': title,
+            'message': message,
+            'type': 'warning',
+            'section': 'Signals',
+            'action_tab': 'signals',
+            'force': False,
+            'send_email': True,
+            'recipient_name': programme_name,
+        },
+    )
+
+
+def record_programme_no_selected_timeframes_notification(
+    pdo,
+    programme_id: int,
+    programme_name: str,
+    owner_email: str,
+) -> Optional[int]:
+    programme_id = int(programme_id or 0)
+    owner_email = (owner_email or '').strip().lower()
+    programme_name = (programme_name or '').strip() or f"programme {programme_id}"
+
+    if programme_id <= 0 or not owner_email or '@' not in owner_email:
+        print('[HarvHub Notification Service] no-selected-timeframes: invalid identity')
+        return None
+
+    title = 'Chart Timeframes Not Selected'
+    message = (
+        f"Your {programme_name} programme has no timeframes selected yet, "
+        f"so charts cannot be generated for it. Please open your dashboard settings and choose the timeframes you want your programme charts to cover."
+    )
+
+    return record_programme_notification_once(
+        pdo,
+        programme_id,
+        owner_email,
+        {
+            'notification_key': f'prog-chart-no-timeframes-{programme_id}',
+            'title': title,
+            'message': message,
+            'type': 'warning',
+            'section': 'Signals',
+            'action_tab': 'signals',
+            'force': False,
+            'send_email': True,
+            'recipient_name': programme_name,
+        },
+    )
+
+
+def record_programme_no_timezone_notification(
+    pdo,
+    programme_id: int,
+    programme_name: str,
+    owner_email: str,
+) -> Optional[int]:
+    programme_id = int(programme_id or 0)
+    owner_email = (owner_email or '').strip().lower()
+    programme_name = (programme_name or '').strip() or f"programme {programme_id}"
+
+    if programme_id <= 0 or not owner_email or '@' not in owner_email:
+        print('[HarvHub Notification Service] no-timezone: invalid identity')
+        return None
+
+    title = 'Chart Timezone Not Selected'
+    message = (
+        f"Your {programme_name} programme has no timezone selected yet, "
+        f"so charts cannot be generated for it. Please open your dashboard settings and pick the timezone your programme should use for market analysis and candle timestamps."
+    )
+
+    return record_programme_notification_once(
+        pdo,
+        programme_id,
+        owner_email,
+        {
+            'notification_key': f'prog-chart-no-timezone-{programme_id}',
+            'title': title,
+            'message': message,
+            'type': 'warning',
+            'section': 'Signals',
+            'action_tab': 'signals',
+            'force': False,
+            'send_email': True,
+            'recipient_name': programme_name,
+        },
+    )
+
+
+def record_programme_chart_ready_notification(
+    pdo,
+    programme_id: int,
+    programme_name: str,
+    owner_email: str,
+) -> Optional[int]:
+    """
+    Optional: fires once when a programme first reaches a fully configured
+    state (symbols + timeframes + timezone all present). Uses
+    record_programme_notification_once so it is sent at most once.
+    """
+    programme_id = int(programme_id or 0)
+    owner_email = (owner_email or '').strip().lower()
+    programme_name = (programme_name or '').strip() or f"programme {programme_id}"
+
+    if programme_id <= 0 or not owner_email or '@' not in owner_email:
+        return None
+
+    return record_programme_notification_once(
+        pdo,
+        programme_id,
+        owner_email,
+        {
+            'notification_key': f'prog-chart-ready-{programme_id}',
+            'title': 'Chart Pipeline Activated',
+            'message': (
+                f"Your {programme_name} programme is now fully configured "
+                f"and its market charts will be generated continuously."
+            ),
+            'type': 'success',
+            'section': 'Signals',
+            'action_tab': 'signals',
+            'force': False,
+            'send_email': True,
+            'recipient_name': programme_name,
+        },
+    )
