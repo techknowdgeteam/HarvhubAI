@@ -1,0 +1,55 @@
+PS C:\xampp\htdocs\harvcore> & 'C:\Program Files\Python310\python.exe' 'c:/xampp/htdocs/harvcore/harvox/programme_training.py'
+Programme Training scope: all programmes with signals_provider_interest.begin_test = 1
+VPS/IP limitation: disabled for now; programme discovery is based on Begin Test only
+Root filter: apply_to_chart = 1 only; disabled roots and their confirmations are skipped
+Acquired mysqlremote channel 1
+Begin Test scope: 1 started interest record(s), 1 unique programme(s)
+
+==================================================================================
+PROGRAMME: CRT (ID 1)
+==================================================================================
+Owner user ID: 1
+CRT Begin Test = yes (interest #12, status=ongoing, started_at=2026-11-05 16:20:19)
+fetching saved programme training configuration..
+Programme 1 configuration: 37 parent row(s), 3 parent root(s), 14 configured tree(s)
+Programme 1 confirmation configuration: 8 row(s), 2 confirmation root(s), 4 tree(s)
+CRT | CRT RESISTANCE apply to chart = no
+CRT | CRT SUPPORT apply to chart = no
+CRT | Msnr apply to chart = yes
+fetching candle records..
+Symbols: AUDCAD
+Configured timeframes only: 4H, 1H
+  AUDCAD 4H: fetched 5,000 candle record(s)
+  AUDCAD 1H: fetched 5,000 candle record(s)
+converting and building into json
+  Temporary runtime JSON created: programme_training_runtime.json (5,208,865 bytes)
+  Reloading temporary JSON as the Python in-memory configuration and candle store..
+configuration matching engine at the background..
+
+CRT AUDCAD Msnr 4H:
+  Msnr has 0 matched families
+  trade is not setup for Msnr
+
+CRT AUDCAD Msnr key level 1H:
+  key level projection process on Msnr
+  trade is setup for this confirmation
+  key level has 0 matched families (no completed parent families on 4H)
+  found 0 trades, check analytics in programme analytics
+updating analytics to programme analytics
+  AUDCAD 4H: 0 analytics rows from this run; no new row inserted
+  AUDCAD 1H: 0 analytics rows from this run; no new row inserted
+Temporary JSON files cleaned up
+CRT complete: 0 analytics pair(s), 0 matched family record(s), 0 configured trade record(s), 10,000 candles fetched
+History mode: every analytics record is saved with live_trades = 0
+
+----------------------------------------------------------------------------------
+PROGRAMME TRAINING SCAN COMPLETE
+Programmes processed : 1
+Analytics pairs      : 0
+Matched families     : 0
+Trade records        : 0
+Candles fetched      : 10,000
+Live flag            : 0 (History)
+Programme scope      : Begin Test flag only (no VPS/IP restriction)
+----------------------------------------------------------------------------------
+Begin Test scope: 1 started interest record(s), 1 unique programme(s)
