@@ -7449,7 +7449,6 @@ def main() -> int:
         description="Programme Training: VPS-scoped matcher and programme analytics writer"
     )
     parser.add_argument("--once", action="store_true", help="run one complete scan and exit")
-    parser.add_argument("--loop", action="store_true", help="keep scanning continuously (used by HarvCore Manager)")
     parser.add_argument("--interval", type=int, default=60, help="seconds between complete scans (default: 60)")
     parser.add_argument(
         "--programme-id", type=int, default=None,
@@ -7461,8 +7460,6 @@ def main() -> int:
     args = parser.parse_args()
     if args.once:
         loop = False
-    elif args.loop:
-        loop = True
     if args.interval < 5:
         parser.error("--interval must be at least 5 seconds")
 

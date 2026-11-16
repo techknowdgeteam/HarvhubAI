@@ -215,8 +215,8 @@ atexit.register(db.release_channel)
 # ==============================================================================
 #  CONFIG
 # ==============================================================================
-DEFAULT_MT5_PATH     = r"C:\xampp\htdocs\harvcore\mt5\MetaTrader 5"
-MT5_DESTINATION_PATH = r"C:\xampp\htdocs\harvcore\mt5"
+DEFAULT_MT5_PATH     = r"C:\xampp\htdocs\harvhubAI\mt5\MetaTrader 5"
+MT5_DESTINATION_PATH = r"C:\xampp\htdocs\harvhubAI\mt5"
 
 MANUAL_POLL_INTERVAL = 1.5
 COPY_FEEDBACK_MS     = 900
@@ -3436,9 +3436,6 @@ def main():
             except Exception as e:
                 print(f"[main] check_if_broker_is_logged_in raised: {e}")
                 traceback.print_exc()
-            # Respect the configured service interval instead of immediately
-            # starting another database/MT5 scan.
-            time.sleep(interval)
     except KeyboardInterrupt:
         print("[main] interrupted — shutting down")
 

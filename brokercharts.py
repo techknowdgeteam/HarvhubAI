@@ -96,8 +96,8 @@ except Exception:
 # ==============================================================================
 #  PATHS — must match brokerdetails.py exactly
 # ==============================================================================
-DEFAULT_MT5_PATH     = r"C:\xampp\htdocs\harvcore\mt5\MetaTrader 5"
-MT5_DESTINATION_PATH = r"C:\xampp\htdocs\harvcore\mt5"
+DEFAULT_MT5_PATH     = r"C:\xampp\htdocs\harvhubAI\mt5\MetaTrader 5"
+MT5_DESTINATION_PATH = r"C:\xampp\htdocs\harvhubAI\mt5"
 # ==============================================================================
 #  BRIDGE CLIENT — same protocol as brokerdetails.py / programmetrades.py
 # ==============================================================================
