@@ -1,0 +1,55 @@
+HARVHUB AI — START HERE
+======================
+
+1. Extract this complete project ZIP into Downloads.
+2. Double-click HarvHubAI.vbs (Build_HarvHubProgram.vbs is an alias).
+3. Approve the Windows administrator prompt.
+4. Do not open CMD and do not click a build button.
+
+LATEST PROJECT PRIORITY
+-----------------------
+The launcher searches Downloads for complete project folders containing
+"HarvHub" in the folder name. It uses the newest matching project even when the
+clicked VBS belongs to an older extracted folder.
+
+EVERY LAUNCHER CLICK REFRESHES THE INSTALLATION
+------------------------------------------------
+Every VBS or Desktop/Start Menu shortcut click automatically rebuilds the latest
+HarvHubAI.exe, backs up and replaces the installed EXE, updates changed HarvCore
+Python files, refreshes the stored source fallback and recreates shortcuts. The
+same GUI progress window then becomes HarvHub AI. No CMD window or build button.
+
+GLOBAL APPLICATION HEADER
+-------------------------
+The HarvHub AI title appears once, in the top global header. Run All, Stop All
+and Update are on the right side of that same header. The old Ready indicator
+is removed. Stop All appears only while at least one program is running.
+
+Update replaces the old Setup / Repair header button. It requires all HarvCore
+programs to be stopped, closes the manager, waits for its process to exit, then
+starts the installed VBS updater. The updater selects the newest complete
+HarvHub project in Downloads and updates the EXE and Python source files.
+
+Individual program pages contain only their own Play / Stop / Show Console /
+Copy Console Result / Clear controls. No global execution buttons are repeated
+inside those pages. Consoles remain hidden by default.
+
+INSTALLATION LOCATIONS
+----------------------
+Desktop app:       C:\xampp\htdocs\harvcore\HarvHubAI.exe
+Python programs:   C:\xampp\htdocs\harvcore\python\
+MT5 template:      C:\xampp\htdocs\harvcore\mt5\MetaTrader 5\
+Latest source:     C:\xampp\htdocs\harvcore\.manager\source\
+Backups/manifest:  C:\xampp\htdocs\harvcore\.manager\
+
+The build computer needs 64-bit Python 3.10–3.14 with Tkinter. The app installs
+its pinned Python 3.13.17 x64 runtime, required modules, Chrome and MetaTrader 5
+when missing.
+
+MANAGER NAVIGATION
+------------------
+MySQL Remote; Broker Details; Broker Charts; Programme Training;
+Programme Signals Trading; Signals Provision Challenge; Computer IP.
+
+The Windows-native VBS updater, WMI process wait, elevation, actual installers,
+and shortcut behavior still need to be verified on a Windows test VPS.

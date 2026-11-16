@@ -47,8 +47,8 @@ server3 = {
     'fetch': 'https://harvhub.42web.io/phpmyadmin_tablesfetch.php'
 }
 
-admin_email = 'ciphercirclex12@gmail.com'
-admin_password = '@ciphercircleadminauthenticator#'
+admin_email = os.environ.get('HARVHUB_ADMIN_EMAIL', '')  # Configure outside the distributed package.
+admin_password = os.environ.get('HARVHUB_ADMIN_PASSWORD', '')  # Never embed shared credentials in customer files.
 
 DEFAULT_WAIT_TIMEOUT = 15.0
 

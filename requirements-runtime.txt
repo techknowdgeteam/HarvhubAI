@@ -1,0 +1,10 @@
+# Runtime dependencies discovered from the supplied HarvCore Python files.
+# Versions are intentionally resolved by pip for the pinned CPython 3.13 x64 runtime.
+MetaTrader5
+pytz
+tzdata
+requests
+urllib3
+selenium
+beautifulsoup4
+webdriver-manager

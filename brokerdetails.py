@@ -3436,6 +3436,9 @@ def main():
             except Exception as e:
                 print(f"[main] check_if_broker_is_logged_in raised: {e}")
                 traceback.print_exc()
+            # Respect the configured service interval instead of immediately
+            # starting another database/MT5 scan.
+            time.sleep(interval)
     except KeyboardInterrupt:
         print("[main] interrupted — shutting down")
 
