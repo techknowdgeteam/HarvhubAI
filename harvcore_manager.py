@@ -43,20 +43,20 @@ MT5_SETUP_URL = (
 BRIDGE_HOST = "127.0.0.1"
 BRIDGE_PORT = 5599
 
-# The deployed HarvCore root is also the permanent desktop-app installation
+# The deployed HarvHub AI root is also the permanent desktop-app installation
 # directory. The VBS launcher installs/updates HarvHubAI.exe here.
-HARVCORE_ROOT = Path(os.environ.get(
-    "HARVCORE_ROOT", r"C:\xampp\htdocs\harvcore"
+HARVHUBAI_ROOT = Path(os.environ.get(
+    "HARVHUBAI_ROOT", r"C:\xampp\htdocs\harvhubAI"
 ))
-PYTHON_DIR = HARVCORE_ROOT / "python"
-MT5_ROOT = HARVCORE_ROOT / "mt5"
+PYTHON_DIR = HARVHUBAI_ROOT / "python"
+MT5_ROOT = HARVHUBAI_ROOT / "mt5"
 MT5_TEMPLATE = MT5_ROOT / "MetaTrader 5"
-LOG_DIR = HARVCORE_ROOT / "logs"
-MANAGER_DIR = HARVCORE_ROOT / ".manager"
+LOG_DIR = HARVHUBAI_ROOT / "logs"
+MANAGER_DIR = HARVHUBAI_ROOT / ".manager"
 DOWNLOAD_DIR = MANAGER_DIR / "downloads"
 STATE_FILE = MANAGER_DIR / "installation.json"
 
-# All nine files supplied for HarvCore are deployed. Only the six genuine
+# All nine supplied Python files are deployed. Only the six genuine
 # long-running services appear in the navigation; support modules remain
 # silent importable files in the Python folder.
 BUNDLED_PYTHON_FILES = [
@@ -76,7 +76,7 @@ PROGRAMS = [
         "key": "mysqlremote",
         "label": "MySQL Remote",
         "filename": "mysqlremote.py",
-        "description": "Database bridge used by the HarvCore background programs.",
+        "description": "Database bridge used by the HarvHub AI background programs.",
         "icon": "⌘",
         "args": [],
         "role": "service",
@@ -391,9 +391,31 @@ def candidate_python_is_compatible(executable: Path) -> bool:
 
 
 def locate_python() -> Optional[Path]:
+    """Find the exact supported 64-bit Python runtime in machine or user scope.
+
+    The single-file bootstrap installs Python per-user on a fresh VPS, while
+    older HarvHub installations may have installed it for all users. Check both
+    locations explicitly before relying on PATH or the Python launcher.
+    """
     candidates: list[Path] = []
     program_files = Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
-    candidates.append(program_files / "Python313" / "python.exe")
+    local_app_data = Path(os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local")))
+    candidates.extend([
+        program_files / "Python313" / "python.exe",
+        local_app_data / "Programs" / "Python" / "Python313" / "python.exe",
+    ])
+
+    # Include Python313 installations discoverable beside the selected
+    # pythonw.exe or from the per-user Python installation root.
+    user_python_root = local_app_data / "Programs" / "Python"
+    if user_python_root.is_dir():
+        try:
+            candidates.extend(
+                folder / "python.exe"
+                for folder in sorted(user_python_root.glob("Python*"), reverse=True)
+            )
+        except OSError:
+            pass
 
     launcher = shutil.which("py.exe") or shutil.which("py")
     if launcher:
@@ -695,7 +717,7 @@ class HarvCoreManager:
         card = self._card(self.content, 28)
         card.pack(fill="both", expand=True)
         tk.Label(card, text="Windows is required", bg=self.colors["surface"], fg=self.colors["text"], font=("Segoe UI", 22, "bold")).pack(anchor="w")
-        tk.Label(card, text="HarvHub AI prepares the HarvCore environment and controls its Windows programs. Run this application on the buyer's Windows VPS.", bg=self.colors["surface"], fg=self.colors["muted"], wraplength=850, justify="left", font=("Segoe UI", 10)).pack(anchor="w", pady=(10, 0))
+        tk.Label(card, text="HarvHub AI prepares the HarvHub AI environment and controls its Windows programs. Run this application on the buyer's Windows VPS.", bg=self.colors["surface"], fg=self.colors["muted"], wraplength=850, justify="left", font=("Segoe UI", 10)).pack(anchor="w", pady=(10, 0))
 
     # ----------------------------- Setup screen ------------------------------
     def _show_setup(self) -> None:
@@ -741,7 +763,7 @@ class HarvCoreManager:
             ("packages", "Install Python modules"),
             ("chrome", "Prepare browser service"),
             ("mt5", "Install MetaTrader 5"),
-            ("sources", "Deploy current HarvCore files"),
+            ("sources", "Deploy current HarvHub AI files"),
             ("verify", "Verify installation"),
         ]
         for key, label in stages:
@@ -753,7 +775,7 @@ class HarvCoreManager:
             text.pack(side="left", fill="x", expand=True)
             self.setup_rows[key] = (icon, text)
             self.setup_step_states[key] = "pending"
-        tk.Label(left, text="Installation target: HarvCore workspace", bg=self.colors["surface"], fg=self.colors["muted"], font=("Segoe UI", 8)).pack(anchor="w", side="bottom", pady=(22, 0))
+        tk.Label(left, text="Installation target: HarvHub AI workspace", bg=self.colors["surface"], fg=self.colors["muted"], font=("Segoe UI", 8)).pack(anchor="w", side="bottom", pady=(22, 0))
 
         right = self._card(body, 22)
         if setup_landscape:
@@ -847,9 +869,9 @@ class HarvCoreManager:
             if sys.maxsize <= 2**32:
                 raise RuntimeError("The manager was started with a 32-bit runtime. Build and run the Windows x64 executable.")
 
-            for folder in (HARVCORE_ROOT, PYTHON_DIR, MT5_ROOT, LOG_DIR, MANAGER_DIR, DOWNLOAD_DIR):
+            for folder in (HARVHUBAI_ROOT, PYTHON_DIR, MT5_ROOT, LOG_DIR, MANAGER_DIR, DOWNLOAD_DIR):
                 folder.mkdir(parents=True, exist_ok=True)
-            self._setup_step("system", "done", "Windows x64 and HarvCore folders are ready.")
+            self._setup_step("system", "done", "Windows x64 and HarvHub AI folders are ready.")
             self._check_setup_cancelled()
 
             python_exe = locate_python()
@@ -872,7 +894,7 @@ class HarvCoreManager:
             self._setup_step("python", "done", f"Python runtime verified: {self.python_exe}")
             self._check_setup_cancelled()
 
-            self._setup_step("packages", "running", "Installing the modules imported by the supplied HarvCore programs.")
+            self._setup_step("packages", "running", "Installing the modules imported by the supplied HarvHub AI programs.")
             requirements = resource_directory() / "requirements-runtime.txt"
             if not requirements.is_file():
                 raise RuntimeError(f"Runtime requirements file is missing: {requirements}")
@@ -882,7 +904,7 @@ class HarvCoreManager:
             )
             self._run_command(
                 [str(self.python_exe), "-m", "pip", "install", "--disable-pip-version-check", "--upgrade", "--no-input", "-r", str(requirements)],
-                "Install HarvCore Python modules", timeout=1800,
+                "Install HarvHub AI Python modules", timeout=1800,
             )
             self._setup_step("packages", "done", "Python dependencies installed.")
             self._check_setup_cancelled()
@@ -906,26 +928,21 @@ class HarvCoreManager:
             self._check_setup_cancelled()
 
             mt5_exe = MT5_TEMPLATE / "terminal64.exe"
-            if not mt5_exe.is_file():
-                self._setup_step("mt5", "running", "Downloading the official MetaTrader 5 installer.")
+            if not self._mt5_terminal_ready(mt5_exe):
+                self._setup_step("mt5", "running", "Downloading and installing the official MetaTrader 5 terminal.")
                 mt5_setup = DOWNLOAD_DIR / "mt5setup.exe"
                 self._download(MT5_SETUP_URL, mt5_setup, "MetaTrader 5 installer")
                 self._check_setup_cancelled()
                 self._require_signer(mt5_setup, ("metaquotes",))
-                self._run_command(
-                    [str(mt5_setup), "/auto", f'/path:"{MT5_TEMPLATE}"'],
-                    "Install MetaTrader 5", timeout=1200,
-                )
-                if not self._wait_for_file(mt5_exe, timeout=900):
-                    raise RuntimeError(f"MetaTrader 5 installer did not create the expected terminal: {mt5_exe}")
+                self._install_mt5_terminal(mt5_setup, mt5_exe)
             self._setup_step("mt5", "done", f"MT5 template verified at {mt5_exe}")
             self._check_setup_cancelled()
 
-            self._setup_step("sources", "running", "Updating the HarvCore program files and desktop app.")
+            self._setup_step("sources", "running", "Updating the HarvHub AI program files and desktop app.")
             self._deploy_sources()
             self._check_setup_cancelled()
             self._deploy_manager_executable()
-            self._setup_step("sources", "done", f"Current HarvCore files deployed under {HARVCORE_ROOT}")
+            self._setup_step("sources", "done", f"Current HarvHub AI files deployed under {HARVHUBAI_ROOT}")
 
             self._setup_step("verify", "running", "Checking interpreter, package imports, Chrome and MT5 terminal.")
             self._check_setup_cancelled()
@@ -1084,11 +1101,149 @@ class HarvCoreManager:
             raise RuntimeError(f"{label} failed with exit code {process.returncode}.")
         self._setup_emit("setup_log", f"{label} completed (exit code {process.returncode}).")
 
+    def _mt5_terminal_ready(self, terminal_exe: Path) -> bool:
+        try:
+            return terminal_exe.is_file() and terminal_exe.stat().st_size >= 1024 * 1024
+        except OSError:
+            return False
+
+    def _wait_for_mt5_terminal(self, terminal_exe: Path, timeout: int) -> bool:
+        started = time.monotonic()
+        while time.monotonic() - started < timeout:
+            self._check_setup_cancelled()
+            if self._mt5_terminal_ready(terminal_exe):
+                return True
+            time.sleep(1)
+        return self._mt5_terminal_ready(terminal_exe)
+
+    def _show_mt5_manual_fallback_prompt(self) -> None:
+        """Show the manual-installer instructions on Tk's owning UI thread."""
+        prompt_done = threading.Event()
+
+        def show_prompt() -> None:
+            try:
+                messagebox.showinfo(
+                    "HarvHub AI - MetaTrader 5",
+                    "Automatic MetaTrader 5 installation did not produce the expected terminal.\n\n"
+                    "The official MetaTrader 5 setup wizard will now open.\n"
+                    "In the wizard, open Settings and set the installation folder to:\n\n"
+                    f"{MT5_TEMPLATE}\n\n"
+                    "Complete the installation. HarvHub AI will continue automatically "
+                    "when terminal64.exe is detected in that folder.",
+                    parent=self.root,
+                )
+            finally:
+                prompt_done.set()
+
+        self.root.after(0, show_prompt)
+        while not prompt_done.wait(0.1):
+            self._check_setup_cancelled()
+
+    def _install_mt5_terminal(self, installer: Path, terminal_exe: Path) -> None:
+        """Install MT5, verify its actual output, and fall back to its GUI wizard.
+
+        MetaQuotes documents /auto and /path for unattended installation. The
+        web installer can nevertheless return a non-zero process status on some
+        VPS images. A return code is not treated as proof of failure when the
+        requested terminal executable was actually created and is usable.
+        """
+        MT5_TEMPLATE.mkdir(parents=True, exist_ok=True)
+        command_line = f'"{installer}" /auto /path:"{MT5_TEMPLATE}"'
+        self._setup_emit(
+            "setup_log",
+            "Running MetaTrader 5 automatic installation with the documented /auto and /path options.",
+        )
+        self._setup_emit("setup_log", f"MT5 destination: {MT5_TEMPLATE}")
+        process_exit: Optional[int] = None
+        launch_error: Optional[str] = None
+
+        try:
+            # Pass a raw Windows command line so /path:"..." reaches the
+            # MetaQuotes installer exactly as documented, including its quotes.
+            process = subprocess.Popen(
+                command_line,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            started = time.monotonic()
+            terminal_seen_since: Optional[float] = None
+            while process.poll() is None:
+                self._check_setup_cancelled()
+                now = time.monotonic()
+                if self._mt5_terminal_ready(terminal_exe):
+                    if terminal_seen_since is None:
+                        terminal_seen_since = now
+                    elif now - terminal_seen_since >= 8:
+                        # Some web-installer builds launch the terminal as a
+                        # child and do not promptly exit. Once the terminal file
+                        # is present and stable, do not wait on that child forever.
+                        break
+                else:
+                    terminal_seen_since = None
+                if now - started > 1200:
+                    try:
+                        process.kill()
+                    except Exception:
+                        pass
+                    raise TimeoutError("MetaTrader 5 automatic installer exceeded the 20-minute limit.")
+                time.sleep(1)
+            process_exit = process.poll()
+            if process_exit is None:
+                self._setup_emit(
+                    "setup_log",
+                    "MetaTrader 5 terminal64.exe appeared and remained stable; continuing without waiting for the installer child to close.",
+                )
+            else:
+                self._setup_emit("setup_log", f"MetaTrader 5 automatic installer process exited with code {process_exit}.")
+        except SetupCancelled:
+            raise
+        except Exception as exc:
+            launch_error = str(exc)
+            self._setup_emit("setup_log", f"Automatic MT5 launch warning: {launch_error}")
+
+        # Accept verified output immediately, even if the small bootstrap
+        # installer returned a non-zero code or left a child process running.
+        if self._mt5_terminal_ready(terminal_exe) or self._wait_for_mt5_terminal(terminal_exe, timeout=60):
+            if process_exit not in (None, 0, 3010):
+                self._setup_emit(
+                    "setup_log",
+                    f"Installer returned exit code {process_exit}, but terminal64.exe was created and passed file verification. Accepting the verified installation.",
+                )
+            else:
+                self._setup_emit("setup_log", "MetaTrader 5 terminal64.exe was created and verified.")
+            return
+
+        self._setup_emit(
+            "setup_log",
+            "Automatic MT5 installation did not create the expected terminal. Starting the official interactive installer as a fallback.",
+        )
+        self._show_mt5_manual_fallback_prompt()
+        self._check_setup_cancelled()
+        try:
+            os.startfile(str(installer))  # type: ignore[attr-defined]
+        except Exception as exc:
+            raise RuntimeError(
+                "MetaTrader 5 automatic installation failed"
+                + (f" (exit code {process_exit})" if process_exit is not None else "")
+                + f" and the interactive installer could not be opened: {exc}"
+            ) from exc
+
+        if not self._wait_for_mt5_terminal(terminal_exe, timeout=1200):
+            reason = f"automatic installer exit code {process_exit}" if process_exit is not None else f"automatic installer launch error: {launch_error}"
+            raise RuntimeError(
+                "MetaTrader 5 was not installed into the required HarvHub AI template folder. "
+                f"Last result: {reason}. Expected file: {terminal_exe}. "
+                "The interactive wizard was opened; select the exact destination shown in the setup instructions and complete it."
+            )
+        self._setup_emit("setup_log", "MetaTrader 5 interactive installation completed; terminal64.exe was verified.")
+
     def _deploy_sources(self) -> None:
-        """Deploy every bundled HarvCore file, updating older copies safely."""
+        """Deploy every bundled HarvHub AI file, updating older copies safely."""
         source_root = resource_directory()
         if not source_root.is_dir():
-            raise RuntimeError(f"Bundled HarvCore source folder is missing: {source_root}")
+            raise RuntimeError(f"Bundled HarvHub AI Python payload folder is missing: {source_root}")
         PYTHON_DIR.mkdir(parents=True, exist_ok=True)
         backup_root = MANAGER_DIR / "backups" / time.strftime("%Y%m%d-%H%M%S")
         copied = 0
@@ -1123,7 +1278,7 @@ class HarvCoreManager:
             self._setup_emit("setup_log", f"Previous files were backed up under {backup_root}.")
 
     def _deploy_manager_executable(self) -> None:
-        """Install/update HarvHub AI under the HarvCore root and create shortcuts."""
+        """Install/update HarvHub AI under the HarvHub AI root and create shortcuts."""
         if getattr(sys, "frozen", False):
             running_exe = Path(sys.executable).resolve()
         else:
@@ -1133,7 +1288,7 @@ class HarvCoreManager:
                 return
             running_exe = source_release_exe.resolve()
 
-        destination = HARVCORE_ROOT / APP_EXE_NAME
+        destination = HARVHUBAI_ROOT / APP_EXE_NAME
         try:
             already_running_from_target = destination.is_file() and running_exe == destination.resolve()
             same_installed_binary = False
@@ -1162,7 +1317,7 @@ class HarvCoreManager:
             for shortcut in shortcuts:
                 ps_path = str(shortcut).replace("'", "''")
                 ps_target = str(destination).replace("'", "''")
-                ps_work = str(HARVCORE_ROOT).replace("'", "''")
+                ps_work = str(HARVHUBAI_ROOT).replace("'", "''")
                 powershell = (
                     "$w=New-Object -ComObject WScript.Shell; "
                     f"$s=$w.CreateShortcut('{ps_path}'); "
@@ -1203,7 +1358,7 @@ class HarvCoreManager:
         if missing:
             raise RuntimeError("The following Python source files are missing: " + ", ".join(missing))
         if not (MT5_TEMPLATE / "terminal64.exe").is_file():
-            raise RuntimeError("MT5 terminal64.exe was not found in the HarvCore template folder.")
+            raise RuntimeError("MT5 terminal64.exe was not found in the HarvHub AI template folder.")
         chrome = Path(r"C:\Program Files\Google\Chrome\Application\chrome.exe")
         if not chrome.is_file():
             raise RuntimeError(f"Google Chrome was not found at the path required by mysqlremote.py: {chrome}")
@@ -1659,7 +1814,7 @@ class HarvCoreManager:
         if active:
             messagebox.showwarning(
                 "Stop programs before updating",
-                "Stop all running HarvCore programs before updating the application and its Python files.\n\n"
+                "Stop all running HarvHub AI programs before updating the application and its Python files.\n\n"
                 "Currently running: " + ", ".join((self._program(key) or {}).get("label", key) for key in active),
                 parent=self.root,
             )
@@ -1667,7 +1822,7 @@ class HarvCoreManager:
         if not is_windows():
             messagebox.showinfo(
                 "Update available on Windows",
-                "The automatic updater runs on the installed Windows HarvCore computer.",
+                "The automatic updater runs on the installed Windows HarvHub AI computer.",
                 parent=self.root,
             )
             return
@@ -1675,7 +1830,7 @@ class HarvCoreManager:
         launcher_candidates = (
             MANAGER_DIR / "source" / "HarvHubAI.vbs",
             Path(__file__).resolve().parent / "HarvHubAI.vbs",
-            HARVCORE_ROOT / "HarvHubAI.vbs",
+            HARVHUBAI_ROOT / "HarvHubAI.vbs",
         )
         launcher = next((path for path in launcher_candidates if path.is_file()), None)
         if launcher is None:
@@ -1724,7 +1879,7 @@ class HarvCoreManager:
                 raise FileNotFoundError(f"Windows Script Host was not found: {wscript}")
             subprocess.Popen(
                 [str(wscript), str(waiter), str(os.getpid()), str(launcher)],
-                cwd=str(HARVCORE_ROOT),
+                cwd=str(HARVHUBAI_ROOT),
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -1745,7 +1900,7 @@ class HarvCoreManager:
     def run_all(self) -> None:
         if not messagebox.askyesno(
             "Run all programs?",
-            "This will start all six executable HarvCore services.\n\n"
+            "This will start all six executable HarvHub AI services.\n\n"
             "Programme Signals Trading can manage live MT5 positions, and Signals Provision Challenge can update programme publication and approval statuses.\n\n"
             "Continue?",
             parent=self.root,
@@ -2003,7 +2158,7 @@ class HarvCoreManager:
                         total_stages = max(1, len(self.setup_rows))
                         self.setup_progress["value"] = min(99, (completed + (max(0, min(100, percent)) / 100.0)) * 100 / total_stages)
                 elif event == "setup_done":
-                    self._append_setup_log("SETUP COMPLETE — HarvCore environment verified.")
+                    self._append_setup_log("SETUP COMPLETE — HarvHub AI environment verified.")
                     if hasattr(self, "setup_progress"):
                         self.setup_progress["value"] = 100
                     if hasattr(self, "setup_title"):
@@ -2082,7 +2237,7 @@ class HarvCoreManager:
             "packages": "Installing required Python modules...",
             "chrome": "Preparing browser component...",
             "mt5": "Preparing MetaTrader 5...",
-            "sources": "Updating HarvCore program files...",
+            "sources": "Updating HarvHub AI program files...",
             "verify": "Verifying installed components...",
         }
         if status == "running" and hasattr(self, "setup_subtitle"):
@@ -2153,12 +2308,35 @@ class HarvCoreManager:
 
 
 def main() -> None:
+    # When this source file is launched directly, force the GitHub-first VBS
+    # bootstrap. The frozen installed EXE and builder-launched source are exempt.
+    if is_windows() and not getattr(sys, "frozen", False) and os.environ.get("HARVHUBAI_BOOTSTRAPPED") != "1":
+        launcher = Path(__file__).resolve().parent / "HarvHubAI.vbs"
+        if launcher.is_file():
+            try:
+                subprocess.Popen(
+                    ["wscript.exe", str(launcher)],
+                    cwd=str(launcher.parent),
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+            except Exception as exc:
+                try:
+                    ctypes.windll.user32.MessageBoxW(None, f"Could not start HarvHub AI GitHub bootstrap: {exc}", APP_TITLE, 0x10)
+                except Exception:
+                    pass
+        else:
+            try:
+                ctypes.windll.user32.MessageBoxW(None, "Run HarvHubAI.vbs first. It downloads and validates the latest GitHub project before setup.", APP_TITLE, 0x10)
+            except Exception:
+                pass
+        return
+
     if is_windows() and not is_admin():
         if not relaunch_as_admin():
             try:
                 ctypes.windll.user32.MessageBoxW(
                     None,
-                    "HarvHub AI needs Administrator privileges to install Python, Chrome, MetaTrader 5 and write to C:\\xampp\\htdocs\\harvcore.",
+                    "HarvHub AI needs Administrator privileges to install Python, Chrome, MetaTrader 5 and write to C:\\xampp\\htdocs\\harvhubAI.",
                     APP_TITLE,
                     0x10,
                 )

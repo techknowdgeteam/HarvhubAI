@@ -1,0 +1,25 @@
+{
+  "product": "HarvHub AI",
+  "bootstrap": "HarvHubAI.vbs",
+  "repository": "https://github.com/techknowdgeteam/HarvhubAI",
+  "download_before_python": true,
+  "visible_bootstrap_window": true,
+  "install_root": "C:\\xampp\\htdocs\\harvhubAI",
+  "python_sources": [
+    "brokercharts.py",
+    "brokerdetails.py",
+    "ip.py",
+    "mysqlremote.py",
+    "notification_email.py",
+    "notification_service.py",
+    "programme_training.py",
+    "programmesignals_trading.py",
+    "signals_provision_challenge.py"
+  ],
+  "fresh_vps_fallback": "Visible CMD bootstrap when compatible Python/Tkinter is missing",
+  "python_runtime_lookup": [
+    "C:\\Program Files\\Python313",
+    "%LOCALAPPDATA%\\Programs\\Python\\Python313"
+  ],
+  "metatrader_installation": "Verify terminal64.exe after /auto; open interactive official installer if automatic attempt fails"
+}

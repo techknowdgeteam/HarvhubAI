@@ -16,7 +16,7 @@ from tkinter.scrolledtext import ScrolledText
 
 # The VBS launcher selects the newest complete HarvHub project in Downloads
 # and passes its exact root to the GUI builder.
-APP_DIR = Path(os.environ.get("HARVHUB_SOURCE_ROOT", str(Path(__file__).resolve().parent))).resolve()
+APP_DIR = Path(os.environ.get("HARVHUBAI_SOURCE_ROOT", str(Path(__file__).resolve().parent))).resolve()
 BUILD_ENV = APP_DIR / ".build-venv"
 BUILD_PYTHON = BUILD_ENV / "Scripts" / "python.exe"
 OUTPUT_EXE = APP_DIR / "release" / "HarvHubAI.exe"
@@ -583,7 +583,7 @@ def _atomic_copy_latest(source: Path, destination: Path, backup_root: Path, rela
 
 def install_current_release_files() -> Path:
     """Always replace the installed EXE and deploy source from the selected latest project."""
-    install_root = Path(os.environ.get("HARVCORE_ROOT", r"C:\xampp\htdocs\harvcore"))
+    install_root = Path(os.environ.get("HARVHUBAI_ROOT", r"C:\xampp\htdocs\harvhubAI"))
     destination = install_root / "HarvHubAI.exe"
     install_root.mkdir(parents=True, exist_ok=True)
     if not OUTPUT_EXE.is_file():
@@ -616,7 +616,7 @@ def install_current_release_files() -> Path:
         else:
             unchanged_count += 1
 
-    # Preserve the complete selected project under HarvCore. The installed
+    # Preserve the complete selected project under HarvHub AI. The installed
     # shortcut points to this VBS, which searches Downloads again on every click.
     manager_dir = install_root / ".manager"
     manager_dir.mkdir(parents=True, exist_ok=True)
@@ -722,13 +722,40 @@ def main():
     if os.name != "nt":
         raise SystemExit("This builder is intended for Windows.")
 
+    # The VBS launcher is the sole entry point on a fresh VPS. If this .pyw
+    # file is started directly, hand control to the sibling VBS so GitHub is
+    # downloaded and validated before Python setup/build continues.
+    if os.environ.get("HARVHUBAI_BOOTSTRAPPED") != "1":
+        launcher = Path(__file__).resolve().parent / "HarvHubAI.vbs"
+        if not launcher.is_file():
+            root = tk.Tk()
+            root.withdraw()
+            messagebox.showerror(
+                "HarvHub AI bootstrap required",
+                "Run HarvHubAI.vbs first. It downloads and validates the latest GitHub project before setup."
+            )
+            root.destroy()
+            return
+        try:
+            subprocess.Popen(
+                ["wscript.exe", str(launcher)],
+                cwd=str(launcher.parent),
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except Exception as exc:
+            root = tk.Tk()
+            root.withdraw()
+            messagebox.showerror("HarvHub AI", f"Could not start the GitHub-first launcher: {exc}")
+            root.destroy()
+        return
+
     args = {str(arg).strip().lower() for arg in sys.argv[1:]}
     install_mode = bool(args.intersection({"--install", "/install"}))
     force_rebuild = bool(args.intersection({"--force-rebuild", "/force-rebuild"}))
 
     # The VBS launcher deliberately requests --force-rebuild. Every click then
     # builds from the newest selected Downloads project and overwrites the installed
-    # EXE plus changed HarvCore sources. No stale EXE can short-circuit the update.
+    # EXE plus changed HarvHub AI sources. No stale EXE can short-circuit the update.
     if not (install_mode and force_rebuild) and output_is_current():
         if install_mode:
             if not is_admin():
