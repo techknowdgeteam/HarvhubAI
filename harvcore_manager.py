@@ -504,6 +504,7 @@ class HarvCoreManager:
         self.console_widgets: dict[str, ScrolledText] = {}
         self.console_cards: dict[str, tk.Frame] = {}
         self.console_visible: dict[str, bool] = {}
+        self.program_page_canvases: dict[str, tk.Canvas] = {}
         self.console_toggle_buttons: dict[str, tk.Button] = {}
         self.console_copy_buttons: dict[str, tk.Button] = {}
         self.program_stop_buttons: dict[str, tk.Button] = {}
@@ -2093,8 +2094,37 @@ class HarvCoreManager:
         self.mysql_metrics = dict(status)
 
     def _build_program_page(self, page: tk.Frame, item: dict) -> None:
-        wrapper = tk.Frame(page, bg=self.colors["bg"])
-        wrapper.pack(fill="both", expand=True)
+        if item["key"] == "brokerdetails":
+            # Broker Details needs room for both the manual-login attention list
+            # and its live console. Its content is taller than the fixed workspace
+            # viewport, so make this one program page vertically scrollable.
+            scroll_shell = tk.Frame(page, bg=self.colors["bg"])
+            scroll_shell.pack(fill="both", expand=True)
+            page_canvas = tk.Canvas(
+                scroll_shell, bg=self.colors["bg"], highlightthickness=0,
+                borderwidth=0, yscrollincrement=24,
+            )
+            page_scrollbar = ttk.Scrollbar(
+                scroll_shell, orient="vertical", command=page_canvas.yview,
+            )
+            page_canvas.configure(yscrollcommand=page_scrollbar.set)
+            page_canvas.pack(side="left", fill="both", expand=True)
+            page_scrollbar.pack(side="right", fill="y")
+            wrapper = tk.Frame(page_canvas, bg=self.colors["bg"])
+            page_window = page_canvas.create_window((0, 0), window=wrapper, anchor="nw")
+            wrapper.bind(
+                "<Configure>",
+                lambda _event, canvas=page_canvas: canvas.configure(scrollregion=canvas.bbox("all")),
+            )
+            page_canvas.bind(
+                "<Configure>",
+                lambda event, canvas=page_canvas, window=page_window:
+                    canvas.itemconfigure(window, width=event.width),
+            )
+            self.program_page_canvases[item["key"]] = page_canvas
+        else:
+            wrapper = tk.Frame(page, bg=self.colors["bg"])
+            wrapper.pack(fill="both", expand=True)
         header = self._card(wrapper, 18)
         header.pack(fill="x", pady=(0, 12))
 
@@ -2432,6 +2462,12 @@ class HarvCoreManager:
             self.refresh_computer_ip()
 
     def toggle_console(self, key: str) -> None:
+        """Show the console while keeping the Broker Details dashboard accessible.
+
+        Broker Details is vertically scrollable so its manual-login list remains
+        mounted while Show Console scrolls down to the live output. Other program
+        pages swap their hidden placeholder for the console.
+        """
         card = self.console_cards.get(key)
         button = self.console_toggle_buttons.get(key)
         placeholder = getattr(self, "console_placeholders", {}).get(key)
@@ -2445,6 +2481,10 @@ class HarvCoreManager:
                 placeholder.pack(fill="both", expand=True, pady=(0, 10))
             self.console_visible[key] = False
             button.configure(text="SHOW CONSOLE")
+            if keep_dashboard_visible:
+                canvas = self.program_page_canvases.get(key)
+                if canvas is not None:
+                    canvas.yview_moveto(0.0)
         else:
             if placeholder and placeholder.winfo_exists() and not keep_dashboard_visible:
                 placeholder.pack_forget()
@@ -2452,23 +2492,56 @@ class HarvCoreManager:
             self.console_visible[key] = True
             button.configure(text="HIDE CONSOLE")
             self._sync_console_widget(key)
+            if keep_dashboard_visible:
+                self.root.after_idle(lambda selected=key: self._scroll_program_console_into_view(selected))
+
+    def _scroll_program_console_into_view(self, key: str) -> None:
+        """Scroll the Broker Details page to its console without removing the dashboard."""
+        canvas = self.program_page_canvases.get(key)
+        card = self.console_cards.get(key)
+        if canvas is None or card is None:
+            return
+        try:
+            canvas.update_idletasks()
+            bounds = canvas.bbox("all")
+            if not bounds:
+                return
+            total_height = max(1, bounds[3] - bounds[1])
+            target_y = max(0, card.winfo_y())
+            canvas.yview_moveto(min(1.0, target_y / total_height))
+        except tk.TclError:
+            pass
 
     def _sync_console_widget(self, key: str) -> None:
-        """Rebuild one program's console from its own retained output buffer."""
+        """Replay retained output efficiently without thousands of Tk calls."""
         widget = self.console_widgets.get(key)
         if not widget:
             return
         try:
+            lines = self.raw_logs.get(key, [])[-4000:]
             widget.configure(state="normal")
             widget.delete("1.0", "end")
-            for line in self.raw_logs.get(key, [])[-4000:]:
+            # Group adjacent lines with the same style so a long console opens
+            # in a small number of Tk insert operations rather than one per line.
+            chunks = []
+            current_tag = None
+            current_lines = []
+            for line in lines:
                 lowered = line.lower()
                 tag = (
                     "error" if "traceback" in lowered or "error" in lowered or "failed" in lowered
                     else "success" if "started pid" in lowered or "success" in lowered
                     else "dim" if line.startswith("[") else ""
                 )
-                widget.insert("end", line + ("" if line.endswith("\n") else "\n"), tag)
+                if current_lines and tag != current_tag:
+                    chunks.append((current_tag or "", "\n".join(current_lines) + "\n"))
+                    current_lines = []
+                current_tag = tag
+                current_lines.append(line)
+            if current_lines:
+                chunks.append((current_tag or "", "\n".join(current_lines) + "\n"))
+            for tag, value in chunks:
+                widget.insert("end", value, tag)
             widget.see("end")
             widget.configure(state="disabled")
         except tk.TclError:
@@ -3277,9 +3350,13 @@ Write-Output $count
 
     # ------------------------------ UI events --------------------------------
     def _poll_events(self) -> None:
+        # Bound work per Tk tick. During busy service cycles, an unbounded event
+        # drain can starve button clicks and make the window appear frozen.
+        processed_events = 0
         try:
-            while True:
+            while processed_events < 250:
                 event, data = self.events.get_nowait()
+                processed_events += 1
                 try:
                     if event == "setup_log":
                         self._append_setup_log(str(data[0]))
@@ -3317,7 +3394,16 @@ Write-Output $count
                         key, line, *rest = data
                         self._append_console(key, str(line), rest[0] if rest else None)
                     elif event == "mysql_metrics":
-                        self._apply_mysql_metrics(data[0] if data else None)
+                        # _mysql_status_poll_loop queues the dict directly. Older
+                        # manager builds (and any compatibility producer) may
+                        # still send a one-item tuple/list.
+                        if isinstance(data, dict):
+                            metric_status = data
+                        elif isinstance(data, (tuple, list)):
+                            metric_status = data[0] if data else None
+                        else:
+                            metric_status = None
+                        self._apply_mysql_metrics(metric_status)
                     elif event == "manual_login_refresh":
                         self._refresh_manual_login_dashboard()
                     elif event == "program_status":
@@ -3395,25 +3481,26 @@ Write-Output $count
                         self._update_global_actions()
                         messagebox.showerror("Reset failed", str(data[0]), parent=self.root)
                 except Exception as exc:
+                    # Attribute a UI event failure to its owner only when the
+                    # event explicitly names a known program. Never mislabel a
+                    # manager/dashboard error as MySQL Remote output.
                     event_key = None
-                    if event in ("console_line", "program_status", "process_exit") and data:
-                        event_key = str(data[0])
-                    if event_key not in self.raw_logs:
-                        event_key = "mysqlremote"
-                    try:
-                        self._append_console(
-                            event_key,
-                            f"[MANAGER][EVENT ERROR] Could not process {event!r}: {type(exc).__name__}: {exc}",
-                            "error",
-                        )
-                    except Exception:
-                        self._write_manager_log(
-                            f"Event handler failed for {event!r}: {type(exc).__name__}: {exc}"
-                        )
+                    if event in ("console_line", "program_status", "process_exit") and isinstance(data, (tuple, list)) and data:
+                        candidate = str(data[0])
+                        if candidate in self.raw_logs:
+                            event_key = candidate
+                    message = f"[MANAGER][EVENT ERROR] Could not process {event!r}: {type(exc).__name__}: {exc}"
+                    if event_key:
+                        self._append_console(event_key, message, "error")
+                    else:
+                        self._write_manager_log(message)
         except queue.Empty:
             pass
         if not self.closing:
-            self.root.after(120, self._poll_events)
+            # If backlog remains, return control to Tk frequently so Show
+            # Console, Stop, and Reset controls remain responsive.
+            delay = 15 if not self.events.empty() else 120
+            self.root.after(delay, self._poll_events)
 
     def _append_setup_log(self, line: str) -> None:
         text = str(line)
