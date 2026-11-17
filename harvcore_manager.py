@@ -489,6 +489,8 @@ class HarvCoreManager:
         self.console_visible: dict[str, bool] = {}
         self.console_toggle_buttons: dict[str, tk.Button] = {}
         self.console_copy_buttons: dict[str, tk.Button] = {}
+        self.program_stop_buttons: dict[str, tk.Button] = {}
+        self.output_threads: dict[str, threading.Thread] = {}
         self.raw_logs: dict[str, list[str]] = {item["key"]: [] for item in PROGRAMS}
         self.setup_raw_lines: list[str] = []
         self.setup_step_states: dict[str, str] = {}
@@ -505,11 +507,15 @@ class HarvCoreManager:
         self.auto_setup_after_id = None
         self.global_run_all_button: Optional[tk.Button] = None
         self.global_stop_all_button: Optional[tk.Button] = None
+        self.global_reset_all_button: Optional[tk.Button] = None
         self.global_update_button: Optional[tk.Button] = None
         self.global_header: Optional[tk.Frame] = None
         self.global_header_left: Optional[tk.Frame] = None
         self.global_header_right: Optional[tk.Frame] = None
         self.run_all_lock = threading.Lock()
+        self.run_all_cancel = threading.Event()
+        self.reset_lock = threading.Lock()
+        self.stop_all_in_progress = False
         self.closing = False
         self.active_page_key = "home"
         self.pages: dict[str, tk.Frame] = {}
@@ -705,6 +711,7 @@ class HarvCoreManager:
         self.global_execution_combo = ttk.Combobox(
             button_group, textvariable=self.global_execution_var,
             values=("Loop", "Once"), state="readonly", width=7,
+            style="HarvHub.TCombobox",
         )
         self.global_execution_combo.pack(side="left", padx=(0, 9))
         self.global_execution_combo.bind("<<ComboboxSelected>>", self._on_global_execution_changed)
@@ -718,6 +725,10 @@ class HarvCoreManager:
             button_group, "■  STOP ALL", self.stop_all, kind="danger"
         )
         self.global_stop_all_button.pack_forget()
+        self.global_reset_all_button = self._button(
+            button_group, "↺  RESET ALL", self.reset_all, kind="quiet"
+        )
+        self.global_reset_all_button.pack(side="left", padx=(0, 7))
         self.global_update_button = self._button(
             button_group, "↻  UPDATE", self.update_application, kind="quiet"
         )
@@ -760,6 +771,34 @@ class HarvCoreManager:
         self.style.configure("Treeview.Heading", background=c["surface2"], foreground=c["muted"], font=("Segoe UI", 9, "bold"), relief="flat")
         self.style.map("Treeview", background=[("selected", c["surface3"])], foreground=[("selected", c["text"])])
 
+        # The application uses the same colored, borderless selector in the
+        # header and on each program page (rather than the platform default).
+        self.style.configure(
+            "HarvHub.TCombobox",
+            fieldbackground=c["surface2"],
+            background=c["gold"],
+            foreground=c["text"],
+            arrowcolor="#ffffff",
+            bordercolor=c["surface2"],
+            lightcolor=c["surface2"],
+            darkcolor=c["surface2"],
+            relief="flat",
+            borderwidth=0,
+            padding=(9, 5),
+            arrowsize=14,
+            font=("Segoe UI", 9, "bold"),
+        )
+        self.style.map(
+            "HarvHub.TCombobox",
+            fieldbackground=[("readonly", c["surface2"]), ("focus", c["surface2"])],
+            foreground=[("readonly", c["text"]), ("disabled", c["muted"])],
+            background=[("active", c["gold_hover"]), ("readonly", c["gold"])],
+            arrowcolor=[("active", "#ffffff"), ("!disabled", "#ffffff")],
+            bordercolor=[("focus", c["surface2"]), ("!focus", c["surface2"])],
+            lightcolor=[("focus", c["surface2"]), ("!focus", c["surface2"])],
+            darkcolor=[("focus", c["surface2"]), ("!focus", c["surface2"])],
+        )
+
     def _button(self, parent: tk.Widget, text: str, command: Callable, kind: str = "primary", width: Optional[int] = None) -> tk.Button:
         c = self.colors
         if kind == "primary":
@@ -794,6 +833,7 @@ class HarvCoreManager:
         self.console_cards.clear()
         self.console_toggle_buttons.clear()
         self.console_copy_buttons.clear()
+        self.program_stop_buttons.clear()
         self.console_visible.clear()
         self.status_widgets.clear()
         self.setup_rows.clear()
@@ -818,6 +858,8 @@ class HarvCoreManager:
         self.workspace_built = False
         if self.global_run_all_button is not None:
             self.global_run_all_button.configure(state="disabled", text="▶  RUN ALL")
+        if self.global_reset_all_button is not None:
+            self.global_reset_all_button.configure(state="disabled", text="↺  RESET ALL")
         if self.global_update_button is not None:
             self.global_update_button.configure(state="disabled")
         self._clear_content()
@@ -1515,6 +1557,8 @@ class HarvCoreManager:
         self.workspace_built = True
         if self.global_run_all_button is not None:
             self.global_run_all_button.configure(state="normal", text="▶  RUN ALL")
+        if self.global_reset_all_button is not None:
+            self.global_reset_all_button.configure(state="normal", text="↺  RESET ALL")
         if self.global_update_button is not None:
             self.global_update_button.configure(state="normal")
         self._clear_content()
@@ -1536,12 +1580,9 @@ class HarvCoreManager:
 
     def _build_navigation(self) -> None:
         nav = self.nav_panel
-        brand = tk.Frame(nav, bg=self.colors["surface"])
-        brand.pack(fill="x", padx=12, pady=(14, 10))
-        tk.Label(brand, text="H", bg=self.colors["gold"], fg="white",
-                 font=("Segoe UI", 13, "bold"), width=3, pady=5).pack(side="left", padx=(0, 9))
+        # The H brand mark is reserved for the main window header only.
         separator = tk.Frame(nav, bg=self.colors["border"], height=1)
-        separator.pack(fill="x", padx=12, pady=(0, 10))
+        separator.pack(fill="x", padx=12, pady=(14, 10))
         self.nav_list = tk.Frame(nav, bg=self.colors["surface"])
         self.nav_list.pack(fill="both", expand=True, padx=9, pady=(0, 12))
         self.nav_buttons = {}
@@ -1557,6 +1598,7 @@ class HarvCoreManager:
             )
             btn.bind("<Enter>", lambda event, key=item["key"]: self._on_nav_hover(key, True))
             btn.bind("<Leave>", lambda event, key=item["key"]: self._on_nav_hover(key, False))
+            btn.pack(fill="x", pady=2)
             self.nav_buttons[item["key"]] = btn
 
     def _on_nav_hover(self, key: str, hovered: bool) -> None:
@@ -1576,8 +1618,6 @@ class HarvCoreManager:
         home_card.pack(fill="both", expand=True)
         center = tk.Frame(home_card, bg=self.colors["surface"])
         center.place(relx=0.5, rely=0.47, anchor="center")
-        tk.Label(center, text="H", bg=self.colors["gold"], fg="white",
-                 font=("Segoe UI", 30, "bold"), width=3, height=1, pady=9).pack(pady=(0, 16))
         tk.Label(center, text="Choose a program from the navigation to view its controls.",
                  bg=self.colors["surface"], fg=self.colors["muted"], font=("Segoe UI", 9),
                  wraplength=480, justify="center").pack()
@@ -1700,6 +1740,7 @@ class HarvCoreManager:
 
         list_shell = tk.Frame(panel, bg=self.colors["surface"])
         list_shell.pack(fill="both", expand=True, pady=(8, 0))
+        self.manual_login_list_shell = list_shell
         canvas = tk.Canvas(list_shell, bg=self.colors["surface"], highlightthickness=0, borderwidth=0)
         scrollbar = ttk.Scrollbar(list_shell, orient="vertical", command=canvas.yview)
         canvas.configure(yscrollcommand=scrollbar.set)
@@ -1735,11 +1776,27 @@ class HarvCoreManager:
         accounts = [item for item in manual_items if str(item.get("kind", "SA")).upper() == "SA"]
         programmes = [item for item in manual_items if str(item.get("kind", "SA")).upper() == "PRG"]
         total = len(accounts) + len(programmes)
+        # Do not leave the user on an empty Accounts tab when the pending item
+        # is a Programme request (or vice versa).
+        if self.manual_login_tab == "SA" and not accounts and programmes:
+            self.manual_login_tab = "PRG"
+        elif self.manual_login_tab == "PRG" and not programmes and accounts:
+            self.manual_login_tab = "SA"
         self.manual_login_count_label.configure(text=f"{total} NEED ATTENTION")
+        tab_labels = {
+            "SA": f"Accounts ({len(accounts)})",
+            "PRG": f"Programme ({len(programmes)})",
+        }
+        for kind, button in getattr(self, "manual_login_tab_buttons", {}).items():
+            button.configure(text=tab_labels.get(kind, kind))
         if hasattr(self, "manual_login_tabs_frame"):
             if total:
                 if not self.manual_login_tabs_frame.winfo_manager():
-                    self.manual_login_tabs_frame.pack(fill="x", pady=(0, 3))
+                    list_shell = getattr(self, "manual_login_list_shell", None)
+                    if list_shell is not None and list_shell.winfo_exists():
+                        self.manual_login_tabs_frame.pack(fill="x", pady=(0, 3), before=list_shell)
+                    else:
+                        self.manual_login_tabs_frame.pack(fill="x", pady=(0, 3))
                 self.manual_login_message.configure(
                     text="These accounts or programmes need a manual MT5 login. Open the terminal, sign in, then confirm the credentials here."
                 )
@@ -1750,6 +1807,13 @@ class HarvCoreManager:
                 )
         for kind, button in getattr(self, "manual_login_tab_buttons", {}).items():
             button.configure(bg=self.colors["gold"] if kind == self.manual_login_tab else self.colors["surface2"])
+        nav_button = getattr(self, "nav_buttons", {}).get("brokerdetails")
+        if nav_button:
+            broker_item = self._program("brokerdetails") or {}
+            nav_text = f"{broker_item.get('icon', '▣')}   {broker_item.get('label', 'Broker Details')}"
+            if total:
+                nav_text += f"   ·   {total} NEED ATTENTION"
+            nav_button.configure(text=nav_text)
         for child in self.manual_login_items_frame.winfo_children():
             child.destroy()
         selected = accounts if self.manual_login_tab == "SA" else programmes
@@ -2021,7 +2085,7 @@ class HarvCoreManager:
         self.program_execution_vars[item["key"]] = execution_var
         execution_combo = ttk.Combobox(
             controls, textvariable=execution_var, values=("Loop", "Once"),
-            state="readonly", width=7,
+            state="readonly", width=7, style="HarvHub.TCombobox",
         )
         execution_combo.pack(side="left", padx=(0, 10))
         execution_combo.bind(
@@ -2032,7 +2096,8 @@ class HarvCoreManager:
         play = self._button(controls, "▶  PLAY", lambda key=item["key"]: self.start_program(key), kind="success")
         play.pack(side="left", padx=(0, 7))
         stop = self._button(controls, "■  STOP", lambda key=item["key"]: self.stop_program(key), kind="danger")
-        stop.pack(side="left", padx=(0, 7))
+        self.program_stop_buttons[item["key"]] = stop
+        stop.pack_forget()
         toggle = self._button(controls, "SHOW CONSOLE", lambda key=item["key"]: self.toggle_console(key), kind="quiet")
         toggle.pack(side="left", padx=(0, 7))
         self.console_toggle_buttons[item["key"]] = toggle
@@ -2114,6 +2179,7 @@ class HarvCoreManager:
             for button in (
                 self.global_run_all_button,
                 self.global_stop_all_button,
+                self.global_reset_all_button,
                 self.global_update_button,
             ):
                 if button is not None and button.winfo_exists():
@@ -2153,8 +2219,10 @@ class HarvCoreManager:
             if not button.winfo_exists():
                 return
             if self._running_program_keys():
+                button.configure(state="normal")
                 if button.winfo_manager() != "pack":
-                    button.pack(side="left", before=self.global_update_button, padx=(0, 7))
+                    next_button = self.global_reset_all_button or self.global_update_button
+                    button.pack(side="left", before=next_button, padx=(0, 7))
             else:
                 button.pack_forget()
         except tk.TclError:
@@ -2326,21 +2394,41 @@ class HarvCoreManager:
         if not card or not button:
             return
         visible = self.console_visible.get(key, False)
+        keep_dashboard_visible = key == "brokerdetails"
         if visible:
             card.pack_forget()
-            if placeholder and placeholder.winfo_exists():
+            if placeholder and placeholder.winfo_exists() and not keep_dashboard_visible:
                 placeholder.pack(fill="both", expand=True, pady=(0, 10))
             self.console_visible[key] = False
             button.configure(text="SHOW CONSOLE")
         else:
-            if placeholder and placeholder.winfo_exists():
+            if placeholder and placeholder.winfo_exists() and not keep_dashboard_visible:
                 placeholder.pack_forget()
             card.pack(fill="both", expand=True, pady=(0, 8))
             self.console_visible[key] = True
             button.configure(text="HIDE CONSOLE")
-            widget = self.console_widgets.get(key)
-            if widget:
-                widget.see("end")
+            self._sync_console_widget(key)
+
+    def _sync_console_widget(self, key: str) -> None:
+        """Rebuild one program's console from its own retained output buffer."""
+        widget = self.console_widgets.get(key)
+        if not widget:
+            return
+        try:
+            widget.configure(state="normal")
+            widget.delete("1.0", "end")
+            for line in self.raw_logs.get(key, [])[-4000:]:
+                lowered = line.lower()
+                tag = (
+                    "error" if "traceback" in lowered or "error" in lowered or "failed" in lowered
+                    else "success" if "started pid" in lowered or "success" in lowered
+                    else "dim" if line.startswith("[") else ""
+                )
+                widget.insert("end", line + ("" if line.endswith("\n") else "\n"), tag)
+            widget.see("end")
+            widget.configure(state="disabled")
+        except tk.TclError:
+            pass
 
     def _copy_text(self, value: str, button: Optional[tk.Button] = None) -> None:
         try:
@@ -2460,57 +2548,109 @@ class HarvCoreManager:
         execution_type = self.global_execution_type
         warning = (
             "Programme Signals Trading can manage live MT5 positions, and Signals Provision Challenge can update programme publication and approval statuses.\n\n"
-            f"Execution type: {execution_type.upper()}. MySQL Remote will stay in listener mode as the shared database dependency while the other services run.\n\n"
+            f"Execution type: {execution_type.upper()}. MySQL Remote starts first as the shared database dependency; each other program is then started as a separate process with its own tab console.\n\n"
             "Continue?"
         )
+        if self.stop_all_in_progress or self.reset_lock.locked():
+            return
         if not messagebox.askyesno("Run all programs?", warning, parent=self.root):
             return
         if not self.run_all_lock.acquire(blocking=False):
             return
+        self.run_all_cancel.clear()
         self._set_global_run_all_buttons("disabled", "STARTING...")
+        if self.global_reset_all_button is not None:
+            self.global_reset_all_button.configure(state="disabled")
         threading.Thread(
             target=self._run_all_worker, args=(execution_type,),
             name="harvcore-run-all", daemon=True,
         ).start()
 
     def _run_all_worker(self, execution_type: str = "once") -> None:
-        bridge_was_available = self._port_open()
         bridge_started_here = False
+        newly_started_workers: list[str] = []
+        attempted_workers: set[str] = set()
+        reported_skips: set[str] = set()
         try:
-            self._ui_log("mysqlremote", "[MANAGER] Starting MySQL Remote bridge first...\n")
-            if not bridge_was_available:
-                bridge_started_here = self._launch_process("mysqlremote", execution_type="loop")
-            if not self._wait_for_bridge(timeout=150):
-                self._ui_log("mysqlremote", "[MANAGER] MySQL Remote did not open port 5599. Other programs were not started.\n", "error")
-                self.events.put(("run_all_finished", ()))
+            if self.run_all_cancel.is_set() or self.closing:
                 return
+
+            bridge_was_available = self._port_open()
+            managed_bridge_running = self._is_process_running("mysqlremote")
+            self._ui_log("mysqlremote", "[MANAGER] Run All: checking the MySQL Remote dependency.\n", "dim")
+
+            if not bridge_was_available and not managed_bridge_running:
+                self._ui_log("mysqlremote", "[MANAGER] Starting MySQL Remote bridge first.\n", "dim")
+                bridge_started_here = self._launch_process("mysqlremote", execution_type="loop")
+                if not bridge_started_here and not self._is_process_running("mysqlremote"):
+                    raise RuntimeError("MySQL Remote could not be started; dependent programs were not launched.")
+            elif bridge_was_available and not managed_bridge_running:
+                self._ui_log(
+                    "mysqlremote",
+                    "[MANAGER] An existing MySQL Remote listener is already active. Its external process is not attached to this window's console.\n",
+                    "dim",
+                )
+                self.events.put(("program_status", ("mysqlremote", "RUNNING")))
+            else:
+                self._ui_log("mysqlremote", "[MANAGER] MySQL Remote is already running under this manager.\n", "success")
+
+            if not self._wait_for_bridge(timeout=150, cancel_event=self.run_all_cancel):
+                if self.run_all_cancel.is_set() or self.closing:
+                    return
+                reason = "MySQL Remote did not open port 5599; this program needs the database bridge."
+                for key in RUN_ALL_ORDER[1:]:
+                    self._ui_log(key, f"[MANAGER] Not started by Run All: {reason}\n", "error")
+                    self.events.put(("program_status", (key, "ERROR")))
+                    reported_skips.add(key)
+                raise RuntimeError("MySQL Remote did not become ready on port 5599.")
+
             self._ui_log("mysqlremote", "[MANAGER] Bridge port 5599 is accepting connections.\n", "success")
-            newly_started_workers = []
             for key in RUN_ALL_ORDER[1:]:
-                if self.closing:
+                if self.closing or self.run_all_cancel.is_set():
                     break
                 was_running = self._is_process_running(key)
-                self._launch_process(key, execution_type=execution_type)
-                if not was_running:
+                attempted_workers.add(key)
+                self._ui_log(
+                    key,
+                    "[MANAGER] Run All requested this program. Starting it in its own process; its output will appear only in this program's Show Console view.\n",
+                    "dim",
+                )
+                started = self._launch_process(key, execution_type=execution_type)
+                if started and not was_running and self._is_process_running(key):
                     newly_started_workers.append(key)
-                time.sleep(0.8)
+                elif not started:
+                    self._ui_log(key, "[MANAGER] Run All could not start this program. See the error above in this program's console.\n", "error")
+                    self.events.put(("program_status", (key, "ERROR")))
+                time.sleep(0.25)
 
-            if execution_type == "once":
-                # Wait for one complete pass from services started by this
-                # action. Already-running workers are left untouched.
-                while not self.closing:
-                    active_workers = [key for key in newly_started_workers if self._is_process_running(key)]
+            if execution_type == "once" and not self.run_all_cancel.is_set():
+                # Wait only for one-shot workers created by this Run All request.
+                # Existing workers are left untouched.
+                while not self.closing and not self.run_all_cancel.is_set():
+                    active_workers = [
+                        key for key in newly_started_workers
+                        if self._is_process_running(key)
+                    ]
                     if not active_workers:
                         break
-                    time.sleep(0.5)
-                if bridge_started_here:
-                    self._ui_log("mysqlremote", "[MANAGER] One-shot workers completed; stopping the temporary database listener.\n", "dim")
+                    time.sleep(0.35)
+                if bridge_started_here and not self.run_all_cancel.is_set():
+                    self._ui_log(
+                        "mysqlremote",
+                        "[MANAGER] One-shot workers completed; stopping the temporary database listener.\n",
+                        "dim",
+                    )
                     self._stop_process_worker("mysqlremote")
-            self.events.put(("run_all_finished", ()))
         except Exception as exc:
             self._ui_log("mysqlremote", f"[MANAGER] Run All failed: {exc}\n", "error")
-            self.events.put(("run_all_finished", ()))
+            # Make the reason visible on every program page that was skipped,
+            # not only in the coordinator's MySQL Remote console.
+            for key in RUN_ALL_ORDER[1:]:
+                if key not in attempted_workers and key not in reported_skips:
+                    self._ui_log(key, f"[MANAGER] Run All did not start this program: {exc}\n", "error")
+                    self.events.put(("program_status", (key, "ERROR")))
         finally:
+            self.events.put(("run_all_finished", ()))
             try:
                 self.run_all_lock.release()
             except RuntimeError:
@@ -2553,11 +2693,13 @@ class HarvCoreManager:
             script = PYTHON_DIR / item["filename"]
             if not script.is_file():
                 self._ui_log(key, f"[MANAGER] Program file not found: {script}\n", "error")
+                self.events.put(("program_status", (key, "ERROR")))
                 return False
             if not self.python_exe:
                 self.python_exe = locate_python()
             if not self.python_exe:
                 self._ui_log(key, "[MANAGER] Python 3.13 x64 is not available. Run Setup / Repair first.\n", "error")
+                self.events.put(("program_status", (key, "ERROR")))
                 return False
 
             selected_execution = execution_type or self.program_execution_types.get(
@@ -2602,7 +2744,13 @@ class HarvCoreManager:
 
         self.events.put(("program_status", (key, "RUNNING")))
         self._ui_log(key, f"[MANAGER] Started PID {process.pid}: {' '.join(command)}\n", "success")
-        threading.Thread(target=self._read_process_output, args=(key, process), daemon=True, name=f"{key}-output").start()
+        self._ui_log(key, "[MANAGER] This program's output is attached to this program's own console.\n", "dim")
+        reader = threading.Thread(
+            target=self._read_process_output, args=(key, process),
+            daemon=True, name=f"{key}-output",
+        )
+        self.output_threads[key] = reader
+        reader.start()
         return True
 
     def _read_process_output(self, key: str, process: subprocess.Popen) -> None:
@@ -2622,16 +2770,194 @@ class HarvCoreManager:
         threading.Thread(target=self._stop_process_worker, args=(key,), daemon=True).start()
 
     def stop_all(self) -> None:
+        if self.stop_all_in_progress or self.reset_lock.locked():
+            return
         if not messagebox.askyesno("Stop all programs?", "Stop all running programs and their child worker processes?", parent=self.root):
             return
+        self.stop_all_in_progress = True
+        self.run_all_cancel.set()
+        self._set_global_run_all_buttons("disabled", "STOPPING...")
+        if self.global_reset_all_button is not None:
+            self.global_reset_all_button.configure(state="disabled")
         threading.Thread(target=self._stop_all_worker, daemon=True).start()
 
     def _stop_all_worker(self) -> None:
+        self.run_all_cancel.set()
+        # Let Run All observe cancellation before taking the final process snapshot.
+        deadline = time.monotonic() + 12
+        while self.run_all_lock.locked() and time.monotonic() < deadline:
+            time.sleep(0.1)
         with self.process_lock:
             keys = list(self.processes.keys())
         for key in keys:
             self._stop_process_worker(key)
+        orphan_count, orphan_error = self._stop_orphaned_harvhub_services()
+        if orphan_count:
+            self._ui_log(
+                "mysqlremote",
+                f"[MANAGER] Stop All also terminated {orphan_count} orphaned HarvHub service process(es).\n",
+                "dim",
+            )
+        if orphan_error:
+            self._ui_log("mysqlremote", f"[MANAGER] Orphan service cleanup warning: {orphan_error}\n", "error")
         self.events.put(("all_stopped", ()))
+
+    def reset_all(self) -> None:
+        if self.reset_lock.locked() or self.stop_all_in_progress:
+            return
+        if not messagebox.askyesno(
+            "Reset HarvHub AI?",
+            "This will stop all HarvHub services (including orphaned instances), terminate HarvHub MT5 terminals and child processes, clear all program consoles, and return the window to its initial Home view.\n\nPending manual-login requests will be kept so they are not lost.\n\nContinue?",
+            parent=self.root,
+        ):
+            return
+        if not self.reset_lock.acquire(blocking=False):
+            return
+        self.run_all_cancel.set()
+        if self.global_reset_all_button is not None:
+            self.global_reset_all_button.configure(state="disabled", text="RESETTING...")
+        self._set_global_run_all_buttons("disabled", "STOPPING...")
+        if self.global_stop_all_button is not None:
+            self.global_stop_all_button.configure(state="disabled")
+        threading.Thread(
+            target=self._reset_all_worker,
+            name="harvhub-reset-all",
+            daemon=True,
+        ).start()
+
+    def _reset_all_worker(self) -> None:
+        try:
+            # Cancel a Run All that may still be bringing up the database bridge.
+            deadline = time.monotonic() + 15
+            while self.run_all_lock.locked() and time.monotonic() < deadline:
+                time.sleep(0.1)
+
+            # Stop every program owned by this manager. taskkill /T in
+            # _stop_process_worker also terminates descendants such as child
+            # MT5 terminal processes started by the service.
+            with self.process_lock:
+                keys = list(self.processes.keys())
+            for key in keys:
+                self._stop_process_worker(key)
+
+            # Catch any process that finished launching just as cancellation
+            # was requested, then wait for its stdout reader to flush/close.
+            with self.process_lock:
+                late_keys = list(self.processes.keys())
+            for key in late_keys:
+                if self._is_process_running(key):
+                    self._stop_process_worker(key)
+            for reader in list(self.output_threads.values()):
+                if reader and reader.is_alive():
+                    reader.join(timeout=2.5)
+
+            # Also remove orphaned HarvHub service processes left behind by a
+            # prior crash/restart. Match only the exact six deployed service
+            # script paths so unrelated Python programs remain untouched.
+            orphan_count, orphan_error = self._stop_orphaned_harvhub_services()
+
+            # Broker Details deliberately launches MT5 terminals detached from
+            # its service process, so taskkill /T on the Python service alone
+            # is not sufficient. Restrict this cleanup to HarvHub's own MT5
+            # installation tree; unrelated user terminals are left untouched.
+            terminal_count, terminal_error = self._stop_harvhub_mt5_terminals()
+            cleanup_errors = [value for value in (orphan_error, terminal_error) if value]
+            time.sleep(0.15)
+            self.events.put(("reset_complete", (orphan_count, terminal_count, "\n\n".join(cleanup_errors))))
+        except Exception as exc:
+            self.events.put(("reset_failed", (str(exc),)))
+        finally:
+            try:
+                self.reset_lock.release()
+            except RuntimeError:
+                pass
+
+    def _stop_orphaned_harvhub_services(self) -> tuple[int, str]:
+        """Stop stale service interpreters running HarvHub's exact script files."""
+        if not is_windows():
+            return 0, ""
+        script_paths = []
+        for key in RUN_ALL_ORDER:
+            item = self._program(key)
+            if item:
+                script_paths.append(str((PYTHON_DIR / item["filename"]).resolve()).replace("'", "''"))
+        if not script_paths:
+            return 0, ""
+        powershell_paths = ",\n    ".join(f"'{path}'" for path in script_paths)
+        script = f"""
+$scriptPaths = @(
+    {powershell_paths}
+)
+$items = @(Get-CimInstance Win32_Process -Filter "Name='python.exe' OR Name='pythonw.exe'" -ErrorAction SilentlyContinue | Where-Object {{
+    $commandLine = [string]$_.CommandLine
+    $matched = $false
+    foreach ($scriptPath in $scriptPaths) {{
+        if ($commandLine.IndexOf($scriptPath, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {{
+            $matched = $true
+            break
+        }}
+    }}
+    $matched
+}})
+$count = 0
+foreach ($item in $items) {{
+    & (Join-Path (Join-Path $env:WINDIR 'System32') 'taskkill.exe') /PID $item.ProcessId /T /F | Out-Null
+    $count++
+}}
+Write-Output $count
+"""
+        try:
+            result = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=25,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            if result.returncode != 0:
+                detail = (result.stderr or result.stdout or "PowerShell returned an error").strip()
+                return 0, detail[-1000:]
+            lines = [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+            return (int(lines[-1]) if lines else 0), ""
+        except Exception as exc:
+            return 0, str(exc)
+
+    def _stop_harvhub_mt5_terminals(self) -> tuple[int, str]:
+        """Close only HarvHub-owned terminal64.exe processes under MT5_ROOT."""
+        if not is_windows():
+            return 0, ""
+        root = str(MT5_ROOT.resolve()).replace("'", "''")
+        script = f"""
+$root = [System.IO.Path]::GetFullPath('{root}').TrimEnd([char]92) + [char]92
+$items = @(Get-CimInstance Win32_Process -Filter "Name='terminal64.exe'" -ErrorAction SilentlyContinue | Where-Object {{
+    $_.ExecutablePath -and $_.ExecutablePath.StartsWith($root, [System.StringComparison]::OrdinalIgnoreCase)
+}})
+$count = 0
+foreach ($item in $items) {{
+    & (Join-Path (Join-Path $env:WINDIR 'System32') 'taskkill.exe') /PID $item.ProcessId /T /F | Out-Null
+    $count++
+}}
+Write-Output $count
+"""
+        try:
+            result = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=25,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            if result.returncode != 0:
+                detail = (result.stderr or result.stdout or "PowerShell returned an error").strip()
+                return 0, detail[-1000:]
+            lines = [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+            return (int(lines[-1]) if lines else 0), ""
+        except Exception as exc:
+            return 0, str(exc)
 
     def _stop_process_worker(self, key: str) -> None:
         with self.process_lock:
@@ -2671,17 +2997,19 @@ class HarvCoreManager:
         self.events.put(("program_status", (key, "STOPPED")))
         self._ui_log(key, "[MANAGER] Process stopped.\n", "dim")
 
-    def _wait_for_bridge(self, timeout: int) -> bool:
+    def _wait_for_bridge(self, timeout: int, cancel_event: Optional[threading.Event] = None) -> bool:
         started = time.monotonic()
         while time.monotonic() - started < timeout and not self.closing:
+            if cancel_event is not None and cancel_event.is_set():
+                return False
             if self._port_open():
                 return True
             with self.process_lock:
                 bridge = self.processes.get("mysqlremote")
             if bridge and bridge.process.poll() is not None:
                 return False
-            time.sleep(1)
-        return self._port_open()
+            time.sleep(0.35)
+        return self._port_open() and not (cancel_event and cancel_event.is_set())
 
     @staticmethod
     def _port_open() -> bool:
@@ -2789,15 +3117,70 @@ class HarvCoreManager:
                     self._set_program_status(key, "STOPPED")
                     self._append_console(key, f"[MANAGER] Process exited with code {code}.", "dim" if code in (0, None) else "error")
                 elif event == "run_all_finished":
-                    self._set_global_run_all_buttons("normal", "▶  RUN ALL")
+                    if not self.stop_all_in_progress and not self.reset_lock.locked():
+                        self._set_global_run_all_buttons("normal", "▶  RUN ALL")
+                        if self.global_reset_all_button is not None:
+                            self.global_reset_all_button.configure(state="normal", text="↺  RESET ALL")
                 elif event == "setup_cancelled":
                     self.setup_started = False
                     self.setup_view_active = False
                     self._append_setup_log("Setup stopped. Completed components were left in place; Setup / Repair can resume later.")
                     self._show_workspace()
                 elif event == "all_stopped":
+                    self.stop_all_in_progress = False
+                    for item in PROGRAMS:
+                        key = item["key"]
+                        self._set_program_status(key, "RUNNING" if self._is_process_running(key) else "STOPPED")
+                    self._set_global_run_all_buttons("normal", "▶  RUN ALL")
+                    if self.global_reset_all_button is not None and not self.reset_lock.locked():
+                        self.global_reset_all_button.configure(state="normal", text="↺  RESET ALL")
                     self._update_global_actions()
                     self._update_summary()
+                elif event == "reset_complete":
+                    orphan_count = int(data[0]) if data else 0
+                    terminal_count = int(data[1]) if len(data) > 1 else 0
+                    terminal_error = str(data[2]) if len(data) > 2 and data[2] else ""
+                    self.stop_all_in_progress = False
+                    for item in PROGRAMS:
+                        key = item["key"]
+                        self.clear_console(key)
+                        self.console_visible[key] = False
+                        card = self.console_cards.get(key)
+                        if card:
+                            card.pack_forget()
+                        placeholder = getattr(self, "console_placeholders", {}).get(key)
+                        if placeholder and placeholder.winfo_exists() and placeholder.winfo_manager() != "pack":
+                            placeholder.pack(fill="both", expand=True, pady=(0, 10))
+                        toggle = self.console_toggle_buttons.get(key)
+                        if toggle:
+                            toggle.configure(text="SHOW CONSOLE")
+                        self._set_program_status(key, "STOPPED")
+                    self._show_page("home")
+                    self.manual_login_tab = "SA"
+                    self._refresh_manual_login_dashboard()
+                    self._set_global_run_all_buttons("normal", "▶  RUN ALL")
+                    if self.global_reset_all_button is not None:
+                        self.global_reset_all_button.configure(state="normal", text="↺  RESET ALL")
+                    self.run_all_cancel.clear()
+                    self._update_global_actions()
+                    self._update_summary()
+                    if terminal_error:
+                        messagebox.showwarning(
+                            "Reset completed with a terminal warning",
+                            "The manager stopped the programs it owned, but one cleanup task reported an issue:\n\n"
+                            + terminal_error,
+                            parent=self.root,
+                        )
+                    else:
+                        self.root.title(f"{APP_TITLE} — Reset complete")
+                        self.root.after(2200, lambda: self.root.title(APP_TITLE) if self.root.winfo_exists() else None)
+                elif event == "reset_failed":
+                    self.stop_all_in_progress = False
+                    self._set_global_run_all_buttons("normal", "▶  RUN ALL")
+                    if self.global_reset_all_button is not None:
+                        self.global_reset_all_button.configure(state="normal", text="↺  RESET ALL")
+                    self._update_global_actions()
+                    messagebox.showerror("Reset failed", str(data[0]), parent=self.root)
         except queue.Empty:
             pass
         if not self.closing:
@@ -2851,6 +3234,16 @@ class HarvCoreManager:
 
     def _set_program_status(self, key: str, status: str) -> None:
         widget = self.status_widgets.get(key)
+        managed_running = self._is_process_running(key)
+        stop_button = self.program_stop_buttons.get(key)
+        if stop_button is not None:
+            try:
+                if managed_running and stop_button.winfo_manager() != "pack":
+                    stop_button.pack(side="left", padx=(0, 7), before=self.console_toggle_buttons.get(key))
+                elif not managed_running:
+                    stop_button.pack_forget()
+            except tk.TclError:
+                pass
         if widget:
             if status == "RUNNING":
                 widget.configure(text="RUNNING", bg=self.colors["green"], fg="#ffffff")
@@ -2889,6 +3282,7 @@ class HarvCoreManager:
 
     # ------------------------------ Shutdown ---------------------------------
     def on_close(self) -> None:
+        self.run_all_cancel.set()
         active = []
         with self.process_lock:
             active = [key for key, entry in self.processes.items() if entry.process.poll() is None]
