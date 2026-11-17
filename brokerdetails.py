@@ -3095,15 +3095,18 @@ def main_loop():
     _build_timeframe_map()
     print(f"\n{'#'*70}")
     print("#  brokerdetails — broker login monitoring")
-    print(f"#  started at {datetime.now().isoformat(timespec='seconds')}")
-    print(f"#  execution type: {'loop' if run_as_loop else 'once'} | interval: {loop_interval}s")
+    print(f"#  started at {datetime.now().isoformat(timespec='seconds')}", flush=True)
+    print(f"#  execution type: {'loop' if run_as_loop else 'once'} | interval: {loop_interval}s", flush=True)
     print(f"{'#'*70}")
 
     try:
+        cycle_number = 0
         while True:
+            cycle_number += 1
+            print(f"\n[main] broker login scan #{cycle_number} starting...", flush=True)
             try:
                 result = check_if_broker_is_logged_in()
-                print(f"[main] {result.get('message')}")
+                print(f"[main] scan #{cycle_number} result: {result.get('message')}", flush=True)
             except Exception as e:
                 print(f"[main] check_if_broker_is_logged_in raised: {e}")
                 traceback.print_exc()
@@ -3114,7 +3117,7 @@ def main_loop():
                 # unresolved rows so Valid/Invalid clicks can be applied safely.
                 if not _MANUAL_WINDOW.has_pending_items():
                     break
-                print("[main] Waiting for manual MT5 login decisions in the HarvHub window.")
+                print("[main] Waiting for manual MT5 login decisions in the HarvHub window.", flush=True)
                 while _MANUAL_WINDOW.has_pending_items():
                     time.sleep(float(loop_interval))
                     try:

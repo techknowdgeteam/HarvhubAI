@@ -1347,6 +1347,7 @@ def _client_loop(conn, addr):
             op = (req.get('op') or 'sql').lower() if isinstance(req, dict) else '?'
             _log(f"client {addr} op={op} "
                  f"channel={req.get('channel_id') if isinstance(req, dict) else '-'}")
+            started_at = time.monotonic()
             try:
                 resp = _handle_request(req)
             except Exception as e:
@@ -1354,8 +1355,22 @@ def _client_loop(conn, addr):
                     'status': 'error',
                     'message': f'bridge dispatcher error: {e}',
                     'results': [], 'affected_rows': 0, 'query_id': None,
-                    'raw_sql': None, 'elapsed': 0.0,
+                    'raw_sql': None, 'elapsed': time.monotonic() - started_at,
                 }
+            results = resp.get('results') or [] if isinstance(resp, dict) else []
+            affected_rows = resp.get('affected_rows', 0) if isinstance(resp, dict) else 0
+            elapsed_raw = resp.get('elapsed', time.monotonic() - started_at) if isinstance(resp, dict) else time.monotonic() - started_at
+            try:
+                elapsed_seconds = float(elapsed_raw or 0)
+            except (TypeError, ValueError):
+                elapsed_seconds = time.monotonic() - started_at
+            status = resp.get('status', 'unknown') if isinstance(resp, dict) else 'invalid-response'
+            _log(
+                f"request complete: op={op} "
+                f"channel={req.get('channel_id') if isinstance(req, dict) else '-'} "
+                f"status={status} result_rows={len(results)} "
+                f"affected_rows={affected_rows} elapsed={elapsed_seconds:.3f}s"
+            )
             try:
                 _send_frame(conn, resp)
             except Exception as e:
@@ -1385,8 +1400,20 @@ def _serve():
     _server_sock.listen(32)
     _server_sock.settimeout(1.0)
     _log(f"listening on {BIND_HOST}:{BIND_PORT}")
+    _log("listener ready: waiting for service database requests")
+    last_heartbeat = time.monotonic()
 
     while not _shutdown_event.is_set():
+        now = time.monotonic()
+        if now - last_heartbeat >= 30:
+            with _channels_lock:
+                channel_count = len(_channels)
+                active_channels = sum(1 for channel in _channels.values() if channel.lock.locked())
+            _log(
+                f"heartbeat: listener alive; channels={channel_count}; "
+                f"active_channel_operations={active_channels}; waiting_for_requests=true"
+            )
+            last_heartbeat = now
         try:
             conn, addr = _server_sock.accept()
         except socket.timeout:
@@ -1461,6 +1488,7 @@ def main_loop():
 
     _log(f"starting at {datetime.now().isoformat(timespec='seconds')}")
     _log(f"Execution type: {'loop' if run_as_loop else 'once'} | interval={loop_interval}s")
+    _log("initialising browser bridge and preparing the per-program database request listener")
 
     if not _ensure_browser():
         _log("WARNING: initial browser launch failed — will retry on first request")
@@ -1476,6 +1504,7 @@ def main_loop():
         threading.Thread(target=_idle_reaper, daemon=True).start()
 
     _log(f"Listening on {BIND_HOST}:{BIND_PORT}; maximum channels={MAX_CHANNELS}.")
+    _log("startup complete; waiting for broker, charts, training, trading and challenge services")
     _serve()
     return 0
 

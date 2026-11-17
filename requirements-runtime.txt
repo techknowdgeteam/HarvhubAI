@@ -2,8 +2,8 @@ MetaTrader5
 pytz
 tzdata
 requests
-certifi
 urllib3
+certifi
 selenium
 beautifulsoup4
 webdriver-manager

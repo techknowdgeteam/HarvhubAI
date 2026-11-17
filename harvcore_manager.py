@@ -89,6 +89,7 @@ PROGRAMS = [
         "args": [],
         "role": "service",
         "runnable": True,
+        "interval": 5,
         "bridge": True,
     },
     {
@@ -100,6 +101,7 @@ PROGRAMS = [
         "args": [],
         "role": "service",
         "runnable": True,
+        "interval": 10,
         "bridge": False,
         "note": "Manual MT5 login requests are shown directly in this HarvHub window.",
     },
@@ -112,6 +114,7 @@ PROGRAMS = [
         "args": [],
         "role": "service",
         "runnable": True,
+        "interval": 60,
         "bridge": False,
     },
     {
@@ -123,6 +126,7 @@ PROGRAMS = [
         "args": [],
         "role": "service",
         "runnable": True,
+        "interval": 60,
         "bridge": False,
     },
     {
@@ -134,6 +138,7 @@ PROGRAMS = [
         "args": [],
         "role": "service",
         "runnable": True,
+        "interval": 5,
         "bridge": False,
         "warning": "This program can manage live MT5 positions and execute configured close/breakeven actions.",
     },
@@ -146,6 +151,7 @@ PROGRAMS = [
         "args": [],
         "role": "service",
         "runnable": True,
+        "interval": 30,
         "bridge": False,
         "warning": "This program can change programme challenge status, advertisement and server approval fields.",
     },
@@ -456,6 +462,14 @@ def locate_python() -> Optional[Path]:
     return None
 
 
+def build_service_command(python_exe, script, key, execution_type, interval, extra_args=()):
+    """Build the one CLI contract accepted by every HarvHub runnable service."""
+    mode = "loop" if str(execution_type).lower() == "loop" else "once"
+    command = [str(python_exe), "-u", str(script), f"--execution-type={mode}", "--interval", str(max(1, int(interval)))]
+    command.extend(str(arg) for arg in (extra_args or ()))
+    return command
+
+
 class HarvCoreManager:
     def __init__(self, root: tk.Tk, force_setup: bool = False):
         self.root = root
@@ -463,14 +477,17 @@ class HarvCoreManager:
         self.processes: dict[str, ProgramProcess] = {}
         self.process_lock = threading.RLock()
         self.execution_config = self._load_execution_config()
-        self.global_execution_type = self.execution_config.get("default", "once")
+        self.global_execution_type = self.execution_config.get("default", "loop")
         if self.global_execution_type not in ("loop", "once"):
-            self.global_execution_type = "once"
+            self.global_execution_type = "loop"
         self.program_execution_types = {
             item["key"]: self.execution_config.get("programs", {}).get(
                 item["key"], self.global_execution_type
             ) for item in PROGRAMS
         }
+        # MySQL Remote is a shared TCP server, not a one-shot worker.
+        self.program_execution_types["mysqlremote"] = "loop"
+        self.global_execution_type = "loop" if self.global_execution_type not in ("loop", "once") else self.global_execution_type
         self.global_execution_var = tk.StringVar(value=self.global_execution_type.title())
         self.program_execution_vars: dict[str, tk.StringVar] = {}
         self.manual_login_items: dict[tuple[str, str, str], dict] = {}
@@ -491,11 +508,17 @@ class HarvCoreManager:
         self.console_copy_buttons: dict[str, tk.Button] = {}
         self.program_stop_buttons: dict[str, tk.Button] = {}
         self.output_threads: dict[str, threading.Thread] = {}
+        self.output_watchdog_stops: dict[str, threading.Event] = {}
+        self.service_output_at: dict[str, float] = {}
         self.raw_logs: dict[str, list[str]] = {item["key"]: [] for item in PROGRAMS}
         self.setup_raw_lines: list[str] = []
         self.setup_step_states: dict[str, str] = {}
         self.active_setup_stage: Optional[str] = None
         self.log_lock = threading.RLock()
+        if int(self.execution_config.get("schema_version", 1) or 1) < 2:
+            # Save the one-time migration so a later explicit Once selection
+            # is respected instead of being reset on every launch.
+            self._persist_execution_config()
         self.status_widgets: dict[str, tk.Label] = {}
         self.setup_rows: dict[str, tuple[tk.Label, tk.Label]] = {}
         self.colors = LIGHT.copy()
@@ -558,28 +581,45 @@ class HarvCoreManager:
 
     # ---------------------------- State and paths ----------------------------
     def _load_execution_config(self) -> dict:
-        config = {"default": "once", "interval": DEFAULT_LOOP_INTERVAL, "programs": {}}
+        config = {"schema_version": 3, "default": "loop", "interval": DEFAULT_LOOP_INTERVAL, "programs": {}}
         try:
             loaded = json.loads(EXECUTION_CONFIG_FILE.read_text(encoding="utf-8"))
             if isinstance(loaded, dict):
-                if loaded.get("default") in ("loop", "once"):
-                    config["default"] = loaded["default"]
+                # Version 1 configurations defaulted to Once, which caused
+                # monitoring services to perform one pass and then exit.
+                # Migrate those old settings to Loop exactly once. Version 2
+                # preserves deliberate user selections going forward.
                 try:
-                    config["interval"] = max(1, int(loaded.get("interval", DEFAULT_LOOP_INTERVAL)))
+                    config_version = int(loaded.get("schema_version", 1) or 1)
                 except (TypeError, ValueError):
-                    pass
-                programs = loaded.get("programs")
-                if isinstance(programs, dict):
-                    config["programs"] = {
-                        str(key): value for key, value in programs.items()
-                        if value in ("loop", "once")
-                    }
+                    config_version = 1
+                config["schema_version"] = 3
+                if config_version >= 3:
+                    if loaded.get("default") in ("loop", "once"):
+                        config["default"] = loaded["default"]
+                    try:
+                        config["interval"] = max(1, int(loaded.get("interval", DEFAULT_LOOP_INTERVAL)))
+                    except (TypeError, ValueError):
+                        pass
+                    programs = loaded.get("programs")
+                    if isinstance(programs, dict):
+                        config["programs"] = {
+                            str(key): value for key, value in programs.items()
+                            if value in ("loop", "once")
+                        }
+                else:
+                    # Previous manager releases persisted Once as the default,
+                    # which made monitoring programs finish immediately. The
+                    # first v3 launch migrates them to continuous monitoring.
+                    config["default"] = "loop"
+                    config["programs"] = {}
         except (OSError, ValueError, TypeError):
             pass
         return config
 
     def _persist_execution_config(self) -> None:
         config = {
+            "schema_version": 3,
             "default": self.global_execution_type,
             "interval": DEFAULT_LOOP_INTERVAL,
             "programs": dict(self.program_execution_types),
@@ -595,17 +635,19 @@ class HarvCoreManager:
             self._write_manager_log(f"Could not save execution settings: {exc}")
 
     def _on_global_execution_changed(self, _event=None) -> None:
-        selected = (self.global_execution_var.get() or "Once").strip().lower()
+        selected = (self.global_execution_var.get() or "Loop").strip().lower()
         self.global_execution_type = "loop" if selected == "loop" else "once"
         for key in self.program_execution_types:
-            self.program_execution_types[key] = self.global_execution_type
-        for variable in self.program_execution_vars.values():
-            variable.set(self.global_execution_type.title())
+            self.program_execution_types[key] = "loop" if key == "mysqlremote" else self.global_execution_type
+        for key, variable in self.program_execution_vars.items():
+            variable.set("Loop" if key == "mysqlremote" else self.global_execution_type.title())
         self._persist_execution_config()
 
     def _on_program_execution_changed(self, key: str, variable: tk.StringVar) -> None:
-        selected = (variable.get() or "Once").strip().lower()
-        self.program_execution_types[key] = "loop" if selected == "loop" else "once"
+        selected = (variable.get() or "Loop").strip().lower()
+        self.program_execution_types[key] = "loop" if key == "mysqlremote" or selected == "loop" else "once"
+        if key == "mysqlremote":
+            variable.set("Loop")
         self._persist_execution_config()
 
     def _load_protected_logs(self) -> None:
@@ -2080,11 +2122,13 @@ class HarvCoreManager:
             fg=self.colors["muted"], font=("Segoe UI", 8, "bold"),
         ).pack(side="left", padx=(0, 6))
         execution_var = tk.StringVar(
-            value=self.program_execution_types.get(item["key"], self.global_execution_type).title()
+            value=("Loop" if item["key"] == "mysqlremote" else
+                   self.program_execution_types.get(item["key"], self.global_execution_type).title())
         )
         self.program_execution_vars[item["key"]] = execution_var
         execution_combo = ttk.Combobox(
-            controls, textvariable=execution_var, values=("Loop", "Once"),
+            controls, textvariable=execution_var,
+            values=(("Loop",) if item["key"] == "mysqlremote" else ("Loop", "Once")),
             state="readonly", width=7, style="HarvHub.TCombobox",
         )
         execution_combo.pack(side="left", padx=(0, 10))
@@ -2144,10 +2188,10 @@ class HarvCoreManager:
         console.tag_configure("success", foreground="#8fd5a8")
         self.console_widgets[item["key"]] = console
         self.console_visible[item["key"]] = False
-        if not self.raw_logs.get(item["key"]):
-            self.raw_logs[item["key"]] = [f"[{item['label']}] Ready."]
-            if item.get("warning"):
-                self.raw_logs[item["key"]].append("NOTICE: " + item["warning"])
+        # Do not seed a fake "Ready." result. The console stays empty until
+        # the manager or the actual child process produces a real log line.
+        if item.get("warning") and not self.raw_logs.get(item["key"]):
+            self.raw_logs[item["key"]] = ["NOTICE: " + item["warning"]]
         for line in self.raw_logs[item["key"]][-4000:]:
             tag = "error" if line.startswith("NOTICE:") or "Traceback" in line or "ERROR" in line else "dim" if line.startswith("[") else ""
             console.configure(state="normal")
@@ -2587,10 +2631,24 @@ class HarvCoreManager:
             elif bridge_was_available and not managed_bridge_running:
                 self._ui_log(
                     "mysqlremote",
-                    "[MANAGER] An existing MySQL Remote listener is already active. Its external process is not attached to this window's console.\n",
+                    "[MANAGER] Port 5599 is already occupied. Checking whether it is an older HarvHub MySQL Remote process so this window can capture the real output.\n",
                     "dim",
                 )
-                self.events.put(("program_status", ("mysqlremote", "RUNNING")))
+                stopped_count, cleanup_error = self._stop_unmanaged_harvhub_service("mysqlremote")
+                if cleanup_error:
+                    raise RuntimeError(f"Could not inspect the existing MySQL Remote process: {cleanup_error}")
+                if stopped_count:
+                    self._ui_log("mysqlremote", f"[MANAGER] Stopped {stopped_count} detached HarvHub MySQL Remote process(es); starting a console-managed instance.\n", "dim")
+                    release_deadline = time.monotonic() + 8
+                    while self._port_open() and time.monotonic() < release_deadline and not self.run_all_cancel.is_set():
+                        time.sleep(0.2)
+                    if self._port_open():
+                        raise RuntimeError("Port 5599 remained occupied after stopping the detached HarvHub listener. Close the process using port 5599 and retry Run All.")
+                    bridge_started_here = self._launch_process("mysqlremote", execution_type="loop")
+                    if not bridge_started_here:
+                        raise RuntimeError("Could not start a new MySQL Remote listener after cleaning the detached instance.")
+                else:
+                    raise RuntimeError("Port 5599 is being used by a process that is not the installed HarvHub mysqlremote.py. For safety it was not terminated; close that process and retry so MySQL Remote can stream its own console output.")
             else:
                 self._ui_log("mysqlremote", "[MANAGER] MySQL Remote is already running under this manager.\n", "success")
 
@@ -2664,11 +2722,34 @@ class HarvCoreManager:
             return
         execution_type = self.program_execution_types.get(key, self.global_execution_type)
         if key == "mysqlremote":
-            self._launch_process(key, execution_type=execution_type)
+            self._ui_log(
+                key,
+                "[MANAGER] MySQL Remote is a persistent database listener; starting in Loop mode so other programs can send it requests.\n",
+                "dim",
+            )
+            threading.Thread(target=self._start_mysql_remote_with_capture, daemon=True, name="start-mysqlremote").start()
             return
         threading.Thread(
             target=self._start_with_bridge_worker, args=(key, execution_type), daemon=True
         ).start()
+
+    def _start_mysql_remote_with_capture(self) -> None:
+        if self._is_process_running("mysqlremote"):
+            self._ui_log("mysqlremote", "[MANAGER] MySQL Remote is already running under this window.\n", "dim")
+            return
+        if self._port_open():
+            count, error = self._stop_unmanaged_harvhub_service("mysqlremote")
+            if error:
+                self._ui_log("mysqlremote", f"[MANAGER][ERROR] Could not inspect the existing listener: {error}\n", "error")
+                return
+            if count:
+                deadline = time.monotonic() + 8
+                while self._port_open() and time.monotonic() < deadline:
+                    time.sleep(0.2)
+            if self._port_open():
+                self._ui_log("mysqlremote", "[MANAGER][ERROR] Port 5599 belongs to another process. It was not terminated. Close it and press PLAY again.\n", "error")
+                return
+        self._launch_process("mysqlremote", execution_type="loop")
 
     def _start_with_bridge_worker(self, key: str, execution_type: str = "once") -> None:
         if not self._port_open():
@@ -2706,12 +2787,15 @@ class HarvCoreManager:
                 key, self.global_execution_type
             )
             selected_execution = "loop" if str(selected_execution).lower() == "loop" else "once"
-            command = [
-                str(self.python_exe), "-u", str(script),
-                f"--execution-type={selected_execution}",
-                "--interval", str(DEFAULT_LOOP_INTERVAL),
-                *item["args"],
-            ]
+            interval = max(1, int(item.get("interval", DEFAULT_LOOP_INTERVAL)))
+            command = build_service_command(
+                python_exe=self.python_exe,
+                script=script,
+                key=key,
+                execution_type=selected_execution,
+                interval=interval,
+                extra_args=item.get("args", ()),
+            )
             env = os.environ.copy()
             env["PYTHONUNBUFFERED"] = "1"
             env["PYTHONUTF8"] = "1"
@@ -2740,31 +2824,87 @@ class HarvCoreManager:
                 self._ui_log(key, f"[MANAGER] Could not start process: {exc}\n", "error")
                 self.events.put(("program_status", (key, "ERROR")))
                 return False
-            self.processes[key] = ProgramProcess(process=process, started_at=time.monotonic())
+            started_at = time.monotonic()
+            self.processes[key] = ProgramProcess(process=process, started_at=started_at)
+            watchdog_stop = threading.Event()
+            self.output_watchdog_stops[key] = watchdog_stop
+            self.service_output_at[key] = started_at
 
         self.events.put(("program_status", (key, "RUNNING")))
-        self._ui_log(key, f"[MANAGER] Started PID {process.pid}: {' '.join(command)}\n", "success")
-        self._ui_log(key, "[MANAGER] This program's output is attached to this program's own console.\n", "dim")
+        self._ui_log(key, f"[MANAGER] STARTED: {item['label']} | PID={process.pid}\n", "success")
+        self._ui_log(key, f"[MANAGER] Execution mode: {selected_execution.upper()} | interval={interval}s\n", "dim")
+        self._ui_log(key, f"[MANAGER] Script: {script}\n", "dim")
+        self._ui_log(key, "[MANAGER] Live stdout/stderr reader attached to this program only.\n", "dim")
         reader = threading.Thread(
             target=self._read_process_output, args=(key, process),
             daemon=True, name=f"{key}-output",
         )
         self.output_threads[key] = reader
         reader.start()
+        watchdog = threading.Thread(
+            target=self._watch_process_output,
+            args=(key, process, started_at, watchdog_stop),
+            daemon=True,
+            name=f"{key}-output-watchdog",
+        )
+        watchdog.start()
         return True
 
     def _read_process_output(self, key: str, process: subprocess.Popen) -> None:
+        """Forward the child process' combined stdout/stderr to its own tab."""
+        received_output = False
         try:
-            if process.stdout:
+            if process.stdout is None:
+                self.events.put(("console_line", (key, "[MANAGER] No stdout pipe was created for this process.", "error")))
+            else:
+                self.events.put(("console_line", (key, "[MANAGER] Live output reader attached; waiting for service output.", "dim")))
                 for line in iter(process.stdout.readline, ""):
+                    received_output = True
+                    self.service_output_at[key] = time.monotonic()
                     self.events.put(("console_line", (key, line.rstrip("\r\n"))))
         except Exception as exc:
-            self.events.put(("console_line", (key, f"[MANAGER] Console reader error: {exc}")))
+            self.events.put(("console_line", (key, f"[MANAGER] Console reader error: {type(exc).__name__}: {exc}", "error")))
+        finally:
+            try:
+                if process.stdout:
+                    process.stdout.close()
+            except Exception:
+                pass
         try:
             return_code = process.wait(timeout=3)
         except Exception:
             return_code = process.poll()
+        if not received_output and return_code is not None:
+            self.events.put((
+                "console_line",
+                (key, f"[MANAGER] The service exited without writing any stdout/stderr. Exit code: {return_code}. Check that the deployed script is the updated source and that it does not redirect output.", "error" if return_code else "dim"),
+            ))
+        watchdog_stop = self.output_watchdog_stops.get(key)
+        if watchdog_stop:
+            watchdog_stop.set()
         self.events.put(("process_exit", (key, return_code)))
+
+    def _watch_process_output(
+        self,
+        key: str,
+        process: subprocess.Popen,
+        started_at: float,
+        stop_event: threading.Event,
+    ) -> None:
+        """Report process health when a service has not emitted a real log line."""
+        next_report = 15.0
+        while process.poll() is None and not stop_event.wait(1.0):
+            now = time.monotonic()
+            last_output = self.service_output_at.get(key, started_at)
+            idle_seconds = now - last_output
+            if idle_seconds >= next_report:
+                uptime = int(now - started_at)
+                self.events.put((
+                    "console_line",
+                    (key, f"[MANAGER][HEALTH] Process PID {process.pid} is still running; no service output for {int(idle_seconds)}s (uptime {uptime}s). This is a process-health notice, not a work result.", "dim"),
+                ))
+                next_report = idle_seconds + 30.0
+        stop_event.set()
 
     def stop_program(self, key: str) -> None:
         threading.Thread(target=self._stop_process_worker, args=(key,), daemon=True).start()
@@ -2813,6 +2953,7 @@ class HarvCoreManager:
             return
         if not self.reset_lock.acquire(blocking=False):
             return
+        self.stop_all_in_progress = True
         self.run_all_cancel.set()
         if self.global_reset_all_button is not None:
             self.global_reset_all_button.configure(state="disabled", text="RESETTING...")
@@ -2826,51 +2967,103 @@ class HarvCoreManager:
         ).start()
 
     def _reset_all_worker(self) -> None:
+        """Bounded, staged reset; always returns a completion/failure event to Tk."""
         try:
-            # Cancel a Run All that may still be bringing up the database bridge.
-            deadline = time.monotonic() + 15
+            self.events.put(("reset_progress", ("CANCELLING RUN ALL...",)))
+            # Run All must finish its cancellation path before Reset snapshots
+            # the process table. Otherwise a late worker can launch a process
+            # after Reset has already reported completion.
+            deadline = time.monotonic() + 25
             while self.run_all_lock.locked() and time.monotonic() < deadline:
                 time.sleep(0.1)
+            if self.run_all_lock.locked():
+                raise TimeoutError(
+                    "Run All did not release its launch lock within 25 seconds. "
+                    "Reset has not been reported as complete; retry after the active launch settles."
+                )
 
-            # Stop every program owned by this manager. taskkill /T in
-            # _stop_process_worker also terminates descendants such as child
-            # MT5 terminal processes started by the service.
             with self.process_lock:
                 keys = list(self.processes.keys())
-            for key in keys:
+            total = max(1, len(keys))
+            for index, key in enumerate(keys, start=1):
+                self.events.put(("reset_progress", (f"STOPPING PROGRAMS {index}/{total}...",)))
                 self._stop_process_worker(key)
 
-            # Catch any process that finished launching just as cancellation
-            # was requested, then wait for its stdout reader to flush/close.
+            # Catch a process that was created as cancellation was requested.
             with self.process_lock:
                 late_keys = list(self.processes.keys())
             for key in late_keys:
                 if self._is_process_running(key):
+                    self.events.put(("reset_progress", (f"STOPPING {key.upper()}...",)))
                     self._stop_process_worker(key)
+
+            # Do not report a successful reset if Windows refused to stop a service.
+            still_running = [key for key in RUN_ALL_ORDER if self._is_process_running(key)]
+            if still_running:
+                raise RuntimeError(
+                    "Could not stop these managed services: " + ", ".join(still_running)
+                )
+
+            self.events.put(("reset_progress", ("FLUSHING CONSOLES...",)))
             for reader in list(self.output_threads.values()):
                 if reader and reader.is_alive():
-                    reader.join(timeout=2.5)
+                    reader.join(timeout=0.8)
 
-            # Also remove orphaned HarvHub service processes left behind by a
-            # prior crash/restart. Match only the exact six deployed service
-            # script paths so unrelated Python programs remain untouched.
+            self.events.put(("reset_progress", ("CLEANING DETACHED HARVHUB SERVICES...",)))
             orphan_count, orphan_error = self._stop_orphaned_harvhub_services()
 
-            # Broker Details deliberately launches MT5 terminals detached from
-            # its service process, so taskkill /T on the Python service alone
-            # is not sufficient. Restrict this cleanup to HarvHub's own MT5
-            # installation tree; unrelated user terminals are left untouched.
+            self.events.put(("reset_progress", ("CLOSING HARVHUB MT5 TERMINALS...",)))
             terminal_count, terminal_error = self._stop_harvhub_mt5_terminals()
+
             cleanup_errors = [value for value in (orphan_error, terminal_error) if value]
-            time.sleep(0.15)
+            self.events.put(("reset_progress", ("FINALISING RESET...",)))
             self.events.put(("reset_complete", (orphan_count, terminal_count, "\n\n".join(cleanup_errors))))
         except Exception as exc:
-            self.events.put(("reset_failed", (str(exc),)))
+            self.events.put(("reset_failed", (f"{type(exc).__name__}: {exc}",)))
         finally:
+            self.stop_all_in_progress = False
             try:
                 self.reset_lock.release()
             except RuntimeError:
                 pass
+
+    def _stop_unmanaged_harvhub_service(self, key: str) -> tuple[int, str]:
+        """Stop only an untracked Python process whose command line runs this exact service file."""
+        if not is_windows():
+            return 0, ""
+        item = self._program(key)
+        if not item:
+            return 0, f"Unknown HarvHub program key: {key}"
+        script_path = str((PYTHON_DIR / item["filename"]).resolve()).replace("'", "''")
+        with self.process_lock:
+            managed_pids = [entry.process.pid for entry in self.processes.values() if entry.process.poll() is None]
+        excluded = ",".join(str(pid) for pid in managed_pids) or "-1"
+        ps = f"""
+$target = '{script_path}'
+$excluded = @({excluded})
+$items = @(Get-CimInstance Win32_Process -Filter "Name='python.exe' OR Name='pythonw.exe'" -ErrorAction SilentlyContinue | Where-Object {{
+    $cmd = [string]$_.CommandLine
+    ($cmd.IndexOf($target, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) -and ($excluded -notcontains [int]$_.ProcessId)
+}})
+$count = 0
+foreach ($item in $items) {{
+    & (Join-Path (Join-Path $env:WINDIR 'System32') 'taskkill.exe') /PID $item.ProcessId /T /F | Out-Null
+    $count++
+}}
+Write-Output $count
+"""
+        try:
+            result = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", ps],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=8, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            if result.returncode != 0:
+                return 0, (result.stderr or result.stdout or "PowerShell returned an error").strip()[-800:]
+            lines = [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+            return (int(lines[-1]) if lines else 0), ""
+        except Exception as exc:
+            return 0, str(exc)
 
     def _stop_orphaned_harvhub_services(self) -> tuple[int, str]:
         """Stop stale service interpreters running HarvHub's exact script files."""
@@ -2913,7 +3106,7 @@ Write-Output $count
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                timeout=25,
+                timeout=10,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
             if result.returncode != 0:
@@ -2948,7 +3141,7 @@ Write-Output $count
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                timeout=25,
+                timeout=10,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
             if result.returncode != 0:
@@ -2974,7 +3167,7 @@ Write-Output $count
                         ["taskkill.exe", "/PID", str(process.pid), "/T", "/F"],
                         capture_output=True,
                         text=True,
-                        timeout=20,
+                        timeout=6,
                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                     )
                 except Exception:
@@ -2988,12 +3181,22 @@ Write-Output $count
                 except Exception:
                     pass
             try:
-                process.wait(timeout=8)
+                process.wait(timeout=2.5)
             except Exception:
                 try:
                     process.kill()
                 except Exception:
                     pass
+                try:
+                    process.wait(timeout=1.0)
+                except Exception:
+                    pass
+            if process.poll() is None:
+                self._ui_log(key, "[MANAGER][ERROR] Process is still alive after termination attempts.\n", "error")
+                return
+        watchdog_stop = self.output_watchdog_stops.get(key)
+        if watchdog_stop:
+            watchdog_stop.set()
         self.events.put(("program_status", (key, "STOPPED")))
         self._ui_log(key, "[MANAGER] Process stopped.\n", "dim")
 
@@ -3039,6 +3242,12 @@ Write-Output $count
 
     def _append_console(self, key: str, line: str, tag: Optional[str] = None) -> None:
         text = str(line)
+        # Strip the legacy fake Ready line if an older protected log contains it.
+        item = self._program(key)
+        ready_placeholder = f"[{item['label']}] Ready." if item else None
+        current_lines = self.raw_logs.setdefault(key, [])
+        if ready_placeholder and ready_placeholder in current_lines:
+            self.raw_logs[key] = [entry for entry in current_lines if entry != ready_placeholder]
         self.raw_logs.setdefault(key, []).append(text)
         if len(self.raw_logs[key]) > 30000:
             self.raw_logs[key] = self.raw_logs[key][-30000:]
@@ -3071,116 +3280,136 @@ Write-Output $count
         try:
             while True:
                 event, data = self.events.get_nowait()
-                if event == "setup_log":
-                    self._append_setup_log(str(data[0]))
-                elif event == "setup_step":
-                    self._set_setup_step(data[0], data[1], data[2])
-                elif event == "setup_download_progress":
-                    label, percent, downloaded, total = data
-                    if hasattr(self, "setup_subtitle"):
-                        self.setup_subtitle.configure(text=f"Preparing components... {percent}%")
-                    if hasattr(self, "setup_progress"):
-                        completed = sum(1 for value in self.setup_step_states.values() if value == "done")
-                        total_stages = max(1, len(self.setup_rows))
-                        self.setup_progress["value"] = min(99, (completed + (max(0, min(100, percent)) / 100.0)) * 100 / total_stages)
-                elif event == "setup_done":
-                    self._append_setup_log("SETUP COMPLETE — HarvHub AI environment verified.")
-                    if hasattr(self, "setup_progress"):
-                        self.setup_progress["value"] = 100
-                    if hasattr(self, "setup_title"):
-                        self.setup_title.configure(text="Setup complete")
-                    if hasattr(self, "setup_subtitle"):
-                        self.setup_subtitle.configure(text="Setup complete. Your programs are ready.")
-                    self.root.after(650, self._show_workspace)
-                elif event == "setup_error":
-                    self._append_setup_log(f"SETUP FAILED: {data[0]}")
-                    if hasattr(self, "setup_title"):
-                        self.setup_title.configure(text="Setup needs attention")
-                    if hasattr(self, "setup_subtitle"):
-                        self.setup_subtitle.configure(text="A component could not be prepared. Copy the setup report for the full diagnostic.")
-                    if hasattr(self, "setup_status_label"):
-                        self.setup_status_label.configure(text="Setup stopped before completion.\nDetailed error information is hidden. Click Copy Setup Report to copy the original result.")
-                    if hasattr(self, "setup_action"):
-                        self.setup_action.configure(state="normal", text="Retry setup")
-                    self.setup_started = False
-                elif event == "console_line":
-                    key, line, *rest = data
-                    self._append_console(key, str(line), rest[0] if rest else None)
-                elif event == "mysql_metrics":
-                    self._apply_mysql_metrics(data[0] if data else None)
-                elif event == "manual_login_refresh":
-                    self._refresh_manual_login_dashboard()
-                elif event == "program_status":
-                    self._set_program_status(data[0], data[1])
-                elif event == "process_exit":
-                    key, code = data
-                    self._set_program_status(key, "STOPPED")
-                    self._append_console(key, f"[MANAGER] Process exited with code {code}.", "dim" if code in (0, None) else "error")
-                elif event == "run_all_finished":
-                    if not self.stop_all_in_progress and not self.reset_lock.locked():
+                try:
+                    if event == "setup_log":
+                        self._append_setup_log(str(data[0]))
+                    elif event == "setup_step":
+                        self._set_setup_step(data[0], data[1], data[2])
+                    elif event == "setup_download_progress":
+                        label, percent, downloaded, total = data
+                        if hasattr(self, "setup_subtitle"):
+                            self.setup_subtitle.configure(text=f"Preparing components... {percent}%")
+                        if hasattr(self, "setup_progress"):
+                            completed = sum(1 for value in self.setup_step_states.values() if value == "done")
+                            total_stages = max(1, len(self.setup_rows))
+                            self.setup_progress["value"] = min(99, (completed + (max(0, min(100, percent)) / 100.0)) * 100 / total_stages)
+                    elif event == "setup_done":
+                        self._append_setup_log("SETUP COMPLETE — HarvHub AI environment verified.")
+                        if hasattr(self, "setup_progress"):
+                            self.setup_progress["value"] = 100
+                        if hasattr(self, "setup_title"):
+                            self.setup_title.configure(text="Setup complete")
+                        if hasattr(self, "setup_subtitle"):
+                            self.setup_subtitle.configure(text="Setup complete. Your programs are ready.")
+                        self.root.after(650, self._show_workspace)
+                    elif event == "setup_error":
+                        self._append_setup_log(f"SETUP FAILED: {data[0]}")
+                        if hasattr(self, "setup_title"):
+                            self.setup_title.configure(text="Setup needs attention")
+                        if hasattr(self, "setup_subtitle"):
+                            self.setup_subtitle.configure(text="A component could not be prepared. Copy the setup report for the full diagnostic.")
+                        if hasattr(self, "setup_status_label"):
+                            self.setup_status_label.configure(text="Setup stopped before completion.\nDetailed error information is hidden. Click Copy Setup Report to copy the original result.")
+                        if hasattr(self, "setup_action"):
+                            self.setup_action.configure(state="normal", text="Retry setup")
+                        self.setup_started = False
+                    elif event == "console_line":
+                        key, line, *rest = data
+                        self._append_console(key, str(line), rest[0] if rest else None)
+                    elif event == "mysql_metrics":
+                        self._apply_mysql_metrics(data[0] if data else None)
+                    elif event == "manual_login_refresh":
+                        self._refresh_manual_login_dashboard()
+                    elif event == "program_status":
+                        self._set_program_status(data[0], data[1])
+                    elif event == "process_exit":
+                        key, code = data
+                        self._set_program_status(key, "STOPPED")
+                        self._append_console(key, f"[MANAGER] Process exited with code {code}.", "dim" if code in (0, None) else "error")
+                    elif event == "run_all_finished":
+                        if not self.stop_all_in_progress and not self.reset_lock.locked():
+                            self._set_global_run_all_buttons("normal", "▶  RUN ALL")
+                            if self.global_reset_all_button is not None:
+                                self.global_reset_all_button.configure(state="normal", text="↺  RESET ALL")
+                    elif event == "setup_cancelled":
+                        self.setup_started = False
+                        self.setup_view_active = False
+                        self._append_setup_log("Setup stopped. Completed components were left in place; Setup / Repair can resume later.")
+                        self._show_workspace()
+                    elif event == "all_stopped":
+                        self.stop_all_in_progress = False
+                        for item in PROGRAMS:
+                            key = item["key"]
+                            self._set_program_status(key, "RUNNING" if self._is_process_running(key) else "STOPPED")
+                        self._set_global_run_all_buttons("normal", "▶  RUN ALL")
+                        if self.global_reset_all_button is not None and not self.reset_lock.locked():
+                            self.global_reset_all_button.configure(state="normal", text="↺  RESET ALL")
+                        self._update_global_actions()
+                        self._update_summary()
+                    elif event == "reset_progress":
+                        if self.global_reset_all_button is not None:
+                            self.global_reset_all_button.configure(state="disabled", text=str(data[0]))
+                    elif event == "reset_complete":
+                        orphan_count = int(data[0]) if data else 0
+                        terminal_count = int(data[1]) if len(data) > 1 else 0
+                        terminal_error = str(data[2]) if len(data) > 2 and data[2] else ""
+                        self.stop_all_in_progress = False
+                        for item in PROGRAMS:
+                            key = item["key"]
+                            self.clear_console(key)
+                            self.console_visible[key] = False
+                            card = self.console_cards.get(key)
+                            if card:
+                                card.pack_forget()
+                            placeholder = getattr(self, "console_placeholders", {}).get(key)
+                            if placeholder and placeholder.winfo_exists() and placeholder.winfo_manager() != "pack":
+                                placeholder.pack(fill="both", expand=True, pady=(0, 10))
+                            toggle = self.console_toggle_buttons.get(key)
+                            if toggle:
+                                toggle.configure(text="SHOW CONSOLE")
+                            self._set_program_status(key, "STOPPED")
+                        self._show_page("home")
+                        self.manual_login_tab = "SA"
+                        self._refresh_manual_login_dashboard()
                         self._set_global_run_all_buttons("normal", "▶  RUN ALL")
                         if self.global_reset_all_button is not None:
                             self.global_reset_all_button.configure(state="normal", text="↺  RESET ALL")
-                elif event == "setup_cancelled":
-                    self.setup_started = False
-                    self.setup_view_active = False
-                    self._append_setup_log("Setup stopped. Completed components were left in place; Setup / Repair can resume later.")
-                    self._show_workspace()
-                elif event == "all_stopped":
-                    self.stop_all_in_progress = False
-                    for item in PROGRAMS:
-                        key = item["key"]
-                        self._set_program_status(key, "RUNNING" if self._is_process_running(key) else "STOPPED")
-                    self._set_global_run_all_buttons("normal", "▶  RUN ALL")
-                    if self.global_reset_all_button is not None and not self.reset_lock.locked():
-                        self.global_reset_all_button.configure(state="normal", text="↺  RESET ALL")
-                    self._update_global_actions()
-                    self._update_summary()
-                elif event == "reset_complete":
-                    orphan_count = int(data[0]) if data else 0
-                    terminal_count = int(data[1]) if len(data) > 1 else 0
-                    terminal_error = str(data[2]) if len(data) > 2 and data[2] else ""
-                    self.stop_all_in_progress = False
-                    for item in PROGRAMS:
-                        key = item["key"]
-                        self.clear_console(key)
-                        self.console_visible[key] = False
-                        card = self.console_cards.get(key)
-                        if card:
-                            card.pack_forget()
-                        placeholder = getattr(self, "console_placeholders", {}).get(key)
-                        if placeholder and placeholder.winfo_exists() and placeholder.winfo_manager() != "pack":
-                            placeholder.pack(fill="both", expand=True, pady=(0, 10))
-                        toggle = self.console_toggle_buttons.get(key)
-                        if toggle:
-                            toggle.configure(text="SHOW CONSOLE")
-                        self._set_program_status(key, "STOPPED")
-                    self._show_page("home")
-                    self.manual_login_tab = "SA"
-                    self._refresh_manual_login_dashboard()
-                    self._set_global_run_all_buttons("normal", "▶  RUN ALL")
-                    if self.global_reset_all_button is not None:
-                        self.global_reset_all_button.configure(state="normal", text="↺  RESET ALL")
-                    self.run_all_cancel.clear()
-                    self._update_global_actions()
-                    self._update_summary()
-                    if terminal_error:
-                        messagebox.showwarning(
-                            "Reset completed with a terminal warning",
-                            "The manager stopped the programs it owned, but one cleanup task reported an issue:\n\n"
-                            + terminal_error,
-                            parent=self.root,
+                        self.run_all_cancel.clear()
+                        self._update_global_actions()
+                        self._update_summary()
+                        if terminal_error:
+                            messagebox.showwarning(
+                                "Reset completed with a terminal warning",
+                                "The manager stopped the programs it owned, but one cleanup task reported an issue:\n\n"
+                                + terminal_error,
+                                parent=self.root,
+                            )
+                        else:
+                            self.root.title(f"{APP_TITLE} — Reset complete")
+                            self.root.after(2200, lambda: self.root.title(APP_TITLE) if self.root.winfo_exists() else None)
+                    elif event == "reset_failed":
+                        self.stop_all_in_progress = False
+                        self._set_global_run_all_buttons("normal", "▶  RUN ALL")
+                        if self.global_reset_all_button is not None:
+                            self.global_reset_all_button.configure(state="normal", text="↺  RESET ALL")
+                        self._update_global_actions()
+                        messagebox.showerror("Reset failed", str(data[0]), parent=self.root)
+                except Exception as exc:
+                    event_key = None
+                    if event in ("console_line", "program_status", "process_exit") and data:
+                        event_key = str(data[0])
+                    if event_key not in self.raw_logs:
+                        event_key = "mysqlremote"
+                    try:
+                        self._append_console(
+                            event_key,
+                            f"[MANAGER][EVENT ERROR] Could not process {event!r}: {type(exc).__name__}: {exc}",
+                            "error",
                         )
-                    else:
-                        self.root.title(f"{APP_TITLE} — Reset complete")
-                        self.root.after(2200, lambda: self.root.title(APP_TITLE) if self.root.winfo_exists() else None)
-                elif event == "reset_failed":
-                    self.stop_all_in_progress = False
-                    self._set_global_run_all_buttons("normal", "▶  RUN ALL")
-                    if self.global_reset_all_button is not None:
-                        self.global_reset_all_button.configure(state="normal", text="↺  RESET ALL")
-                    self._update_global_actions()
-                    messagebox.showerror("Reset failed", str(data[0]), parent=self.root)
+                    except Exception:
+                        self._write_manager_log(
+                            f"Event handler failed for {event!r}: {type(exc).__name__}: {exc}"
+                        )
         except queue.Empty:
             pass
         if not self.closing:

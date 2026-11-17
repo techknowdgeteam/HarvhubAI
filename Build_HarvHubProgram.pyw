@@ -57,13 +57,29 @@ def prepare_payload_sources() -> Path:
 
     for name in REQUIRED_PAYLOAD_FILES:
         target = payload / name
-        if target.is_file() and target.stat().st_size >= 100:
-            continue
 
         # Root-level files are the canonical source in the current repository.
+        # Always synchronize a changed root source into payload/. The previous
+        # size-only shortcut kept an older payload copy forever, meaning a
+        # service fix (including its console logging) could be omitted from
+        # the next EXE even after the root source had been replaced.
         root_source = APP_DIR / name
         if root_source.is_file() and root_source.stat().st_size >= 100:
-            shutil.copy2(root_source, target)
+            needs_copy = not target.is_file()
+            if not needs_copy:
+                try:
+                    needs_copy = (
+                        root_source.stat().st_size != target.stat().st_size
+                        or hashlib.sha256(root_source.read_bytes()).digest()
+                        != hashlib.sha256(target.read_bytes()).digest()
+                    )
+                except OSError:
+                    needs_copy = True
+            if needs_copy:
+                shutil.copy2(root_source, target)
+            continue
+
+        if target.is_file() and target.stat().st_size >= 100:
             continue
 
         # A nested source folder is also supported, excluding generated build
@@ -93,6 +109,11 @@ def prepare_payload_sources() -> Path:
             f"'{payload}' or beside the project builder in '{APP_DIR}'."
         )
 
+    # Fail before PyInstaller starts if any of the six console-managed services
+    # or their shared modules are absent from the staged payload.
+    missing = [name for name in REQUIRED_PAYLOAD_FILES if not (payload / name).is_file()]
+    if missing:
+        raise FileNotFoundError("Incomplete HarvHub AI payload: " + ", ".join(missing))
     return payload
 
 
