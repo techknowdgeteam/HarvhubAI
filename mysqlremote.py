@@ -549,6 +549,24 @@ def _ensure_browser():
     return _open_browser()
 
 
+def shutdown_browser():
+    """Close the Selenium browser and HTTP session cleanly."""
+    global _driver, _session
+    with _browser_lock:
+        driver, _driver = _driver, None
+        session, _session = _session, None
+        if driver is not None:
+            try:
+                driver.quit()
+            except Exception as exc:
+                _log(f"browser shutdown warning: {type(exc).__name__}: {exc}")
+        if session is not None:
+            try:
+                session.close()
+            except Exception:
+                pass
+
+
 # ==============================================================================
 #  CHANNEL REGISTRY  (queryrequest_{id} / queryresult_{id})
 # ==============================================================================
@@ -1201,6 +1219,25 @@ def _handle_request(req):
     if op == 'list_channels':
         return {'status': 'success', 'channels': _list_channels()}
 
+    if op == 'bridge_status':
+        channels = _list_channels()
+        allocated = len(channels)
+        in_use = sum(1 for channel in channels if channel.get('in_use'))
+        idle = max(0, allocated - in_use)
+        return {
+            'status': 'success',
+            'host': BIND_HOST,
+            'port': BIND_PORT,
+            'max_channels': MAX_CHANNELS,
+            'allocated_channels': allocated,
+            'in_use_channels': in_use,
+            'idle_channels': idle,
+            'free_slots': max(0, MAX_CHANNELS - allocated),
+            'browser_connected': bool(_driver is not None),
+            'selected_server': (_current_servers or {}).get('query_page', ''),
+            'channels': channels,
+        }
+
     # ---- SQL op (channel-bound or legacy auto) ----
     sql = req.get('sql', '')
     params = req.get('params')
@@ -1406,19 +1443,46 @@ except Exception:
 # ==============================================================================
 #  MAIN
 # ==============================================================================
-def main():
+def main_loop():
+    """Run once for a browser/session readiness probe or continuously as a listener."""
+    import argparse
+
+    parser = argparse.ArgumentParser(description="HarvHub MySQL Remote channel bridge")
+    parser.add_argument("--execution-type", choices=("loop", "once"), default=None)
+    parser.add_argument("--loop", action="store_true", help="legacy alias for --execution-type=loop")
+    parser.add_argument("--once", action="store_true", help="legacy alias for --execution-type=once")
+    parser.add_argument("--interval", type=int, default=5,
+                        help="manager-wide cycle interval in seconds (default: 5)")
+    args = parser.parse_args()
+    run_as_loop = args.execution_type == "loop" if args.execution_type else bool(args.loop)
+    if args.once:
+        run_as_loop = False
+    loop_interval = max(1, int(args.interval))
+
     _log(f"starting at {datetime.now().isoformat(timespec='seconds')}")
+    _log(f"Execution type: {'loop' if run_as_loop else 'once'} | interval={loop_interval}s")
 
     if not _ensure_browser():
         _log("WARNING: initial browser launch failed — will retry on first request")
 
-    # Start idle reaper if configured.
+    if not run_as_loop:
+        # Run All launches this dependency in loop mode even when its workers
+        # are one-shot, because the database clients need the live listener.
+        _log(f"One-shot readiness result: browser={'ready' if _driver is not None else 'unavailable'}")
+        shutdown_browser()
+        return 0
+
     if CHANNEL_IDLE_CLOSE_SECONDS > 0:
         threading.Thread(target=_idle_reaper, daemon=True).start()
 
-    _log("bridge is up. Ctrl+C to stop.")
+    _log(f"Listening on {BIND_HOST}:{BIND_PORT}; maximum channels={MAX_CHANNELS}.")
     _serve()
+    return 0
+
+
+def main():
+    return main_loop()
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main_loop())

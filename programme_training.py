@@ -7443,13 +7443,15 @@ def process_programme(db: BridgeClient, programme: Dict[str, Any]) -> Dict[str, 
     print(f"Setup grouping: family_number restarts at 1 for each setup_group_id (limit {setup_group_limit})")
     return totals
 
-def main() -> int:
-    loop = False
+def main_loop() -> int:
     parser = argparse.ArgumentParser(
         description="Programme Training: VPS-scoped matcher and programme analytics writer"
     )
-    parser.add_argument("--once", action="store_true", help="run one complete scan and exit")
-    parser.add_argument("--interval", type=int, default=60, help="seconds between complete scans (default: 60)")
+    parser.add_argument("--execution-type", choices=("loop", "once"), default=None,
+                        help="run continuously or perform one scan")
+    parser.add_argument("--loop", action="store_true", help="legacy alias for --execution-type=loop")
+    parser.add_argument("--once", action="store_true", help="legacy alias for --execution-type=once")
+    parser.add_argument("--interval", type=int, default=5, help="seconds between complete scans (default: 5)")
     parser.add_argument(
         "--programme-id", type=int, default=None,
         help="optionally limit to one programme; it must still be linked to this VPS and be advertised or Begin-Test active",
@@ -7458,8 +7460,11 @@ def main() -> int:
     parser.add_argument("--bridge-host", default=BRIDGE_HOST)
     parser.add_argument("--bridge-port", type=int, default=BRIDGE_PORT)
     args = parser.parse_args()
+    run_as_loop = (args.execution_type == "loop") if args.execution_type else bool(args.loop)
     if args.once:
-        loop = False
+        run_as_loop = False
+    loop_interval = max(5, int(args.interval))
+    loop = run_as_loop
     if args.interval < 5:
         parser.error("--interval must be at least 5 seconds")
 
@@ -7468,7 +7473,7 @@ def main() -> int:
     print("Live analytics gate: configured signals on/after signal_testing_started_at while begin_test=1")
     print("Root filter: apply_to_chart = 1 only; disabled roots and their confirmations are skipped")
     print("Configuration restoration: PHP ptRestoreSavedRows row order, drawing-row skips, strict flags and last-row confirmation settings")
-    print(f"Continuous loop: {'enabled' if loop else 'disabled'} (set loop=False in main or use --once for one scan)")
+    print(f"Execution type: {'loop' if run_as_loop else 'once'} | interval: {loop_interval}s")
     print(f"Database batch size: {ANALYTICS_BATCH_SIZE} analytics records per write")
     print(f"Chart candle scope: latest {CHART_CANDLE_LIMIT:,} candles per symbol/timeframe (PHP PT_DEFAULT_AMOUNT; pages of {CANDLE_PAGE_SIZE})")
     print("Analytics deduplication: programme/owner/symbol/timeframe/order + identical entry/SL/TP prices; group/root IDs ignored")
@@ -7524,7 +7529,7 @@ def main() -> int:
             if not loop:
                 break
             elapsed = time.monotonic() - started
-            sleep_for = max(1, args.interval - int(elapsed))
+            sleep_for = max(1, loop_interval - int(elapsed))
             for _ in range(sleep_for):
                 if stopping:
                     break
@@ -7537,5 +7542,9 @@ def main() -> int:
     return 0
 
 
+def main() -> int:
+    return main_loop()
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main_loop())

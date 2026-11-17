@@ -9,6 +9,7 @@ import os
 import queue
 import shutil
 import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -42,6 +43,10 @@ MT5_SETUP_URL = (
 )
 BRIDGE_HOST = "127.0.0.1"
 BRIDGE_PORT = 5599
+CONTROL_HOST = "127.0.0.1"
+CONTROL_PORT = 5601
+DEFAULT_LOOP_INTERVAL = 5
+MAX_BRIDGE_CHANNELS = 32
 
 # The deployed HarvHub AI root is also the permanent desktop-app installation
 # directory. The VBS launcher installs/updates HarvHubAI.exe here.
@@ -55,10 +60,11 @@ LOG_DIR = HARVHUBAI_ROOT / "logs"
 MANAGER_DIR = HARVHUBAI_ROOT / ".manager"
 DOWNLOAD_DIR = MANAGER_DIR / "downloads"
 STATE_FILE = MANAGER_DIR / "installation.json"
+EXECUTION_CONFIG_FILE = MANAGER_DIR / "execution_config.json"
 
-# All nine supplied Python files are deployed. Only the six genuine
-# long-running services appear in the navigation; support modules remain
-# silent importable files in the Python folder.
+# All supplied service and support modules are deployed. Only the six genuine
+# runnable services appear in the navigation; support modules remain
+# importable dependencies in the Python folder.
 BUNDLED_PYTHON_FILES = [
     "mysqlremote.py",
     "brokerdetails.py",
@@ -69,6 +75,7 @@ BUNDLED_PYTHON_FILES = [
     "ip.py",
     "notification_email.py",
     "notification_service.py",
+    "harvhub_ipc.py",
 ]
 
 PROGRAMS = [
@@ -89,11 +96,11 @@ PROGRAMS = [
         "filename": "brokerdetails.py",
         "description": "Broker login monitoring and account-specific MT5 terminal provisioning.",
         "icon": "▣",
-        "args": ["--interval=10"],
+        "args": [],
         "role": "service",
         "runnable": True,
         "bridge": False,
-        "note": "Manual MT5 Login confirmation remains available in its own program window when required.",
+        "note": "Manual MT5 login requests are shown directly in this HarvHub window.",
     },
     {
         "key": "brokercharts",
@@ -101,7 +108,7 @@ PROGRAMS = [
         "filename": "brokercharts.py",
         "description": "Collects broker chart data and programme OHLC candles.",
         "icon": "◈",
-        "args": ["--loop=true", "--interval=60"],
+        "args": [],
         "role": "service",
         "runnable": True,
         "bridge": False,
@@ -112,7 +119,7 @@ PROGRAMS = [
         "filename": "programme_training.py",
         "description": "Matches programme configurations and writes programme analytics.",
         "icon": "▤",
-        "args": ["--loop", "--interval", "60"],
+        "args": [],
         "role": "service",
         "runnable": True,
         "bridge": False,
@@ -123,7 +130,7 @@ PROGRAMS = [
         "filename": "programmesignals_trading.py",
         "description": "Processes programme trade requests and the investor trading pipeline.",
         "icon": "↗",
-        "args": ["--loop=true", "--interval=5"],
+        "args": [],
         "role": "service",
         "runnable": True,
         "bridge": False,
@@ -135,7 +142,7 @@ PROGRAMS = [
         "filename": "signals_provision_challenge.py",
         "description": "Monitors VPS-scoped challenges and programme publication/approval status.",
         "icon": "✓",
-        "args": ["--interval", "30"],
+        "args": [],
         "role": "service",
         "runnable": True,
         "bridge": False,
@@ -454,6 +461,28 @@ class HarvCoreManager:
         self.events: queue.Queue = queue.Queue()
         self.processes: dict[str, ProgramProcess] = {}
         self.process_lock = threading.RLock()
+        self.execution_config = self._load_execution_config()
+        self.global_execution_type = self.execution_config.get("default", "once")
+        if self.global_execution_type not in ("loop", "once"):
+            self.global_execution_type = "once"
+        self.program_execution_types = {
+            item["key"]: self.execution_config.get("programs", {}).get(
+                item["key"], self.global_execution_type
+            ) for item in PROGRAMS
+        }
+        self.global_execution_var = tk.StringVar(value=self.global_execution_type.title())
+        self.program_execution_vars: dict[str, tk.StringVar] = {}
+        self.manual_login_items: dict[tuple[str, str, str], dict] = {}
+        self.manual_login_decisions: dict[tuple[str, str, str], str] = {}
+        self.manual_login_lock = threading.RLock()
+        self.manual_login_tab = "SA"
+        self.mysql_metrics = {}
+        self.mysql_metric_labels: dict[str, tk.Label] = {}
+        self.mysql_channel_tree = None
+        self.mysql_poll_started = False
+        self.mysql_poll_stop = threading.Event()
+        self.control_server_stop = threading.Event()
+        self.control_server_socket = None
         self.console_widgets: dict[str, ScrolledText] = {}
         self.console_cards: dict[str, tk.Frame] = {}
         self.console_visible: dict[str, bool] = {}
@@ -501,6 +530,7 @@ class HarvCoreManager:
         self._configure_styles()
         self._build_shell()
         self._load_protected_logs()
+        threading.Thread(target=self._control_server_loop, name="harvhub-manager-ipc", daemon=True).start()
         self.root.bind("<Configure>", self._on_root_configure, add="+")
         self.root.after(120, self._poll_events)
 
@@ -520,6 +550,57 @@ class HarvCoreManager:
             self.auto_setup_after_id = self.root.after(700, self._auto_start_setup)
 
     # ---------------------------- State and paths ----------------------------
+    def _load_execution_config(self) -> dict:
+        config = {"default": "once", "interval": DEFAULT_LOOP_INTERVAL, "programs": {}}
+        try:
+            loaded = json.loads(EXECUTION_CONFIG_FILE.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                if loaded.get("default") in ("loop", "once"):
+                    config["default"] = loaded["default"]
+                try:
+                    config["interval"] = max(1, int(loaded.get("interval", DEFAULT_LOOP_INTERVAL)))
+                except (TypeError, ValueError):
+                    pass
+                programs = loaded.get("programs")
+                if isinstance(programs, dict):
+                    config["programs"] = {
+                        str(key): value for key, value in programs.items()
+                        if value in ("loop", "once")
+                    }
+        except (OSError, ValueError, TypeError):
+            pass
+        return config
+
+    def _persist_execution_config(self) -> None:
+        config = {
+            "default": self.global_execution_type,
+            "interval": DEFAULT_LOOP_INTERVAL,
+            "programs": dict(self.program_execution_types),
+            "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        try:
+            MANAGER_DIR.mkdir(parents=True, exist_ok=True)
+            temporary = EXECUTION_CONFIG_FILE.with_suffix(".json.new")
+            temporary.write_text(json.dumps(config, indent=2), encoding="utf-8")
+            temporary.replace(EXECUTION_CONFIG_FILE)
+            self.execution_config = config
+        except OSError as exc:
+            self._write_manager_log(f"Could not save execution settings: {exc}")
+
+    def _on_global_execution_changed(self, _event=None) -> None:
+        selected = (self.global_execution_var.get() or "Once").strip().lower()
+        self.global_execution_type = "loop" if selected == "loop" else "once"
+        for key in self.program_execution_types:
+            self.program_execution_types[key] = self.global_execution_type
+        for variable in self.program_execution_vars.values():
+            variable.set(self.global_execution_type.title())
+        self._persist_execution_config()
+
+    def _on_program_execution_changed(self, key: str, variable: tk.StringVar) -> None:
+        selected = (variable.get() or "Once").strip().lower()
+        self.program_execution_types[key] = "loop" if selected == "loop" else "once"
+        self._persist_execution_config()
+
     def _load_protected_logs(self) -> None:
         if not is_windows():
             return
@@ -614,8 +695,20 @@ class HarvCoreManager:
         button_group = tk.Frame(right, bg=self.colors["surface"])
         button_group.pack(side="right")
 
-        # Workspace-wide execution controls live only in this application header.
-        # Their order is Run All, conditional Stop All, then Update at the far edge.
+        # Workspace-wide execution type controls the Run All action. Individual
+        # program pages can override this default before their own Play action.
+        tk.Label(
+            button_group, text="EXECUTION TYPE", bg=self.colors["surface"],
+            fg=self.colors["muted"], font=("Segoe UI", 8, "bold"),
+        ).pack(side="left", padx=(0, 6))
+        self.global_execution_combo = ttk.Combobox(
+            button_group, textvariable=self.global_execution_var,
+            values=("Loop", "Once"), state="readonly", width=7,
+        )
+        self.global_execution_combo.pack(side="left", padx=(0, 9))
+        self.global_execution_combo.bind("<<ComboboxSelected>>", self._on_global_execution_changed)
+
+        # Their order is Execution Type, Run All, conditional Stop All, Update.
         self.global_run_all_button = self._button(
             button_group, "▶  RUN ALL", self.run_all, kind="success"
         )
@@ -1396,6 +1489,9 @@ class HarvCoreManager:
         self._build_navigation()
         self._build_pages()
         self._configure_workspace_layout(force=True)
+        if not self.mysql_poll_started:
+            self.mysql_poll_started = True
+            threading.Thread(target=self._mysql_status_poll_loop, name="harvhub-mysql-status", daemon=True).start()
         self._show_page("home")
         self._update_summary()
         self.root.after(350, self._refresh_all_statuses)
@@ -1457,6 +1553,401 @@ class HarvCoreManager:
         self.pages["computer_ip"] = ip_page
         self._build_computer_ip_page(ip_page)
 
+    # ----------------------- Embedded service dashboards ---------------------
+    def _build_mysql_dashboard(self, parent: tk.Frame) -> None:
+        panel = tk.Frame(parent, bg=self.colors["surface"])
+        panel.pack(fill="both", expand=True)
+        title_row = tk.Frame(panel, bg=self.colors["surface"])
+        title_row.pack(fill="x", pady=(0, 4))
+        tk.Label(title_row, text="MYSQL REMOTE CONNECTION MONITOR", bg=self.colors["surface"],
+                 fg=self.colors["text"], font=("Segoe UI", 11, "bold")).pack(side="left")
+        self.mysql_listener_badge = tk.Label(
+            title_row, text="● CHECKING", bg=self.colors["surface2"],
+            fg=self.colors["muted"], font=("Segoe UI", 8, "bold"), padx=10, pady=5,
+        )
+        self.mysql_listener_badge.pack(side="right")
+        tk.Label(
+            panel,
+            text="Live local listener and the remote database-browser session. Channel counts are read from the bridge registry.",
+            bg=self.colors["surface"], fg=self.colors["muted"],
+            font=("Segoe UI", 8), wraplength=900, justify="left",
+        ).pack(anchor="w", pady=(0, 14))
+
+        cards = tk.Frame(panel, bg=self.colors["surface"])
+        cards.pack(fill="x")
+        metrics = [
+            ("listener", "CONNECTION LISTENER", "OFFLINE"),
+            ("portal", "REMOTE PORTAL SESSION", "WAITING"),
+            ("allocated", "ALLOCATED CHANNELS", "0"),
+            ("in_use", "CHANNELS IN USE", "0"),
+            ("idle", "IDLE / UNUSED", "0"),
+            ("free", "FREE CHANNEL SLOTS", str(MAX_BRIDGE_CHANNELS)),
+        ]
+        for index, (key, label, value) in enumerate(metrics):
+            row, col = divmod(index, 3)
+            card = tk.Frame(
+                cards, bg=self.colors["surface2"], padx=13, pady=11,
+                highlightbackground=self.colors["border"], highlightthickness=1,
+            )
+            card.grid(row=row, column=col, sticky="nsew", padx=4, pady=4)
+            cards.grid_columnconfigure(col, weight=1)
+            tk.Label(card, text=label, bg=self.colors["surface2"], fg=self.colors["muted"],
+                     font=("Segoe UI", 7, "bold"), anchor="w").pack(anchor="w")
+            value_label = tk.Label(card, text=value, bg=self.colors["surface2"], fg=self.colors["text"],
+                                   font=("Segoe UI", 15, "bold"), anchor="w")
+            value_label.pack(anchor="w", pady=(5, 0))
+            self.mysql_metric_labels[key] = value_label
+
+        details = tk.Frame(panel, bg=self.colors["surface"])
+        details.pack(fill="x", pady=(11, 7))
+        self.mysql_host_label = tk.Label(
+            details, text=f"Listener: {BRIDGE_HOST}:{BRIDGE_PORT}", bg=self.colors["surface"],
+            fg=self.colors["muted"], font=("Segoe UI", 8), anchor="w",
+        )
+        self.mysql_host_label.pack(anchor="w")
+        self.mysql_server_label = tk.Label(
+            details, text="Remote server: waiting for bridge status…", bg=self.colors["surface"],
+            fg=self.colors["muted"], font=("Segoe UI", 8), anchor="w",
+        )
+        self.mysql_server_label.pack(anchor="w", pady=(3, 0))
+
+        tk.Label(panel, text="CONNECTED CHANNELS", bg=self.colors["surface"],
+                 fg=self.colors["text"], font=("Segoe UI", 9, "bold")).pack(anchor="w", pady=(10, 6))
+        table_frame = tk.Frame(panel, bg=self.colors["surface"])
+        table_frame.pack(fill="both", expand=True)
+        columns = ("channel", "owner", "state", "last_used")
+        tree = ttk.Treeview(table_frame, columns=columns, show="headings", height=7)
+        for column, heading, width in (
+            ("channel", "CHANNEL", 90), ("owner", "PROGRAM / OWNER", 250),
+            ("state", "STATE", 120), ("last_used", "LAST ACTIVITY", 180),
+        ):
+            tree.heading(column, text=heading)
+            tree.column(column, width=width, anchor="w", stretch=True)
+        scrollbar = ttk.Scrollbar(table_frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=scrollbar.set)
+        tree.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        self.mysql_channel_tree = tree
+        self.mysql_metric_labels.setdefault("listener", self.mysql_metric_labels.get("listener"))
+
+    def _build_manual_login_dashboard(self, parent: tk.Frame) -> None:
+        panel = tk.Frame(parent, bg=self.colors["surface"])
+        panel.pack(fill="both", expand=True)
+        title_row = tk.Frame(panel, bg=self.colors["surface"])
+        title_row.pack(fill="x")
+        tk.Label(title_row, text="MANUAL BROKER LOGIN", bg=self.colors["surface"],
+                 fg=self.colors["text"], font=("Segoe UI", 11, "bold")).pack(side="left")
+        self.manual_login_count_label = tk.Label(
+            title_row, text="0 NEED ATTENTION", bg=self.colors["surface2"],
+            fg=self.colors["muted"], font=("Segoe UI", 8, "bold"), padx=10, pady=5,
+        )
+        self.manual_login_count_label.pack(side="right")
+        self.manual_login_message = tk.Label(
+            panel, text="All accounts and programmes need no manual login.",
+            bg=self.colors["surface"], fg=self.colors["muted"],
+            font=("Segoe UI", 9), anchor="w", justify="left", wraplength=900,
+        )
+        self.manual_login_message.pack(fill="x", pady=(10, 12))
+
+        self.manual_login_tabs_frame = tk.Frame(panel, bg=self.colors["surface"])
+        self.manual_login_tab_buttons = {}
+        for kind, label in (("SA", "Accounts"), ("PRG", "Programme")):
+            button = self._button(
+                self.manual_login_tabs_frame, label,
+                lambda selected=kind: self._select_manual_login_tab(selected),
+                kind="primary" if kind == self.manual_login_tab else "quiet",
+            )
+            button.pack(side="left", padx=(0, 7))
+            self.manual_login_tab_buttons[kind] = button
+
+        list_shell = tk.Frame(panel, bg=self.colors["surface"])
+        list_shell.pack(fill="both", expand=True, pady=(8, 0))
+        canvas = tk.Canvas(list_shell, bg=self.colors["surface"], highlightthickness=0, borderwidth=0)
+        scrollbar = ttk.Scrollbar(list_shell, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        self.manual_login_canvas = canvas
+        self.manual_login_items_frame = tk.Frame(canvas, bg=self.colors["surface"])
+        self.manual_login_canvas_window = canvas.create_window(
+            (0, 0), window=self.manual_login_items_frame, anchor="nw",
+        )
+        self.manual_login_items_frame.bind(
+            "<Configure>", lambda _event: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        canvas.bind(
+            "<Configure>", lambda event: canvas.itemconfigure(self.manual_login_canvas_window, width=event.width)
+        )
+        self._refresh_manual_login_dashboard()
+
+    def _select_manual_login_tab(self, kind: str) -> None:
+        self.manual_login_tab = kind if kind in ("SA", "PRG") else "SA"
+        self._refresh_manual_login_dashboard()
+
+    @staticmethod
+    def _manual_login_key(item: dict) -> tuple[str, str, str]:
+        return (str(item.get("kind", "SA")).upper(),
+                str(item.get("owner_id", "")), str(item.get("account_id", "")))
+
+    def _refresh_manual_login_dashboard(self) -> None:
+        if not hasattr(self, "manual_login_items_frame"):
+            return
+        with self.manual_login_lock:
+            manual_items = list(self.manual_login_items.values())
+        accounts = [item for item in manual_items if str(item.get("kind", "SA")).upper() == "SA"]
+        programmes = [item for item in manual_items if str(item.get("kind", "SA")).upper() == "PRG"]
+        total = len(accounts) + len(programmes)
+        self.manual_login_count_label.configure(text=f"{total} NEED ATTENTION")
+        if hasattr(self, "manual_login_tabs_frame"):
+            if total:
+                if not self.manual_login_tabs_frame.winfo_manager():
+                    self.manual_login_tabs_frame.pack(fill="x", pady=(0, 3))
+                self.manual_login_message.configure(
+                    text="These accounts or programmes need a manual MT5 login. Open the terminal, sign in, then confirm the credentials here."
+                )
+            else:
+                self.manual_login_tabs_frame.pack_forget()
+                self.manual_login_message.configure(
+                    text="All accounts and programmes need no manual login."
+                )
+        for kind, button in getattr(self, "manual_login_tab_buttons", {}).items():
+            button.configure(bg=self.colors["gold"] if kind == self.manual_login_tab else self.colors["surface2"])
+        for child in self.manual_login_items_frame.winfo_children():
+            child.destroy()
+        selected = accounts if self.manual_login_tab == "SA" else programmes
+        if total and not selected:
+            tk.Label(
+                self.manual_login_items_frame,
+                text=("No sub-accounts currently need manual login." if self.manual_login_tab == "SA"
+                      else "No programmes currently need manual login."),
+                bg=self.colors["surface"], fg=self.colors["muted"],
+                font=("Segoe UI", 9), padx=14, pady=18,
+            ).pack(anchor="w")
+            return
+        for index, item in enumerate(selected, start=1):
+            self._render_manual_login_item(index, item)
+
+    def _render_manual_login_item(self, index: int, item: dict) -> None:
+        card = self._card(self.manual_login_items_frame, 13)
+        card.pack(fill="x", expand=True, pady=(0, 8))
+        kind, owner_id, account_id = self._manual_login_key(item)
+        title = (f"{index}. Sub-account {account_id}  ·  Owner {owner_id}" if kind == "SA"
+                 else f"{index}. Programme {account_id}  ·  Owner {owner_id}")
+        tk.Label(card, text=title, bg=self.colors["surface"], fg=self.colors["text"],
+                 font=("Segoe UI", 9, "bold")).pack(anchor="w", pady=(0, 7))
+        fields = (
+            ("Broker", item.get("broker", "N/A"), False),
+            ("Server", item.get("server", "N/A"), False),
+            ("Login ID", item.get("login", ""), True),
+            ("Password", item.get("password", ""), True),
+        )
+        for label_text, value, copyable in fields:
+            row = tk.Frame(card, bg=self.colors["surface"])
+            row.pack(fill="x", pady=2)
+            tk.Label(row, text=f"{label_text}:", width=11, anchor="w", bg=self.colors["surface"],
+                     fg=self.colors["muted"], font=("Segoe UI", 8, "bold")).pack(side="left")
+            display = "••••••••" if label_text == "Password" and value else (str(value) if value else "(empty)")
+            tk.Label(row, text=display, bg=self.colors["surface"], fg=self.colors["text"],
+                     font=("Segoe UI", 8), anchor="w").pack(side="left", fill="x", expand=True)
+            if copyable:
+                self._button(row, "COPY", lambda v=str(value): self._copy_text(v), kind="quiet").pack(side="right")
+        actions = tk.Frame(card, bg=self.colors["surface"])
+        actions.pack(fill="x", pady=(9, 0))
+        terminal = str(item.get("terminal_exe") or "")
+        self._button(
+            actions, "▣  ACTIVATE TERMINAL",
+            lambda path=terminal: self._activate_manual_terminal(path), kind="primary",
+        ).pack(side="left", padx=(0, 7))
+        self._button(
+            actions, "INVALID CREDENTIALS",
+            lambda k=(kind, owner_id, account_id): self._set_manual_login_decision(k, "invalid"),
+            kind="danger",
+        ).pack(side="right", padx=(7, 0))
+        self._button(
+            actions, "VALID CREDENTIALS",
+            lambda k=(kind, owner_id, account_id): self._set_manual_login_decision(k, "valid"),
+            kind="success",
+        ).pack(side="right")
+
+    def _activate_manual_terminal(self, terminal_exe: str) -> None:
+        if not terminal_exe:
+            messagebox.showerror("Terminal unavailable", "No terminal path was supplied for this login request.", parent=self.root)
+            return
+        try:
+            if os.path.isfile(terminal_exe):
+                os.startfile(terminal_exe)
+            else:
+                raise FileNotFoundError(terminal_exe)
+            self._append_console("brokerdetails", f"[MANAGER] Activated MT5 terminal: {terminal_exe}", "success")
+        except Exception as exc:
+            messagebox.showerror("Could not activate terminal", str(exc), parent=self.root)
+
+    def _set_manual_login_decision(self, key: tuple[str, str, str], decision: str) -> None:
+        with self.manual_login_lock:
+            self.manual_login_decisions[key] = decision
+        kind, owner_id, account_id = key
+        self._refresh_manual_login_dashboard()
+        self._ui_log("brokerdetails", f"[MANAGER] {decision.title()} credentials selected for {kind} {account_id}; waiting for the broker monitor to verify.", "success" if decision == "valid" else "error")
+
+    # ----------------------------- Local IPC ---------------------------------
+    @staticmethod
+    def _recv_exact(sock: socket.socket, size: int) -> bytes:
+        chunks = bytearray()
+        while len(chunks) < size:
+            part = sock.recv(size - len(chunks))
+            if not part:
+                raise ConnectionError("socket closed before full frame arrived")
+            chunks.extend(part)
+        return bytes(chunks)
+
+    def _control_server_loop(self) -> None:
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            server.bind((CONTROL_HOST, CONTROL_PORT))
+            server.listen(16)
+            server.settimeout(1.0)
+            self.control_server_socket = server
+            self._write_manager_log(f"Local manager control listener started at {CONTROL_HOST}:{CONTROL_PORT}.")
+            while not self.control_server_stop.is_set():
+                try:
+                    conn, _address = server.accept()
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
+                threading.Thread(target=self._handle_control_client, args=(conn,), daemon=True).start()
+        except OSError as exc:
+            self._write_manager_log(f"Local manager control listener could not bind {CONTROL_HOST}:{CONTROL_PORT}: {exc}")
+        finally:
+            try:
+                server.close()
+            except OSError:
+                pass
+
+    def _handle_control_client(self, conn: socket.socket) -> None:
+        try:
+            conn.settimeout(3.0)
+            (length,) = struct.unpack(">I", self._recv_exact(conn, 4))
+            if length <= 0 or length > 4 * 1024 * 1024:
+                raise ValueError(f"invalid IPC request size: {length}")
+            request = json.loads(self._recv_exact(conn, length).decode("utf-8"))
+            response = self._handle_control_request(request)
+            encoded = json.dumps(response, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            conn.sendall(struct.pack(">I", len(encoded)) + encoded)
+        except Exception:
+            try:
+                encoded = b'{"ok":false,"error":"invalid manager IPC request"}'
+                conn.sendall(struct.pack(">I", len(encoded)) + encoded)
+            except Exception:
+                pass
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+    def _handle_control_request(self, request: dict) -> dict:
+        if not isinstance(request, dict):
+            return {"ok": False, "error": "request must be an object"}
+        op = str(request.get("op") or "").strip().lower()
+        if op == "manual_login_upsert":
+            item = request.get("item")
+            if not isinstance(item, dict):
+                return {"ok": False, "error": "item is missing"}
+            key = self._manual_login_key(item)
+            with self.manual_login_lock:
+                self.manual_login_items[key] = dict(item)
+            self.events.put(("manual_login_refresh", ()))
+            return {"ok": True}
+        if op == "manual_login_remove":
+            key = (str(request.get("kind", "SA")).upper(),
+                   str(request.get("owner_id", "")), str(request.get("account_id", "")))
+            with self.manual_login_lock:
+                self.manual_login_items.pop(key, None)
+                self.manual_login_decisions.pop(key, None)
+            self.events.put(("manual_login_refresh", ()))
+            return {"ok": True}
+        if op == "manual_login_take_decision":
+            key = (str(request.get("kind", "SA")).upper(),
+                   str(request.get("owner_id", "")), str(request.get("account_id", "")))
+            with self.manual_login_lock:
+                decision = self.manual_login_decisions.pop(key, None)
+            return {"ok": True, "decision": decision}
+        if op == "manager_ping":
+            return {"ok": True, "name": APP_TITLE}
+        return {"ok": False, "error": "unknown operation"}
+
+    # ----------------------- MySQL bridge status polling ----------------------
+    def _request_bridge_status(self) -> Optional[dict]:
+        payload = json.dumps({"op": "bridge_status"}).encode("utf-8")
+        try:
+            with socket.create_connection((BRIDGE_HOST, BRIDGE_PORT), timeout=1.2) as sock:
+                sock.settimeout(2.0)
+                sock.sendall(struct.pack(">I", len(payload)) + payload)
+                (length,) = struct.unpack(">I", self._recv_exact(sock, 4))
+                if length <= 0 or length > 8 * 1024 * 1024:
+                    return None
+                response = json.loads(self._recv_exact(sock, length).decode("utf-8"))
+                return response if isinstance(response, dict) else None
+        except (OSError, ValueError, json.JSONDecodeError, ConnectionError):
+            return None
+
+    def _mysql_status_poll_loop(self) -> None:
+        while not self.mysql_poll_stop.is_set() and not self.closing:
+            status = self._request_bridge_status() if self._port_open() else None
+            self.events.put(("mysql_metrics", status or {"status": "offline"}))
+            self.mysql_poll_stop.wait(2.0)
+
+    def _apply_mysql_metrics(self, status: Optional[dict]) -> None:
+        if not hasattr(self, "mysql_metric_labels") or not self.mysql_metric_labels:
+            self.mysql_metrics = status or {}
+            return
+        status = status if isinstance(status, dict) else {"status": "offline"}
+        online = status.get("status") == "success"
+        listener = "LISTENING" if online else "OFFLINE"
+        portal = "READY" if online and status.get("browser_connected") else ("STARTING" if online else "OFFLINE")
+        values = {
+            "listener": listener,
+            "portal": portal,
+            "allocated": str(status.get("allocated_channels", 0)) if online else "0",
+            "in_use": str(status.get("in_use_channels", 0)) if online else "0",
+            "idle": str(status.get("idle_channels", 0)) if online else "0",
+            "free": str(status.get("free_slots", MAX_BRIDGE_CHANNELS)) if online else str(MAX_BRIDGE_CHANNELS),
+        }
+        for key, value in values.items():
+            label = self.mysql_metric_labels.get(key)
+            if label is not None:
+                label.configure(text=value)
+        if hasattr(self, "mysql_listener_badge"):
+            self.mysql_listener_badge.configure(
+                text=("● LISTENING" if online else "● OFFLINE"),
+                fg=(self.colors["green"] if online else self.colors["red"]),
+            )
+        if hasattr(self, "mysql_host_label"):
+            self.mysql_host_label.configure(
+                text=(f"Listener: {status.get('host', BRIDGE_HOST)}:{status.get('port', BRIDGE_PORT)}  ·  capacity {status.get('max_channels', MAX_BRIDGE_CHANNELS)}"
+                      if online else f"Listener: {BRIDGE_HOST}:{BRIDGE_PORT}  ·  waiting for MySQL Remote"))
+        if hasattr(self, "mysql_server_label"):
+            self.mysql_server_label.configure(
+                text=(f"Remote server: {status.get('selected_server') or 'not selected'}  ·  portal session: {portal}"
+                      if online else "Remote server: not connected"))
+        tree = self.mysql_channel_tree
+        if tree is not None:
+            for child in tree.get_children():
+                tree.delete(child)
+            for channel in status.get("channels", []) if online else []:
+                channel_id = channel.get("channel_id", "—")
+                owner = channel.get("owner", "unknown")
+                state = "IN USE" if channel.get("in_use") else "IDLE / FREE"
+                stamp = channel.get("last_used_at")
+                try:
+                    last_used = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(stamp)))
+                except (TypeError, ValueError, OSError):
+                    last_used = "—"
+                tree.insert("", "end", values=(channel_id, owner, state, last_used))
+        self.mysql_metrics = dict(status)
+
     def _build_program_page(self, page: tk.Frame, item: dict) -> None:
         wrapper = tk.Frame(page, bg=self.colors["bg"])
         wrapper.pack(fill="both", expand=True)
@@ -1482,6 +1973,24 @@ class HarvCoreManager:
 
         controls = tk.Frame(header, bg=self.colors["surface"])
         controls.pack(fill="x", pady=(15, 0))
+        tk.Label(
+            controls, text="Execution type", bg=self.colors["surface"],
+            fg=self.colors["muted"], font=("Segoe UI", 8, "bold"),
+        ).pack(side="left", padx=(0, 6))
+        execution_var = tk.StringVar(
+            value=self.program_execution_types.get(item["key"], self.global_execution_type).title()
+        )
+        self.program_execution_vars[item["key"]] = execution_var
+        execution_combo = ttk.Combobox(
+            controls, textvariable=execution_var, values=("Loop", "Once"),
+            state="readonly", width=7,
+        )
+        execution_combo.pack(side="left", padx=(0, 10))
+        execution_combo.bind(
+            "<<ComboboxSelected>>",
+            lambda event, key=item["key"], var=execution_var:
+                self._on_program_execution_changed(key, var),
+        )
         play = self._button(controls, "▶  PLAY", lambda key=item["key"]: self.start_program(key), kind="success")
         play.pack(side="left", padx=(0, 7))
         stop = self._button(controls, "■  STOP", lambda key=item["key"]: self.stop_program(key), kind="danger")
@@ -1497,15 +2006,20 @@ class HarvCoreManager:
 
         placeholder = self._card(wrapper, 22)
         placeholder.pack(fill="both", expand=True, pady=(0, 10))
-        emblem = tk.Frame(placeholder, bg=self.colors["surface"])
-        emblem.place(relx=0.5, rely=0.44, anchor="center")
-        tk.Label(emblem, text=item["icon"], bg=self.colors["surface2"], fg=self.colors["gold"],
-                 font=("Segoe UI Symbol", 34, "bold"), width=3, height=1, pady=8).pack(pady=(0, 12))
-        tk.Label(emblem, text="CONSOLE HIDDEN", bg=self.colors["surface"], fg=self.colors["text"],
-                 font=("Segoe UI", 11, "bold")).pack()
-        tk.Label(emblem, text="The console is hidden by default. Use Show Console to view the original output.",
-                 bg=self.colors["surface"], fg=self.colors["muted"], font=("Segoe UI", 9),
-                 wraplength=520, justify="center").pack(pady=(5, 0))
+        if item["key"] == "mysqlremote":
+            self._build_mysql_dashboard(placeholder)
+        elif item["key"] == "brokerdetails":
+            self._build_manual_login_dashboard(placeholder)
+        else:
+            emblem = tk.Frame(placeholder, bg=self.colors["surface"])
+            emblem.place(relx=0.5, rely=0.44, anchor="center")
+            tk.Label(emblem, text=item["icon"], bg=self.colors["surface2"], fg=self.colors["gold"],
+                     font=("Segoe UI Symbol", 34, "bold"), width=3, height=1, pady=8).pack(pady=(0, 12))
+            tk.Label(emblem, text="CONSOLE HIDDEN", bg=self.colors["surface"], fg=self.colors["text"],
+                     font=("Segoe UI", 11, "bold")).pack()
+            tk.Label(emblem, text="The console is hidden by default. Use Show Console to view the original output.",
+                     bg=self.colors["surface"], fg=self.colors["muted"], font=("Segoe UI", 9),
+                     wraplength=520, justify="center").pack(pady=(5, 0))
 
         console_card = self._card(wrapper, 10)
         self.console_cards[item["key"]] = console_card
@@ -1557,6 +2071,8 @@ class HarvCoreManager:
             left.pack_forget()
             right.pack_forget()
             compact = width < 760
+            if hasattr(self, "global_execution_combo"):
+                self.global_execution_combo.configure(width=6 if compact else 7)
             for button in (
                 self.global_run_all_button,
                 self.global_stop_all_button,
@@ -1584,6 +2100,11 @@ class HarvCoreManager:
                 key for key, entry in self.processes.items()
                 if entry.process.poll() is None
             ]
+
+    def _is_process_running(self, key: str) -> bool:
+        with self.process_lock:
+            entry = self.processes.get(key)
+            return bool(entry and entry.process.poll() is None)
 
     def _update_global_actions(self) -> None:
         """Show Stop All only while at least one managed program is running."""
@@ -1898,33 +2419,55 @@ class HarvCoreManager:
         self.root.after(250, self.root.destroy)
 
     def run_all(self) -> None:
-        if not messagebox.askyesno(
-            "Run all programs?",
-            "This will start all six executable HarvHub AI services.\n\n"
+        execution_type = self.global_execution_type
+        warning = (
             "Programme Signals Trading can manage live MT5 positions, and Signals Provision Challenge can update programme publication and approval statuses.\n\n"
-            "Continue?",
-            parent=self.root,
-        ):
+            f"Execution type: {execution_type.upper()}. MySQL Remote will stay in listener mode as the shared database dependency while the other services run.\n\n"
+            "Continue?"
+        )
+        if not messagebox.askyesno("Run all programs?", warning, parent=self.root):
             return
         if not self.run_all_lock.acquire(blocking=False):
             return
         self._set_global_run_all_buttons("disabled", "STARTING...")
-        threading.Thread(target=self._run_all_worker, name="harvcore-run-all", daemon=True).start()
+        threading.Thread(
+            target=self._run_all_worker, args=(execution_type,),
+            name="harvcore-run-all", daemon=True,
+        ).start()
 
-    def _run_all_worker(self) -> None:
+    def _run_all_worker(self, execution_type: str = "once") -> None:
+        bridge_was_available = self._port_open()
+        bridge_started_here = False
         try:
             self._ui_log("mysqlremote", "[MANAGER] Starting MySQL Remote bridge first...\n")
-            self._launch_process("mysqlremote")
+            if not bridge_was_available:
+                bridge_started_here = self._launch_process("mysqlremote", execution_type="loop")
             if not self._wait_for_bridge(timeout=150):
                 self._ui_log("mysqlremote", "[MANAGER] MySQL Remote did not open port 5599. Other programs were not started.\n", "error")
                 self.events.put(("run_all_finished", ()))
                 return
             self._ui_log("mysqlremote", "[MANAGER] Bridge port 5599 is accepting connections.\n", "success")
+            newly_started_workers = []
             for key in RUN_ALL_ORDER[1:]:
                 if self.closing:
                     break
-                self._launch_process(key)
+                was_running = self._is_process_running(key)
+                self._launch_process(key, execution_type=execution_type)
+                if not was_running:
+                    newly_started_workers.append(key)
                 time.sleep(0.8)
+
+            if execution_type == "once":
+                # Wait for one complete pass from services started by this
+                # action. Already-running workers are left untouched.
+                while not self.closing:
+                    active_workers = [key for key in newly_started_workers if self._is_process_running(key)]
+                    if not active_workers:
+                        break
+                    time.sleep(0.5)
+                if bridge_started_here:
+                    self._ui_log("mysqlremote", "[MANAGER] One-shot workers completed; stopping the temporary database listener.\n", "dim")
+                    self._stop_process_worker("mysqlremote")
             self.events.put(("run_all_finished", ()))
         except Exception as exc:
             self._ui_log("mysqlremote", f"[MANAGER] Run All failed: {exc}\n", "error")
@@ -1941,21 +2484,24 @@ class HarvCoreManager:
             return
         if item.get("warning") and not messagebox.askyesno("Confirm program start", item["warning"] + "\n\nStart this program?", parent=self.root):
             return
+        execution_type = self.program_execution_types.get(key, self.global_execution_type)
         if key == "mysqlremote":
-            self._launch_process(key)
+            self._launch_process(key, execution_type=execution_type)
             return
-        threading.Thread(target=self._start_with_bridge_worker, args=(key,), daemon=True).start()
+        threading.Thread(
+            target=self._start_with_bridge_worker, args=(key, execution_type), daemon=True
+        ).start()
 
-    def _start_with_bridge_worker(self, key: str) -> None:
+    def _start_with_bridge_worker(self, key: str, execution_type: str = "once") -> None:
         if not self._port_open():
             self._ui_log(key, "[MANAGER] MySQL Remote is not running. Starting it automatically...\n", "dim")
-            self._launch_process("mysqlremote")
+            self._launch_process("mysqlremote", execution_type="loop")
             if not self._wait_for_bridge(timeout=150):
                 self._ui_log(key, "[MANAGER] Cannot start this program because the MySQL Remote bridge did not become ready.\n", "error")
                 return
-        self._launch_process(key)
+        self._launch_process(key, execution_type=execution_type)
 
-    def _launch_process(self, key: str) -> bool:
+    def _launch_process(self, key: str, execution_type: Optional[str] = None) -> bool:
         item = self._program(key)
         if not item or not item["runnable"]:
             return False
@@ -1976,10 +2522,24 @@ class HarvCoreManager:
                 self._ui_log(key, "[MANAGER] Python 3.13 x64 is not available. Run Setup / Repair first.\n", "error")
                 return False
 
-            command = [str(self.python_exe), "-u", str(script), *item["args"]]
+            selected_execution = execution_type or self.program_execution_types.get(
+                key, self.global_execution_type
+            )
+            selected_execution = "loop" if str(selected_execution).lower() == "loop" else "once"
+            command = [
+                str(self.python_exe), "-u", str(script),
+                f"--execution-type={selected_execution}",
+                "--interval", str(DEFAULT_LOOP_INTERVAL),
+                *item["args"],
+            ]
             env = os.environ.copy()
             env["PYTHONUNBUFFERED"] = "1"
             env["PYTHONUTF8"] = "1"
+            env["HARVHUB_EXECUTION_TYPE"] = selected_execution
+            env["HARVHUB_LOOP_INTERVAL"] = str(DEFAULT_LOOP_INTERVAL)
+            env["HARVHUB_CONTROL_HOST"] = CONTROL_HOST
+            env["HARVHUB_CONTROL_PORT"] = str(CONTROL_PORT)
+            env["HARVHUB_MANAGER_DIR"] = str(MANAGER_DIR)
             env["PATH"] = str(self.python_exe.parent) + os.pathsep + str(self.python_exe.parent / "Scripts") + os.pathsep + env.get("PATH", "")
             flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
             try:
@@ -2180,6 +2740,10 @@ class HarvCoreManager:
                 elif event == "console_line":
                     key, line, *rest = data
                     self._append_console(key, str(line), rest[0] if rest else None)
+                elif event == "mysql_metrics":
+                    self._apply_mysql_metrics(data[0] if data else None)
+                elif event == "manual_login_refresh":
+                    self._refresh_manual_login_dashboard()
                 elif event == "program_status":
                     self._set_program_status(data[0], data[1])
                 elif event == "process_exit":
@@ -2304,6 +2868,13 @@ class HarvCoreManager:
             for key in active:
                 self._stop_process_worker(key)
         self.closing = True
+        self.control_server_stop.set()
+        self.mysql_poll_stop.set()
+        try:
+            if self.control_server_socket is not None:
+                self.control_server_socket.close()
+        except OSError:
+            pass
         self.root.destroy()
 
 

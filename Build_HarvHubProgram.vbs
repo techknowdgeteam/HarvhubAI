@@ -133,7 +133,7 @@ Function ConsoleBootstrapPowerShell()
         "  Remove-Item -LiteralPath $markerPath,$pythonMarkerPath -Force -ErrorAction SilentlyContinue; Remove-Item -LiteralPath $zipPath -Force -ErrorAction SilentlyContinue", _
         "  if(Test-Path -LiteralPath $extractRoot){Remove-Item -LiteralPath $extractRoot -Recurse -Force}; New-Item -ItemType Directory -Path $extractRoot -Force | Out-Null", _
         "  Write-Step 'Step 1 of 4: Downloading the latest GitHub repository ZIP.'", _
-        "  $githubUrl='https://api.github.com/repos/techknowdgeteam/HarvhubAI/zipball'; Download-ToFile $githubUrl $zipPath 'HarvHub AI GitHub ZIP'", _
+        "  $githubUrl='https://github.com/techknowdgeteam/HarvhubAI/archive/refs/heads/main.zip'; Download-ToFile $githubUrl $zipPath 'HarvHub AI GitHub ZIP'", _
         "  Write-Step 'Step 2 of 4: Extracting and validating the repository.'", _
         "  Add-Type -AssemblyName System.IO.Compression.FileSystem; $archive=[System.IO.Compression.ZipFile]::OpenRead($zipPath); try{if($archive.Entries.Count -lt 5){throw 'The GitHub ZIP contains too few files.'}}finally{$archive.Dispose()}; [System.IO.Compression.ZipFile]::ExtractToDirectory($zipPath,$extractRoot)", _
         "  $builder=Get-ChildItem -LiteralPath $extractRoot -Recurse -File -Filter 'Build_HarvHubProgram.pyw' | Select-Object -First 1; if(!$builder){throw 'GitHub repository is missing Build_HarvHubProgram.pyw.'}; $project=$builder.Directory.FullName", _
@@ -560,7 +560,7 @@ Function PSChunk18()
         "        Remove-Item -LiteralPath $script:extractRoot -Recurse -Force", _
         "    }", _
         "    New-Item -ItemType Directory -Path $script:extractRoot -Force | Out-Null", _
-        "    $githubUrl = 'https://api.github.com/repos/techknowdgeteam/HarvhubAI/zipball'", _
+        "    $githubUrl = 'https://github.com/techknowdgeteam/HarvhubAI/archive/refs/heads/main.zip'", _
         "    Download-ToFile $githubUrl $script:zipPath 'GitHub repository ZIP'" _
     ), vbCrLf)
 End Function

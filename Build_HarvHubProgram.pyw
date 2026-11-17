@@ -540,6 +540,7 @@ BUNDLED_SOURCE_FILES = (
     "ip.py",
     "notification_email.py",
     "notification_service.py",
+    "harvhub_ipc.py",
     "requirements-runtime.txt",
 )
 

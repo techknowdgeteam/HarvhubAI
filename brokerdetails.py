@@ -75,10 +75,13 @@ import subprocess
 import traceback
 from datetime import datetime
 
-import tkinter as tk
-from tkinter import ttk
 
 import notification_service as notifier
+
+try:
+    from harvhub_ipc import manager_request
+except Exception:
+    manager_request = None
 
 try:
     import MetaTrader5 as mt5
@@ -1978,427 +1981,76 @@ def _process_programme_disconnect_requests():
 
 
 # ==============================================================================
-#  [SHARED UI] Single manual-login window, two columns
+#  [SHARED UI] Manual login requests are rendered inside HarvHub AI.
 # ==============================================================================
 class _ManualLoginWindow:
+    """IPC-backed queue; no separate Tk window is created by this service."""
+
     def __init__(self):
-        self._lock           = threading.Lock()
-        self._sa_items       = {}
-        self._prg_items      = {}
-        self._pending_dec    = {}
-        self._root           = None
-        self._sa_holder      = None
-        self._prg_holder     = None
-        self._started        = False
-        self._stop_poll      = threading.Event()
-        self._thread         = None
-        self._polling        = False
+        self._lock = threading.RLock()
+        self._sa_items = {}
+        self._prg_items = {}
+
+    @staticmethod
+    def _key(kind, owner_id, account_id):
+        return (str(kind).upper(), str(owner_id), str(account_id))
+
+    def _send(self, payload):
+        if manager_request is None:
+            print("      [MANUAL] HarvHub manager IPC helper is unavailable.", flush=True)
+            return None
+        return manager_request(payload, timeout=2.0)
 
     def add_item(self, kind, owner_id, account_id, broker, server,
                  login, password, terminal_exe):
-        item_key = (kind, owner_id, account_id)
-
-        new_item = {
-            'kind':         kind,
-            'owner_id':     owner_id,
-            'account_id':   account_id,
-            'broker':       broker or 'N/A',
-            'server':       server or 'N/A',
-            'login':        login,
-            'password':     password or '',
-            'terminal_exe': terminal_exe,
+        kind = str(kind).upper()
+        item = {
+            "kind": kind,
+            "owner_id": str(owner_id),
+            "account_id": str(account_id),
+            "broker": broker or "N/A",
+            "server": server or "N/A",
+            "login": str(login or ""),
+            "password": str(password or ""),
+            "terminal_exe": str(terminal_exe or ""),
         }
-
-        store = self._sa_items if kind == 'SA' else self._prg_items
-
+        key = self._key(kind, owner_id, account_id)
+        store = self._sa_items if kind == "SA" else self._prg_items
         with self._lock:
-            existing = store.get(item_key)
-            if existing is not None:
-                same = all(
-                    str(existing.get(k)) == str(new_item.get(k))
-                    for k in ('account_id', 'broker', 'server',
-                              'login', 'password', 'terminal_exe')
-                )
-                if same:
-                    return
-            store[item_key] = new_item
-
-        self._ensure_started()
-        self._request_refresh(kind)
+            store[key] = item
+        self._send({"op": "manual_login_upsert", "item": item})
 
     def remove_item(self, kind, owner_id, account_id):
-        item_key = (kind, owner_id, account_id)
-        store = self._sa_items if kind == 'SA' else self._prg_items
+        kind = str(kind).upper()
+        key = self._key(kind, owner_id, account_id)
+        store = self._sa_items if kind == "SA" else self._prg_items
         with self._lock:
-            existed = store.pop(item_key, None) is not None
-            self._pending_dec.pop(item_key, None)
-        if existed:
-            self._request_refresh(kind)
+            existed = store.pop(key, None) is not None
+        self._send({
+            "op": "manual_login_remove",
+            "kind": kind, "owner_id": str(owner_id), "account_id": str(account_id),
+        })
+        return existed
 
     def take_decision(self, kind, owner_id, account_id):
-        item_key = (kind, owner_id, account_id)
+        kind = str(kind).upper()
+        key = self._key(kind, owner_id, account_id)
+        response = self._send({
+            "op": "manual_login_take_decision",
+            "kind": kind, "owner_id": str(owner_id), "account_id": str(account_id),
+        }) or {}
+        decision = response.get("decision")
+        if decision in ("valid", "invalid"):
+            return decision
+        return None
+
+    def has_pending_items(self):
         with self._lock:
-            return self._pending_dec.pop(item_key, None)
+            return bool(self._sa_items or self._prg_items)
 
     def stop(self):
-        self._stop_poll.set()
-
-    def _ensure_started(self):
-        with self._lock:
-            if self._started:
-                return
-            self._started = True
-        self._thread = threading.Thread(
-            target=self._run, name="manual_login_window", daemon=True)
-        self._thread.start()
-
-    def _run(self):
-        try:
-            self._build_and_loop()
-        except Exception as e:
-            print(f"      [WINDOW] Tk thread died: {e}")
-            traceback.print_exc()
-
-    def _build_and_loop(self):
-        self._root = tk.Tk()
-        self._root.title("Manual MT5 Login — Sub Accounts | Programme Accounts")
-        self._root.geometry("1180x680")
-        self._root.minsize(900, 460)
-
-        try:
-            self._root.attributes('-topmost', True)
-            self._root.after(400, lambda: self._root.attributes('-topmost', False))
-        except Exception:
-            pass
-
-        header = ttk.Frame(self._root, padding=(12, 10, 12, 4))
-        header.pack(fill="x")
-
-        ttk.Label(
-            header,
-            text="Manual MT5 Login",
-            font=("Segoe UI", 14, "bold")
-        ).pack(anchor="w")
-
-        ttk.Label(
-            header,
-            text="Each MT5 terminal has been launched in the background. "
-                 "Log in manually, then click Valid or Invalid on the row. "
-                 "Rows stay here until the live terminal probe confirms the "
-                 "login and account name, or you mark them Invalid. "
-                 "Demo is allowed for programme accounts; investors must be "
-                 "real-account.",
-            foreground="#555",
-            wraplength=1140,
-            justify="left"
-        ).pack(anchor="w", pady=(4, 0))
-
-        body = ttk.Frame(self._root)
-        body.pack(fill="both", expand=True, padx=12, pady=(6, 8))
-
-        left  = ttk.LabelFrame(body, text="[SA] Sub Accounts", padding=6)
-        right = ttk.LabelFrame(body, text="[PRG] Programme Accounts", padding=6)
-
-        left.pack(side="left",  fill="both", expand=True, padx=(0, 6))
-        right.pack(side="right", fill="both", expand=True, padx=(6, 0))
-
-        self._sa_holder  = self._build_scroll_column(left)
-        self._prg_holder = self._build_scroll_column(right)
-
-        footer = ttk.Frame(self._root, padding=(12, 0, 12, 10))
-        footer.pack(fill="x")
-        ttk.Button(footer, text="Close (reopens if unresolved rows remain)",
-                   command=self._on_close).pack(side="right")
-
-        self._root.protocol("WM_DELETE_WINDOW", self._on_close)
-
-        self._refresh_column('SA')
-        self._refresh_column('PRG')
-
-        self._schedule_db_poll()
-
-        try:
-            self._root.mainloop()
-        except Exception:
-            pass
-
-    def _build_scroll_column(self, parent):
-        container = ttk.Frame(parent)
-        container.pack(fill="both", expand=True)
-
-        canvas = tk.Canvas(container, borderwidth=0, highlightthickness=0)
-        vbar   = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
-        canvas.configure(yscrollcommand=vbar.set)
-
-        canvas.pack(side="left", fill="both", expand=True)
-        vbar.pack(side="right", fill="y")
-
-        holder = ttk.Frame(canvas)
-        canvas.create_window((0, 0), window=holder, anchor="nw")
-
-        def _on_configure(_evt=None):
-            try:
-                canvas.configure(scrollregion=canvas.bbox("all"))
-            except Exception:
-                pass
-
-        holder.bind("<Configure>", _on_configure)
-
-        def _on_mousewheel(event):
-            try:
-                canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-            except Exception:
-                pass
-        canvas.bind_all("<MouseWheel>", _on_mousewheel)
-
-        return holder
-
-    def _on_close(self):
-        print("      [WINDOW] closed by user; will reopen if rows remain")
-        try:
-            self._root.quit()
-            self._root.destroy()
-        except Exception:
-            pass
-        with self._lock:
-            self._started = False
-            self._root = None
-            self._sa_holder = None
-            self._prg_holder = None
-
-    def _request_refresh(self, kind):
-        root = self._root
-        if root is None:
-            return
-        try:
-            root.after(0, lambda k=kind: self._refresh_column(k))
-        except Exception:
-            pass
-
-    def _refresh_column(self, kind):
-        holder = self._sa_holder if kind == 'SA' else self._prg_holder
-        if holder is None:
-            return
-
-        store = self._sa_items if kind == 'SA' else self._prg_items
-
-        try:
-            with self._lock:
-                snapshot = list(store.items())
-
-            for child in holder.winfo_children():
-                child.destroy()
-
-            if not snapshot:
-                ttk.Label(
-                    holder,
-                    text=("No [SA] accounts pending manual login."
-                          if kind == 'SA' else
-                          "No [PRG] programmes pending manual login."),
-                    foreground="#666",
-                    padding=12
-                ).pack(anchor="w")
-                return
-
-            for idx, (_, item) in enumerate(snapshot, start=1):
-                self._render_row(kind, idx, item)
-        except Exception as e:
-            print(f"      [{kind}][WINDOW] refresh error: {e}")
-
-    def _render_row(self, kind, idx, item):
-        holder = self._sa_holder if kind == 'SA' else self._prg_holder
-        owner_id   = item['owner_id']
-        account_id = item['account_id']
-
-        label = ('[SA] user {u} | sub {a}'.format(u=owner_id, a=account_id)
-                 if kind == 'SA' else
-                 '[PRG] user {u} | programme {a}'.format(u=owner_id, a=account_id))
-
-        card = ttk.LabelFrame(holder, text=f"{idx}. {label}", padding=8)
-        card.pack(fill="x", expand=True, pady=4, padx=2)
-
-        def _field(parent, name, value):
-            row = ttk.Frame(parent)
-            row.pack(fill="x", pady=1)
-            ttk.Label(row, text=f"{name}:", width=10, anchor="w").pack(side="left")
-            ttk.Label(row, text=str(value), anchor="w").pack(side="left")
-            self._make_copy_button(row, value).pack(side="left", padx=(6, 0))
-
-        _field(card, "Broker", item['broker'])
-        _field(card, "Server", item['server'])
-        _field(card, "Login",  item['login'])
-
-        pw_row = ttk.Frame(card)
-        pw_row.pack(fill="x", pady=1)
-        ttk.Label(pw_row, text="Password:", width=10, anchor="w").pack(side="left")
-        pw_var = tk.StringVar(value="••••••••")
-        ttk.Label(pw_row, textvariable=pw_var, anchor="w").pack(side="left")
-
-        def _toggle_pw():
-            if pw_var.get().startswith("•"):
-                pw_var.set(item['password'] or "(empty)")
-            else:
-                pw_var.set("••••••••")
-
-        ttk.Button(pw_row, text="Show", width=6,
-                   command=_toggle_pw).pack(side="left", padx=(6, 0))
-        self._make_copy_button(pw_row, item['password']).pack(side="left", padx=(4, 0))
-
-        actions = ttk.Frame(card)
-        actions.pack(fill="x", pady=(6, 0))
-
-        def _on_open_terminal():
-            bring_terminal_to_front(item['terminal_exe'])
-
-        ttk.Button(actions, text="Open Terminal",
-                   command=_on_open_terminal).pack(side="left", padx=(0, 6))
-
-        def _on_valid():
-            key = (kind, owner_id, account_id)
-            with self._lock:
-                self._pending_dec[key] = 'valid'
-            print(f"      [{kind}][UI] queued VALID for owner={owner_id} "
-                  f"account={account_id}")
-
-        def _on_invalid():
-            key = (kind, owner_id, account_id)
-            with self._lock:
-                self._pending_dec[key] = 'invalid'
-            print(f"      [{kind}][UI] queued INVALID for owner={owner_id} "
-                  f"account={account_id}")
-
-        ttk.Button(actions, text="Invalid Credentials",
-                   command=_on_invalid).pack(side="left", expand=True,
-                                             fill="x", padx=(0, 4))
-        ttk.Button(actions, text="Valid Credentials",
-                   command=_on_valid).pack(side="left", expand=True,
-                                           fill="x", padx=(4, 0))
-
-    def _make_copy_button(self, parent, value, label="Copy"):
-        btn = ttk.Button(parent, text=label, width=6)
-
-        def _do_copy():
-            try:
-                self._root.clipboard_clear()
-                self._root.clipboard_append(str(value))
-                self._root.update_idletasks()
-                print(f"      [COPY] {value}")
-            except Exception as e:
-                print(f"      [COPY] failed: {e}")
-            try:
-                btn.configure(text="✓")
-                btn.after(COPY_FEEDBACK_MS,
-                          lambda: btn.configure(text=label))
-            except Exception:
-                pass
-
-        btn.configure(command=_do_copy)
-        return btn
-
-    def _schedule_db_poll(self):
-        if self._stop_poll.is_set():
-            return
-        try:
-            if not self._polling:
-                self._polling = True
-                threading.Thread(
-                    target=self._poll_worker, daemon=True
-                ).start()
-        except Exception:
-            pass
-
-        try:
-            if self._root is not None:
-                self._root.after(int(MANUAL_POLL_INTERVAL * 1000),
-                                 self._schedule_db_poll)
-        except Exception:
-            pass
-
-    def _poll_worker(self):
-        try:
-            self._poll_db_once()
-        except Exception as e:
-            print(f"      [WINDOW][POLL] raised: {e}")
-            traceback.print_exc()
-        finally:
-            self._polling = False
-
-    def _poll_db_once(self):
-        with self._lock:
-            sa_snapshot  = list(self._sa_items.items())
-            prg_snapshot = list(self._prg_items.items())
-
-        removed_sa  = False
-        removed_prg = False
-
-        for key, item in sa_snapshot:
-            kind, owner_id, account_id = key
-            try:
-                db_status = _get_broker_login_status(owner_id)
-            except Exception:
-                db_status = None
-
-            db_status_l = (db_status or '').strip().lower()
-
-            if db_status_l in TERMINAL_NEGATIVE_STATUSES:
-                print(f"      [SA][MANUAL] owner={owner_id} "
-                      f"account={account_id} removed — DB negative "
-                      f"status -> {db_status_l}")
-                with self._lock:
-                    self._sa_items.pop(key, None)
-                    self._pending_dec.pop(key, None)
-                removed_sa = True
-                continue
-
-            if db_status_l == VALID_STATUS and _was_terminal_live(
-                    'SA', owner_id, account_id):
-                print(f"      [SA][MANUAL] owner={owner_id} "
-                      f"account={account_id} removed — pipeline confirmed live")
-                with self._lock:
-                    self._sa_items.pop(key, None)
-                    self._pending_dec.pop(key, None)
-                removed_sa = True
-                continue
-
-            print(f"      [SA][MANUAL] owner={owner_id} "
-                  f"account={account_id} still pending (db={db_status_l!r})")
-
-        for key, item in prg_snapshot:
-            kind, owner_id, account_id = key
-            try:
-                db_status = _get_programme_broker_login_status(account_id)
-            except Exception:
-                db_status = None
-
-            db_status_l = (db_status or '').strip().lower()
-
-            if db_status_l in PROGRAMME_NEGATIVE_STATUSES:
-                print(f"      [PRG][MANUAL] owner={owner_id} "
-                      f"account={account_id} removed — DB negative "
-                      f"status -> {db_status_l}")
-                with self._lock:
-                    self._prg_items.pop(key, None)
-                    self._pending_dec.pop(key, None)
-                removed_prg = True
-                continue
-
-            if db_status_l == VALID_STATUS and _was_terminal_live(
-                    'PRG', owner_id, account_id):
-                print(f"      [PRG][MANUAL] owner={owner_id} "
-                      f"account={account_id} removed — pipeline confirmed live")
-                with self._lock:
-                    self._prg_items.pop(key, None)
-                    self._pending_dec.pop(key, None)
-                removed_prg = True
-                continue
-
-            print(f"      [PRG][MANUAL] owner={owner_id} "
-                  f"account={account_id} still pending (db={db_status_l!r})")
-
-        if removed_sa:
-            self._request_refresh('SA')
-        if removed_prg:
-            self._request_refresh('PRG')
+        # No independent UI/event loop is owned by this service any longer.
+        return None
 
 
 _MANUAL_WINDOW = _ManualLoginWindow()
@@ -3412,21 +3064,40 @@ def check_if_broker_is_logged_in(inv_id=None):
 # ==============================================================================
 #  MAIN LOOP
 # ==============================================================================
-def main():
-    _build_timeframe_map()
-
-    print(f"\n{'#'*70}")
-    print(f"#  brokerdetails — check_if_broker_is_logged_in loop")
-    print(f"#  started at {datetime.now().isoformat(timespec='seconds')}")
-    print(f"{'#'*70}")
-
-    interval = 10
+def main_loop():
+    run_as_loop = False
+    loop_interval = 5
     for arg in sys.argv[1:]:
-        if arg.startswith('--interval='):
+        lower = arg.lower()
+        if lower.startswith("--execution-type="):
+            run_as_loop = lower.split("=", 1)[1].strip() == "loop"
+        elif lower in ("--loop", "--loop=true", "--loop=1", "--loop=yes"):
+            run_as_loop = True
+        elif lower in ("--once", "--loop=false", "--loop=0", "--loop=no"):
+            run_as_loop = False
+        elif lower.startswith("--interval="):
             try:
-                interval = max(1, int(arg.split('=', 1)[1]))
+                loop_interval = max(1, int(lower.split("=", 1)[1]))
             except ValueError:
                 pass
+        elif lower == "--interval":
+            # Supports the argparse-style two-token form.
+            continue
+
+    args = list(sys.argv[1:])
+    for index, arg in enumerate(args[:-1]):
+        if arg.lower() == "--interval":
+            try:
+                loop_interval = max(1, int(args[index + 1]))
+            except ValueError:
+                pass
+
+    _build_timeframe_map()
+    print(f"\n{'#'*70}")
+    print("#  brokerdetails — broker login monitoring")
+    print(f"#  started at {datetime.now().isoformat(timespec='seconds')}")
+    print(f"#  execution type: {'loop' if run_as_loop else 'once'} | interval: {loop_interval}s")
+    print(f"{'#'*70}")
 
     try:
         while True:
@@ -3436,9 +3107,33 @@ def main():
             except Exception as e:
                 print(f"[main] check_if_broker_is_logged_in raised: {e}")
                 traceback.print_exc()
+
+            if not run_as_loop:
+                # Preserve the manual-login workflow: in Once mode the scan is
+                # complete, but keep this process alive while the manager has
+                # unresolved rows so Valid/Invalid clicks can be applied safely.
+                if not _MANUAL_WINDOW.has_pending_items():
+                    break
+                print("[main] Waiting for manual MT5 login decisions in the HarvHub window.")
+                while _MANUAL_WINDOW.has_pending_items():
+                    time.sleep(float(loop_interval))
+                    try:
+                        result = check_if_broker_is_logged_in()
+                        print(f"[main] manual-login follow-up: {result.get('message')}")
+                    except Exception as e:
+                        print(f"[main] manual-login follow-up raised: {e}")
+                        traceback.print_exc()
+                break
+
+            time.sleep(loop_interval)
     except KeyboardInterrupt:
         print("[main] interrupted — shutting down")
+    finally:
+        _MANUAL_WINDOW.stop()
 
+
+def main():
+    return main_loop()
 
 if __name__ == "__main__":
-    main()
+    main_loop()

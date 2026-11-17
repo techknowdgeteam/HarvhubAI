@@ -13884,18 +13884,29 @@ def main_loop():
     run_as_loop = False
     loop_interval = 5
     max_loops = None
+    args = list(sys.argv[1:])
 
-    for arg in sys.argv[1:]:
-        if arg.startswith('--loop='):
-            run_as_loop = arg.split('=')[1].lower() in ('true', 'yes', '1', 'on')
-        elif arg.startswith('--interval='):
+    for index, arg in enumerate(args):
+        lower = arg.lower()
+        if lower.startswith('--execution-type='):
+            run_as_loop = lower.split('=', 1)[1].strip() == 'loop'
+        elif lower in ('--loop', '--loop=true', '--loop=yes', '--loop=1'):
+            run_as_loop = True
+        elif lower in ('--once', '--loop=false', '--loop=no', '--loop=0'):
+            run_as_loop = False
+        elif lower.startswith('--interval='):
             try:
-                loop_interval = int(arg.split('=')[1])
+                loop_interval = max(1, int(lower.split('=', 1)[1]))
             except ValueError:
                 pass
-        elif arg.startswith('--max-loops='):
+        elif lower == '--interval' and index + 1 < len(args):
             try:
-                max_loops = int(arg.split('=')[1])
+                loop_interval = max(1, int(args[index + 1]))
+            except ValueError:
+                pass
+        elif lower.startswith('--max-loops='):
+            try:
+                max_loops = int(lower.split('=', 1)[1])
             except ValueError:
                 pass
 
@@ -13932,10 +13943,10 @@ def main_loop():
                 jobs = discover_investor_jobs()
 
                 if not jobs:
-                    print(f" └─ 🔘 No active investor jobs returned by DB for "
-                          f"this VPS. Sleeping {loop_interval}s.")
-                    time.sleep(loop_interval)
-                    continue
+                    print(" └─ 🔘 No active investor jobs returned by DB for this VPS.")
+                    if run_as_loop:
+                        time.sleep(loop_interval)
+                        continue
 
                 print(f"📊 Submitting {len(jobs)} investor job(s) "
                       f"via persistent pool")

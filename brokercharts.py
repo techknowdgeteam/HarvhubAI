@@ -1322,19 +1322,30 @@ def process_programme_job(programme_job):
 # ==============================================================================
 def main_loop():
     run_as_loop = False
-    loop_interval = 60
+    loop_interval = 5
     max_loops = None
-    for arg in sys.argv[1:]:
-        if arg.startswith('--loop='):
-            run_as_loop = arg.split('=', 1)[1].lower() in ('true', 'yes', '1', 'on')
-        elif arg.startswith('--interval='):
+    args = list(sys.argv[1:])
+    for index, arg in enumerate(args):
+        lower = arg.lower()
+        if lower.startswith('--execution-type='):
+            run_as_loop = lower.split('=', 1)[1].strip() == 'loop'
+        elif lower in ('--loop', '--loop=true', '--loop=yes', '--loop=1'):
+            run_as_loop = True
+        elif lower in ('--once', '--loop=false', '--loop=no', '--loop=0'):
+            run_as_loop = False
+        elif lower.startswith('--interval='):
             try:
-                loop_interval = int(arg.split('=', 1)[1])
+                loop_interval = max(1, int(lower.split('=', 1)[1]))
             except ValueError:
                 pass
-        elif arg.startswith('--max-loops='):
+        elif lower == '--interval' and index + 1 < len(args):
             try:
-                max_loops = int(arg.split('=', 1)[1])
+                loop_interval = max(1, int(args[index + 1]))
+            except ValueError:
+                pass
+        elif lower.startswith('--max-loops='):
+            try:
+                max_loops = int(lower.split('=', 1)[1])
             except ValueError:
                 pass
     print("\n" + "=" * 60)
@@ -1363,9 +1374,11 @@ def main_loop():
             try:
                 programmes = _fetch_candidate_programmes()
                 if not programmes:
-                    print(" └─ 🔘 No candidate programmes. Sleeping.")
-                    if run_as_loop:
-                        time.sleep(loop_interval)
+                    print(" └─ 🔘 No candidate programmes found.")
+                    if not run_as_loop:
+                        print("Single execution completed. Exiting...")
+                        break
+                    time.sleep(loop_interval)
                     continue
                 print(f"📊 Submitting {len(programmes)} programme job(s)")
                 t0 = time.time()

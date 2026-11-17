@@ -1,14 +1,10 @@
-HARVHUB AI - FRESH VPS INSTALLATION
+HARVHUB AI — START HERE
 
-1. Copy ONLY HarvHubAI.vbs to the new VPS.
-2. Double-click HarvHubAI.vbs and approve the Windows administrator prompt.
-3. A visible HarvHub AI - Installer window displays the GitHub ZIP download, extraction, validation and Python preparation.
-4. When bootstrap completes, the normal HarvHub AI builder window opens, followed by the manager.
+1. Extract the complete ZIP to a normal Windows folder.
+2. Run HarvHubAI.vbs as Administrator.
+3. Complete the first-time setup when prompted.
+4. Choose Loop or Once in the top Execution Type selector for Run All.
+5. Open an individual service page to override its execution type before pressing Play.
 
-Do not launch the Python builder directly on a fresh VPS. The VBS launcher must run first so GitHub is downloaded and validated before Python setup.
-
-GitHub repository: https://github.com/techknowdgeteam/HarvhubAI
-Installed root: C:\xampp\htdocs\harvhubAI
-
-Fresh VPS without Python: HarvHubAI.vbs opens a visible CMD bootstrap, installs/verifies Python, then opens the desktop build window.
-MetaTrader 5: automatic install is verified by terminal64.exe; if automatic mode fails, the official setup wizard opens for the exact HarvHub AI MT5 folder.
+The MySQL Remote page shows listener and channel usage. The Broker Details page shows
+manual MT5 login requests in the manager window; no separate manual-login window is used.

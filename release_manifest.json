@@ -14,12 +14,23 @@
     "notification_service.py",
     "programme_training.py",
     "programmesignals_trading.py",
-    "signals_provision_challenge.py"
+    "signals_provision_challenge.py",
+    "harvhub_ipc.py"
   ],
   "fresh_vps_fallback": "Visible CMD bootstrap when compatible Python/Tkinter is missing",
   "python_runtime_lookup": [
     "C:\\Program Files\\Python313",
     "%LOCALAPPDATA%\\Programs\\Python\\Python313"
   ],
-  "metatrader_installation": "Verify terminal64.exe after /auto; open interactive official installer if automatic attempt fails"
+  "metatrader_installation": "Verify terminal64.exe after /auto; open interactive official installer if automatic attempt fails",
+  "execution_mode_control": {
+    "global_selector": "Loop|Once",
+    "per_service_selector": "Loop|Once",
+    "default_loop_interval_seconds": 5,
+    "configuration": "<install_root>/.manager/execution_config.json"
+  },
+  "manager_dashboards": {
+    "mysqlremote": "live listener state, portal session, allocated/in-use/idle/free channel metrics and per-channel owners",
+    "brokerdetails": "in-window Accounts and Programme manual-login tabs with copy, terminal activation and validity actions"
+  }
 }
