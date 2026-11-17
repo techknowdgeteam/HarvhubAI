@@ -138,7 +138,7 @@ Function ConsoleBootstrapPowerShell()
         "  Add-Type -AssemblyName System.IO.Compression.FileSystem; $archive=[System.IO.Compression.ZipFile]::OpenRead($zipPath); try{if($archive.Entries.Count -lt 5){throw 'The GitHub ZIP contains too few files.'}}finally{$archive.Dispose()}; [System.IO.Compression.ZipFile]::ExtractToDirectory($zipPath,$extractRoot)", _
         "  $builder=Get-ChildItem -LiteralPath $extractRoot -Recurse -File -Filter 'Build_HarvHubProgram.pyw' | Select-Object -First 1; if(!$builder){throw 'GitHub repository is missing Build_HarvHubProgram.pyw.'}; $project=$builder.Directory.FullName", _
         "  $manager=Join-Path $project 'harvcore_manager.py'; if(!(Test-Path -LiteralPath $manager)){throw 'GitHub repository is missing harvcore_manager.py.'}; $payload=Join-Path $project 'payload'; New-Item -ItemType Directory -Path $payload -Force | Out-Null", _
-        "  $sourceNames=@('mysqlremote.py','brokerdetails.py','brokercharts.py','programme_training.py','programmesignals_trading.py','signals_provision_challenge.py','ip.py','notification_email.py','notification_service.py')", _
+        "  $sourceNames=@('mysqlremote.py','brokerdetails.py','brokercharts.py','programme_training.py','programmesignals_trading.py','signals_provision_challenge.py','ip.py','notification_email.py','notification_service.py','harvhub_ipc.py')", _
         "  foreach($name in $sourceNames) {", _
         "    $target = Join-Path $payload $name", _
         "    $base = [System.IO.Path]::GetFileNameWithoutExtension($name)", _
@@ -153,10 +153,10 @@ Function ConsoleBootstrapPowerShell()
         "    }", _
         "    if (!(Test-Path -LiteralPath $target) -or (Get-Item -LiteralPath $target).Length -lt 100) { throw ('Python source is incomplete: ' + $name) }", _
         "  }", _
-        "  $requirements=Join-Path $payload 'requirements-runtime.txt'; if(!(Test-Path -LiteralPath $requirements)){$requiredText=@('# HarvHub AI runtime requirements','MetaTrader5','pytz','tzdata','requests','urllib3','selenium','beautifulsoup4','webdriver-manager') -join [Environment]::NewLine; [IO.File]::WriteAllText($requirements,$requiredText,[Text.Encoding]::ASCII)}", _
+        "  $requirements=Join-Path $payload 'requirements-runtime.txt'; if(!(Test-Path -LiteralPath $requirements)){$requiredText=@('# HarvHub AI runtime requirements','MetaTrader5','pytz','tzdata','requests','urllib3','certifi','selenium','beautifulsoup4','webdriver-manager') -join [Environment]::NewLine; [IO.File]::WriteAllText($requirements,$requiredText,[Text.Encoding]::ASCII)}", _
         "  if(!$clickedVbs -or !(Test-Path -LiteralPath $clickedVbs)){throw 'The standalone HarvHubAI.vbs file is no longer accessible.'}; Copy-Item -LiteralPath $clickedVbs -Destination (Join-Path $project 'HarvHubAI.vbs') -Force; Copy-Item -LiteralPath $clickedVbs -Destination (Join-Path $project 'Build_HarvHubProgram.vbs') -Force", _
         "  foreach($required in @('Build_HarvHubProgram.pyw','harvcore_manager.py','HarvHubAI.vbs','Build_HarvHubProgram.vbs')){if(!(Test-Path -LiteralPath (Join-Path $project $required))){throw ('Required installer file is missing: '+$required)}}", _
-        "  [IO.File]::WriteAllText($markerPath,$project,[Text.Encoding]::Unicode); Write-Step 'GitHub archive extracted and all nine Python source files validated.'", _
+        "  [IO.File]::WriteAllText($markerPath,$project,[Text.Encoding]::Unicode); Write-Step 'GitHub archive extracted and all ten Python source files validated.'", _
         "  Write-Step 'Step 3 of 4: Checking for a compatible 64-bit Python runtime with Tkinter.'", _
         "  $python=Find-CompatiblePython", _
         "  if (!$python) {", _
@@ -586,7 +586,7 @@ End Function
 
 Function PSChunk20()
     PSChunk20 = Join(Array( _
-        "    $sourceNames = @('mysqlremote.py','brokerdetails.py','brokercharts.py','programme_training.py','programmesignals_trading.py','signals_provision_challenge.py','ip.py','notification_email.py','notification_service.py')", _
+        "    $sourceNames = @('mysqlremote.py','brokerdetails.py','brokercharts.py','programme_training.py','programmesignals_trading.py','signals_provision_challenge.py','ip.py','notification_email.py','notification_service.py','harvhub_ipc.py')", _
         "    foreach ($name in $sourceNames) {", _
         "        $target = Join-Path $payload $name", _
         "        $baseName = [System.IO.Path]::GetFileNameWithoutExtension($name)", _
@@ -616,7 +616,7 @@ Function PSChunk21()
         "    }", _
         "    $requirements = Join-Path $payload 'requirements-runtime.txt'", _
         "    if (!(Test-Path -LiteralPath $requirements)) {", _
-        "        $requirementsText = @('# HarvHub AI runtime requirements','MetaTrader5','pytz','tzdata','requests','urllib3','selenium','beautifulsoup4','webdriver-manager') -join [Environment]::NewLine", _
+        "        $requirementsText = @('# HarvHub AI runtime requirements','MetaTrader5','pytz','tzdata','requests','urllib3','certifi','selenium','beautifulsoup4','webdriver-manager') -join [Environment]::NewLine", _
         "        [System.IO.File]::WriteAllText($requirements, $requirementsText, [System.Text.Encoding]::ASCII)", _
         "    }" _
     ), vbCrLf)

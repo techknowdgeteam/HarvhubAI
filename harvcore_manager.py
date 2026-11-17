@@ -9,6 +9,7 @@ import os
 import queue
 import shutil
 import socket
+import ssl
 import struct
 import subprocess
 import sys
@@ -1061,6 +1062,43 @@ class HarvCoreManager:
         if detail:
             self._write_manager_log(f"{key}: {detail}")
 
+    def _download_ssl_context(self) -> ssl.SSLContext:
+        """Build a verified TLS context using certifi and Windows trusted roots.
+
+        Python's urllib does not automatically use requests' certifi bundle.
+        Some Windows Python installations therefore fail HTTPS downloads even
+        though the runtime dependencies installed certifi successfully. Keep
+        hostname and certificate verification enabled while combining the
+        public Mozilla CA bundle with certificates trusted by Windows.
+        """
+        context = ssl.create_default_context()
+
+        try:
+            import certifi
+            context.load_verify_locations(cafile=certifi.where())
+            self._setup_emit("setup_log", "HTTPS certificate bundle: certifi plus Windows/system trust.")
+        except (ImportError, OSError, ssl.SSLError) as exc:
+            self._setup_emit(
+                "setup_log",
+                f"certifi CA bundle unavailable; using the operating-system trust store ({exc}).",
+            )
+
+        # On Windows, also include certificates explicitly trusted in the
+        # machine ROOT store. This supports VPS environments using a legitimate
+        # managed TLS inspection/proxy root without turning verification off.
+        if os.name == "nt" and hasattr(ssl, "enum_certificates"):
+            try:
+                pem_roots = []
+                for certificate, encoding, _trust in ssl.enum_certificates("ROOT"):
+                    if encoding == "x509_asn":
+                        pem_roots.append(ssl.DER_cert_to_PEM_cert(certificate))
+                if pem_roots:
+                    context.load_verify_locations(cadata="\n".join(pem_roots))
+            except (OSError, ValueError, ssl.SSLError) as exc:
+                self._setup_emit("setup_log", f"Additional Windows ROOT certificates could not be loaded: {exc}")
+
+        return context
+
     def _download(self, url: str, destination: Path, label: str, expected_sha256: Optional[str] = None) -> None:
         self._check_setup_cancelled()
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -1073,7 +1111,7 @@ class HarvCoreManager:
             )
             temp_path = destination.with_suffix(destination.suffix + ".part")
             try:
-                with urllib.request.urlopen(request, timeout=45) as response, temp_path.open("wb") as output:
+                with urllib.request.urlopen(request, timeout=45, context=self._download_ssl_context()) as response, temp_path.open("wb") as output:
                     total = int(response.headers.get("Content-Length", "0") or "0")
                     downloaded = 0
                     while True:

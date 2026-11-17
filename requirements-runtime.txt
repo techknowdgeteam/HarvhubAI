@@ -2,6 +2,7 @@ MetaTrader5
 pytz
 tzdata
 requests
+certifi
 urllib3
 selenium
 beautifulsoup4
