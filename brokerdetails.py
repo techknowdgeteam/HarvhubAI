@@ -3633,7 +3633,6 @@ def main():
             except Exception as e:
                 print(f"[main] check_if_broker_is_logged_in raised: {e}")
                 traceback.print_exc()
-            time.sleep(interval)
     except KeyboardInterrupt:
         print("[main] interrupted — shutting down")
 
