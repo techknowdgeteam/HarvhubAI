@@ -62,7 +62,6 @@ for more details." Deduplicated per sub-account.
 """
 
 import atexit
-import ctypes
 import os
 import re
 import sys
@@ -75,6 +74,9 @@ import threading
 import subprocess
 import traceback
 from datetime import datetime
+
+import tkinter as tk
+from tkinter import ttk
 
 import notification_service as notifier
 
@@ -751,268 +753,72 @@ def delete_mt5_folder(folder_abs, tag='SA'):
         return False
 
 
-# =============================================================================
-#  Terminal launcher — exactly one portable MT5 process per account folder
-# =============================================================================
+# ==============================================================================
+#  Terminal launcher
+# ==============================================================================
 _LAUNCHED_FOLDERS = set()
 _LAUNCH_LOCK      = threading.Lock()
 
 
-def _normalise_executable_path(path):
-    """Normalise a Windows executable path for exact process-path matching."""
-    try:
-        return os.path.normcase(os.path.realpath(os.path.abspath(path)))
-    except Exception:
-        return os.path.normcase(os.path.normpath(str(path)))
-
-
-def _process_image_path(pid):
-    """Return the full executable path for a PID on Windows, or None."""
-    if os.name != 'nt':
-        return None
-
-    try:
-        from ctypes import wintypes
-
-        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
-        kernel32.OpenProcess.argtypes = [
-            wintypes.DWORD, wintypes.BOOL, wintypes.DWORD
-        ]
-        kernel32.OpenProcess.restype = wintypes.HANDLE
-        kernel32.QueryFullProcessImageNameW.argtypes = [
-            wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR,
-            ctypes.POINTER(wintypes.DWORD)
-        ]
-        kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
-        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-        kernel32.CloseHandle.restype = wintypes.BOOL
-
-        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-        handle = kernel32.OpenProcess(
-            PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid)
-        )
-        if not handle:
-            return None
-
-        try:
-            buffer = ctypes.create_unicode_buffer(32768)
-            size = wintypes.DWORD(len(buffer))
-            if not kernel32.QueryFullProcessImageNameW(
-                handle, 0, buffer, ctypes.byref(size)
-            ):
-                return None
-            return buffer.value
-        finally:
-            kernel32.CloseHandle(handle)
-    except Exception as e:
-        print(f"      [PROCESS] could not read executable path for PID {pid}: {e}")
-        return None
-
-
-def _terminal_pids_for_folder(folder_abs):
-    """Find terminal64.exe processes whose full path belongs to this account."""
-    target_exe = os.path.join(folder_abs, 'terminal64.exe')
-    if not os.path.isfile(target_exe) or os.name != 'nt':
-        return []
-
-    target_norm = _normalise_executable_path(target_exe)
-    matching = []
-    for pid in _list_pids_for_image('terminal64.exe'):
-        running_path = _process_image_path(pid)
-        if running_path and _normalise_executable_path(running_path) == target_norm:
-            matching.append(pid)
-    return matching
-
-
 def _terminal_running_for_folder(folder_abs):
-    """True only when this exact account-folder terminal process is running."""
-    return bool(_terminal_pids_for_folder(folder_abs))
-
-
-def _acquire_account_launch_guard(folder_abs):
-    """Acquire a short cross-process lock while checking/starting this account."""
-    if os.name != 'nt':
-        return None
-
-    lock_path = os.path.join(folder_abs, '.brokerdetails_launch_guard')
-    handle = None
+    target_exe = os.path.join(folder_abs, "terminal64.exe")
+    if not os.path.exists(target_exe):
+        return False
     try:
-        import msvcrt
-
-        handle = open(lock_path, 'a+b')
-        handle.seek(0, os.SEEK_END)
-        if handle.tell() == 0:
-            handle.write(b'0')
-            handle.flush()
-        handle.seek(0)
-        msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
-        return handle
-    except Exception as e:
-        if handle is not None:
-            try:
-                handle.close()
-            except Exception:
-                pass
-        raise RuntimeError(f'could not acquire account launch guard: {e}')
-
-
-def _release_account_launch_guard(handle):
-    if handle is None:
-        return
-    try:
-        import msvcrt
-        handle.seek(0)
-        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-    except Exception as e:
-        print(f"      [LAUNCH] account launch guard release warning: {e}")
-    finally:
-        try:
-            handle.close()
-        except Exception:
+        with open(target_exe, 'a'):
             pass
+    except Exception:
+        return True
+    return False
 
 
 def launch_terminal(terminal_exe, folder_abs):
-    """Launch one portable terminal for this account, never a second copy."""
     folder_key = os.path.normcase(os.path.abspath(folder_abs))
 
     with _LAUNCH_LOCK:
         if folder_key in _LAUNCHED_FOLDERS:
-            if _terminal_running_for_folder(folder_abs):
-                print(f"      [LAUNCH] account terminal is already running: {terminal_exe}")
-                return False, True
-            # The process has exited since the previous scan. Remove the stale
-            # in-memory marker so this account can be restarted exactly once.
-            _LAUNCHED_FOLDERS.discard(folder_key)
-            print(f"      [LAUNCH] previous terminal is no longer running; restarting once")
+            print(f"      [LAUNCH] already launched this session: {terminal_exe}")
+            return False, True
 
-        guard = None
-        try:
-            guard = _acquire_account_launch_guard(folder_abs)
-
-            # Check the exact running process path. Opening the EXE file is not
-            # a valid test because Windows normally permits that while running.
-            if _terminal_running_for_folder(folder_abs):
-                _LAUNCHED_FOLDERS.add(folder_key)
-                print(f"      [LAUNCH] exact account terminal already running: {terminal_exe}")
-                return False, True
-
-            DETACHED_PROCESS = 0x00000008
-            CREATE_NEW_PROCESS_GROUP = 0x00000200
-            subprocess.Popen(
-                [terminal_exe, '/portable'],
-                cwd=folder_abs,
-                creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
-                close_fds=True,
-            )
-
-            # Retain the cross-process guard briefly until the new process is
-            # visible, closing the race between Popen and process enumeration.
-            deadline = time.monotonic() + 3.0
-            process_seen = False
-            while time.monotonic() < deadline:
-                if _terminal_running_for_folder(folder_abs):
-                    process_seen = True
-                    break
-                time.sleep(0.1)
-
-            # Popen succeeded: mark it launched even if process enumeration is
-            # temporarily unavailable. A blind second launch is not safe.
+    if _terminal_running_for_folder(folder_abs):
+        with _LAUNCH_LOCK:
             _LAUNCHED_FOLDERS.add(folder_key)
-            if process_seen:
-                print(f"      [LAUNCH] started exactly one portable terminal: {terminal_exe}")
-            else:
-                print(f"      [LAUNCH] Popen succeeded; process not yet confirmed: {terminal_exe}")
-            return True, True
-
-        except Exception as e:
-            print(f"      [LAUNCH] failed: {e}")
-            return False, False
-        finally:
-            _release_account_launch_guard(guard)
-
-
-def _focus_existing_terminal_window(terminal_exe):
-    """Focus a running terminal window without starting another process."""
-    if os.name != 'nt':
-        return False
-
-    folder_abs = os.path.dirname(os.path.abspath(terminal_exe))
-    pids = set(_terminal_pids_for_folder(folder_abs))
-    if not pids:
-        print(f"      [FOCUS] no running terminal process found; refusing to launch another: {terminal_exe}")
-        return False
+        print(f"      [LAUNCH] terminal already running: {terminal_exe}")
+        return False, True
 
     try:
-        from ctypes import wintypes
-
-        user32 = ctypes.WinDLL('user32', use_last_error=True)
-        enum_type = ctypes.WINFUNCTYPE(
-            wintypes.BOOL, wintypes.HWND, wintypes.LPARAM
+        DETACHED_PROCESS = 0x00000008
+        CREATE_NEW_PROCESS_GROUP = 0x00000200
+        subprocess.Popen(
+            [terminal_exe],
+            cwd=folder_abs,
+            creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+            close_fds=True,
         )
-        user32.EnumWindows.argtypes = [enum_type, wintypes.LPARAM]
-        user32.EnumWindows.restype = wintypes.BOOL
-        user32.GetWindowThreadProcessId.argtypes = [
-            wintypes.HWND, ctypes.POINTER(wintypes.DWORD)
-        ]
-        user32.GetWindowThreadProcessId.restype = wintypes.DWORD
-        user32.IsWindowVisible.argtypes = [wintypes.HWND]
-        user32.IsWindowVisible.restype = wintypes.BOOL
-        user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
-        user32.ShowWindow.restype = wintypes.BOOL
-        user32.BringWindowToTop.argtypes = [wintypes.HWND]
-        user32.BringWindowToTop.restype = wintypes.BOOL
-        user32.SetForegroundWindow.argtypes = [wintypes.HWND]
-        user32.SetForegroundWindow.restype = wintypes.BOOL
-
-        windows = []
-
-        def _enum_callback(hwnd, _lparam):
-            pid = wintypes.DWORD()
-            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-            if pid.value in pids and user32.IsWindowVisible(hwnd):
-                windows.append(hwnd)
-            return True
-
-        callback = enum_type(_enum_callback)
-        user32.EnumWindows(callback, 0)
-
-        for hwnd in windows:
-            user32.ShowWindow(hwnd, 9)  # SW_RESTORE
-            user32.BringWindowToTop(hwnd)
-            if user32.SetForegroundWindow(hwnd):
-                print(f"      [FOCUS] focused existing terminal window for PID set {sorted(pids)}")
-                return True
-
-        if windows:
-            print("      [FOCUS] existing terminal window restored; Windows blocked foreground activation")
-            return True
-
-        print("      [FOCUS] terminal process exists but no visible top-level window was found")
-        return False
     except Exception as e:
-        print(f"      [FOCUS] could not focus existing terminal window: {e}")
-        return False
+        print(f"      [LAUNCH] failed: {e}")
+        return False, False
+
+    with _LAUNCH_LOCK:
+        _LAUNCHED_FOLDERS.add(folder_key)
+    print(f"      [LAUNCH] started: {terminal_exe}")
+    return True, True
 
 
 def bring_terminal_to_front(terminal_exe):
-    """Open one terminal if stopped; otherwise focus the existing window."""
-    folder_abs = os.path.dirname(os.path.abspath(terminal_exe))
-
-    if not _terminal_running_for_folder(folder_abs):
-        print(f"      [FOCUS] terminal is not running; requesting one guarded launch")
-        _started, ok = launch_terminal(terminal_exe, folder_abs)
-        if not ok:
+    try:
+        os.startfile(terminal_exe)
+        print(f"      [FOCUS] opened: {terminal_exe}")
+        return True
+    except Exception as e:
+        print(f"      [FOCUS] os.startfile failed: {e}")
+        try:
+            subprocess.Popen([terminal_exe], close_fds=True)
+            print(f"      [FOCUS] Popen opened: {terminal_exe}")
+            return True
+        except Exception as e2:
+            print(f"      [FOCUS] Popen failed: {e2}")
             return False
-
-        # Give Windows time to create the main terminal window after Popen.
-        deadline = time.monotonic() + 5.0
-        while time.monotonic() < deadline:
-            if _terminal_running_for_folder(folder_abs):
-                break
-            time.sleep(0.2)
-
-    return _focus_existing_terminal_window(terminal_exe)
 
 
 # ==============================================================================
@@ -2172,53 +1978,39 @@ def _process_programme_disconnect_requests():
 
 
 # ==============================================================================
-#  [SHARED UI] Manual-login requests are hosted by the HarvHub AI desktop app
+#  [SHARED UI] Single manual-login window, two columns
 # ==============================================================================
-# The manager reads these private event lines from this process' stdout and
-# renders the controls inside its existing Broker Details page.  This process
-# deliberately creates NO Tk root, Toplevel, message box, or external window.
-MANUAL_UI_EVENT_PREFIX = "@@HARVHUB_MANUAL_LOGIN@@"
-
-
 class _ManualLoginWindow:
-    """Host bridge for manual-login cards displayed inside HarvHub AI."""
-
     def __init__(self):
-        self._lock = threading.RLock()
-        self._event_lock = threading.Lock()
-        self._sa_items = {}
-        self._prg_items = {}
-        self._pending_dec = {}
-        self._stop_poll = threading.Event()
-        self._started = False
-        self._poll_thread = None
-        self._input_thread = None
-
-    def _emit_host_event(self, payload):
-        try:
-            line = MANUAL_UI_EVENT_PREFIX + json.dumps(
-                payload, ensure_ascii=False, separators=(",", ":")
-            )
-            with self._event_lock:
-                sys.stdout.write(line + "\n")
-                sys.stdout.flush()
-        except Exception as e:
-            print(f"      [MANUAL-UI] could not notify HarvHub AI: {e}", flush=True)
+        self._lock           = threading.Lock()
+        self._sa_items       = {}
+        self._prg_items      = {}
+        self._pending_dec    = {}
+        self._root           = None
+        self._sa_holder      = None
+        self._prg_holder     = None
+        self._started        = False
+        self._stop_poll      = threading.Event()
+        self._thread         = None
+        self._polling        = False
 
     def add_item(self, kind, owner_id, account_id, broker, server,
                  login, password, terminal_exe):
         item_key = (kind, owner_id, account_id)
+
         new_item = {
-            'kind': kind,
-            'owner_id': owner_id,
-            'account_id': account_id,
-            'broker': broker or 'N/A',
-            'server': server or 'N/A',
-            'login': login,
-            'password': password or '',
+            'kind':         kind,
+            'owner_id':     owner_id,
+            'account_id':   account_id,
+            'broker':       broker or 'N/A',
+            'server':       server or 'N/A',
+            'login':        login,
+            'password':     password or '',
             'terminal_exe': terminal_exe,
         }
+
         store = self._sa_items if kind == 'SA' else self._prg_items
+
         with self._lock:
             existing = store.get(item_key)
             if existing is not None:
@@ -2232,12 +2024,7 @@ class _ManualLoginWindow:
             store[item_key] = new_item
 
         self._ensure_started()
-        self._emit_host_event({'action': 'upsert', 'item': new_item})
-        print(
-            f"      [{kind}][MANUAL] Login required for account={account_id}; "
-            "shown in HarvHub AI > Broker Details.",
-            flush=True,
-        )
+        self._request_refresh(kind)
 
     def remove_item(self, kind, owner_id, account_id):
         item_key = (kind, owner_id, account_id)
@@ -2246,10 +2033,7 @@ class _ManualLoginWindow:
             existed = store.pop(item_key, None) is not None
             self._pending_dec.pop(item_key, None)
         if existed:
-            self._emit_host_event({
-                'action': 'remove', 'kind': kind,
-                'owner_id': owner_id, 'account_id': account_id,
-            })
+            self._request_refresh(kind)
 
     def take_decision(self, kind, owner_id, account_id):
         item_key = (kind, owner_id, account_id)
@@ -2264,105 +2048,361 @@ class _ManualLoginWindow:
             if self._started:
                 return
             self._started = True
+        self._thread = threading.Thread(
+            target=self._run, name="manual_login_window", daemon=True)
+        self._thread.start()
 
-        self._poll_thread = threading.Thread(
-            target=self._poll_loop, name="manual_login_status_poll", daemon=True
-        )
-        self._poll_thread.start()
-        self._input_thread = threading.Thread(
-            target=self._read_host_commands, name="manual_login_host_commands", daemon=True
-        )
-        self._input_thread.start()
+    def _run(self):
+        try:
+            self._build_and_loop()
+        except Exception as e:
+            print(f"      [WINDOW] Tk thread died: {e}")
+            traceback.print_exc()
 
-    def _read_host_commands(self):
-        """Receive button actions from the HarvHub AI window through stdin."""
-        stream = getattr(sys, 'stdin', None)
-        if stream is None:
+    def _build_and_loop(self):
+        self._root = tk.Tk()
+        self._root.title("Manual MT5 Login — Sub Accounts | Programme Accounts")
+        self._root.geometry("1180x680")
+        self._root.minsize(900, 460)
+
+        try:
+            self._root.attributes('-topmost', True)
+            self._root.after(400, lambda: self._root.attributes('-topmost', False))
+        except Exception:
+            pass
+
+        header = ttk.Frame(self._root, padding=(12, 10, 12, 4))
+        header.pack(fill="x")
+
+        ttk.Label(
+            header,
+            text="Manual MT5 Login",
+            font=("Segoe UI", 14, "bold")
+        ).pack(anchor="w")
+
+        ttk.Label(
+            header,
+            text="Each MT5 terminal has been launched in the background. "
+                 "Log in manually, then click Valid or Invalid on the row. "
+                 "Rows stay here until the live terminal probe confirms the "
+                 "login and account name, or you mark them Invalid. "
+                 "Demo is allowed for programme accounts; investors must be "
+                 "real-account.",
+            foreground="#555",
+            wraplength=1140,
+            justify="left"
+        ).pack(anchor="w", pady=(4, 0))
+
+        body = ttk.Frame(self._root)
+        body.pack(fill="both", expand=True, padx=12, pady=(6, 8))
+
+        left  = ttk.LabelFrame(body, text="[SA] Sub Accounts", padding=6)
+        right = ttk.LabelFrame(body, text="[PRG] Programme Accounts", padding=6)
+
+        left.pack(side="left",  fill="both", expand=True, padx=(0, 6))
+        right.pack(side="right", fill="both", expand=True, padx=(6, 0))
+
+        self._sa_holder  = self._build_scroll_column(left)
+        self._prg_holder = self._build_scroll_column(right)
+
+        footer = ttk.Frame(self._root, padding=(12, 0, 12, 10))
+        footer.pack(fill="x")
+        ttk.Button(footer, text="Close (reopens if unresolved rows remain)",
+                   command=self._on_close).pack(side="right")
+
+        self._root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        self._refresh_column('SA')
+        self._refresh_column('PRG')
+
+        self._schedule_db_poll()
+
+        try:
+            self._root.mainloop()
+        except Exception:
+            pass
+
+    def _build_scroll_column(self, parent):
+        container = ttk.Frame(parent)
+        container.pack(fill="both", expand=True)
+
+        canvas = tk.Canvas(container, borderwidth=0, highlightthickness=0)
+        vbar   = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vbar.set)
+
+        canvas.pack(side="left", fill="both", expand=True)
+        vbar.pack(side="right", fill="y")
+
+        holder = ttk.Frame(canvas)
+        canvas.create_window((0, 0), window=holder, anchor="nw")
+
+        def _on_configure(_evt=None):
+            try:
+                canvas.configure(scrollregion=canvas.bbox("all"))
+            except Exception:
+                pass
+
+        holder.bind("<Configure>", _on_configure)
+
+        def _on_mousewheel(event):
+            try:
+                canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            except Exception:
+                pass
+        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+
+        return holder
+
+    def _on_close(self):
+        print("      [WINDOW] closed by user; will reopen if rows remain")
+        try:
+            self._root.quit()
+            self._root.destroy()
+        except Exception:
+            pass
+        with self._lock:
+            self._started = False
+            self._root = None
+            self._sa_holder = None
+            self._prg_holder = None
+
+    def _request_refresh(self, kind):
+        root = self._root
+        if root is None:
             return
         try:
-            for raw_line in stream:
-                if self._stop_poll.is_set():
-                    break
-                raw_line = (raw_line or '').strip()
-                if not raw_line:
-                    continue
-                try:
-                    command = json.loads(raw_line)
-                except Exception:
-                    continue
-                if not isinstance(command, dict):
-                    continue
+            root.after(0, lambda k=kind: self._refresh_column(k))
+        except Exception:
+            pass
 
-                action = str(command.get('action') or '').strip().lower()
-                kind = str(command.get('kind') or '').strip().upper()
-                owner_id = _coerce_int(command.get('owner_id'))
-                account_id = _coerce_int(command.get('account_id'))
-                key = (kind, owner_id, account_id)
+    def _refresh_column(self, kind):
+        holder = self._sa_holder if kind == 'SA' else self._prg_holder
+        if holder is None:
+            return
 
-                if kind not in ('SA', 'PRG') or owner_id is None or account_id is None:
-                    continue
+        store = self._sa_items if kind == 'SA' else self._prg_items
 
-                if action == 'decision':
-                    decision = str(command.get('decision') or '').strip().lower()
-                    if decision not in ('valid', 'invalid'):
-                        continue
-                    with self._lock:
-                        self._pending_dec[key] = decision
-                    print(
-                        f"      [{kind}][UI-DECISION] account={account_id} "
-                        f"-> {decision.upper()} (received from HarvHub AI)",
-                        flush=True,
-                    )
+        try:
+            with self._lock:
+                snapshot = list(store.items())
 
-                elif action == 'focus':
-                    store = self._sa_items if kind == 'SA' else self._prg_items
-                    with self._lock:
-                        item = store.get(key)
-                    if item:
-                        bring_terminal_to_front(item['terminal_exe'])
+            for child in holder.winfo_children():
+                child.destroy()
 
+            if not snapshot:
+                ttk.Label(
+                    holder,
+                    text=("No [SA] accounts pending manual login."
+                          if kind == 'SA' else
+                          "No [PRG] programmes pending manual login."),
+                    foreground="#666",
+                    padding=12
+                ).pack(anchor="w")
+                return
+
+            for idx, (_, item) in enumerate(snapshot, start=1):
+                self._render_row(kind, idx, item)
         except Exception as e:
-            print(f"      [MANUAL-UI] host command reader stopped: {e}", flush=True)
+            print(f"      [{kind}][WINDOW] refresh error: {e}")
 
-    def _poll_loop(self):
-        while not self._stop_poll.wait(MANUAL_POLL_INTERVAL):
+    def _render_row(self, kind, idx, item):
+        holder = self._sa_holder if kind == 'SA' else self._prg_holder
+        owner_id   = item['owner_id']
+        account_id = item['account_id']
+
+        label = ('[SA] user {u} | sub {a}'.format(u=owner_id, a=account_id)
+                 if kind == 'SA' else
+                 '[PRG] user {u} | programme {a}'.format(u=owner_id, a=account_id))
+
+        card = ttk.LabelFrame(holder, text=f"{idx}. {label}", padding=8)
+        card.pack(fill="x", expand=True, pady=4, padx=2)
+
+        def _field(parent, name, value):
+            row = ttk.Frame(parent)
+            row.pack(fill="x", pady=1)
+            ttk.Label(row, text=f"{name}:", width=10, anchor="w").pack(side="left")
+            ttk.Label(row, text=str(value), anchor="w").pack(side="left")
+            self._make_copy_button(row, value).pack(side="left", padx=(6, 0))
+
+        _field(card, "Broker", item['broker'])
+        _field(card, "Server", item['server'])
+        _field(card, "Login",  item['login'])
+
+        pw_row = ttk.Frame(card)
+        pw_row.pack(fill="x", pady=1)
+        ttk.Label(pw_row, text="Password:", width=10, anchor="w").pack(side="left")
+        pw_var = tk.StringVar(value="••••••••")
+        ttk.Label(pw_row, textvariable=pw_var, anchor="w").pack(side="left")
+
+        def _toggle_pw():
+            if pw_var.get().startswith("•"):
+                pw_var.set(item['password'] or "(empty)")
+            else:
+                pw_var.set("••••••••")
+
+        ttk.Button(pw_row, text="Show", width=6,
+                   command=_toggle_pw).pack(side="left", padx=(6, 0))
+        self._make_copy_button(pw_row, item['password']).pack(side="left", padx=(4, 0))
+
+        actions = ttk.Frame(card)
+        actions.pack(fill="x", pady=(6, 0))
+
+        def _on_open_terminal():
+            bring_terminal_to_front(item['terminal_exe'])
+
+        ttk.Button(actions, text="Open Terminal",
+                   command=_on_open_terminal).pack(side="left", padx=(0, 6))
+
+        def _on_valid():
+            key = (kind, owner_id, account_id)
+            with self._lock:
+                self._pending_dec[key] = 'valid'
+            print(f"      [{kind}][UI] queued VALID for owner={owner_id} "
+                  f"account={account_id}")
+
+        def _on_invalid():
+            key = (kind, owner_id, account_id)
+            with self._lock:
+                self._pending_dec[key] = 'invalid'
+            print(f"      [{kind}][UI] queued INVALID for owner={owner_id} "
+                  f"account={account_id}")
+
+        ttk.Button(actions, text="Invalid Credentials",
+                   command=_on_invalid).pack(side="left", expand=True,
+                                             fill="x", padx=(0, 4))
+        ttk.Button(actions, text="Valid Credentials",
+                   command=_on_valid).pack(side="left", expand=True,
+                                           fill="x", padx=(4, 0))
+
+    def _make_copy_button(self, parent, value, label="Copy"):
+        btn = ttk.Button(parent, text=label, width=6)
+
+        def _do_copy():
             try:
-                self._poll_db_once()
+                self._root.clipboard_clear()
+                self._root.clipboard_append(str(value))
+                self._root.update_idletasks()
+                print(f"      [COPY] {value}")
             except Exception as e:
-                print(f"      [MANUAL-UI][POLL] raised: {e}", flush=True)
-                traceback.print_exc()
+                print(f"      [COPY] failed: {e}")
+            try:
+                btn.configure(text="✓")
+                btn.after(COPY_FEEDBACK_MS,
+                          lambda: btn.configure(text=label))
+            except Exception:
+                pass
+
+        btn.configure(command=_do_copy)
+        return btn
+
+    def _schedule_db_poll(self):
+        if self._stop_poll.is_set():
+            return
+        try:
+            if not self._polling:
+                self._polling = True
+                threading.Thread(
+                    target=self._poll_worker, daemon=True
+                ).start()
+        except Exception:
+            pass
+
+        try:
+            if self._root is not None:
+                self._root.after(int(MANUAL_POLL_INTERVAL * 1000),
+                                 self._schedule_db_poll)
+        except Exception:
+            pass
+
+    def _poll_worker(self):
+        try:
+            self._poll_db_once()
+        except Exception as e:
+            print(f"      [WINDOW][POLL] raised: {e}")
+            traceback.print_exc()
+        finally:
+            self._polling = False
 
     def _poll_db_once(self):
         with self._lock:
-            sa_snapshot = list(self._sa_items.items())
+            sa_snapshot  = list(self._sa_items.items())
             prg_snapshot = list(self._prg_items.items())
 
-        for key, _item in sa_snapshot:
-            _kind, owner_id, account_id = key
+        removed_sa  = False
+        removed_prg = False
+
+        for key, item in sa_snapshot:
+            kind, owner_id, account_id = key
             try:
                 db_status = _get_broker_login_status(owner_id)
             except Exception:
                 db_status = None
-            status = (db_status or '').strip().lower()
-            if status in TERMINAL_NEGATIVE_STATUSES or (
-                status == VALID_STATUS and _was_terminal_live('SA', owner_id, account_id)
-            ):
-                self.remove_item('SA', owner_id, account_id)
 
-        for key, _item in prg_snapshot:
-            _kind, owner_id, account_id = key
+            db_status_l = (db_status or '').strip().lower()
+
+            if db_status_l in TERMINAL_NEGATIVE_STATUSES:
+                print(f"      [SA][MANUAL] owner={owner_id} "
+                      f"account={account_id} removed — DB negative "
+                      f"status -> {db_status_l}")
+                with self._lock:
+                    self._sa_items.pop(key, None)
+                    self._pending_dec.pop(key, None)
+                removed_sa = True
+                continue
+
+            if db_status_l == VALID_STATUS and _was_terminal_live(
+                    'SA', owner_id, account_id):
+                print(f"      [SA][MANUAL] owner={owner_id} "
+                      f"account={account_id} removed — pipeline confirmed live")
+                with self._lock:
+                    self._sa_items.pop(key, None)
+                    self._pending_dec.pop(key, None)
+                removed_sa = True
+                continue
+
+            print(f"      [SA][MANUAL] owner={owner_id} "
+                  f"account={account_id} still pending (db={db_status_l!r})")
+
+        for key, item in prg_snapshot:
+            kind, owner_id, account_id = key
             try:
                 db_status = _get_programme_broker_login_status(account_id)
             except Exception:
                 db_status = None
-            status = (db_status or '').strip().lower()
-            if status in PROGRAMME_NEGATIVE_STATUSES or (
-                status == VALID_STATUS and _was_terminal_live('PRG', owner_id, account_id)
-            ):
-                self.remove_item('PRG', owner_id, account_id)
+
+            db_status_l = (db_status or '').strip().lower()
+
+            if db_status_l in PROGRAMME_NEGATIVE_STATUSES:
+                print(f"      [PRG][MANUAL] owner={owner_id} "
+                      f"account={account_id} removed — DB negative "
+                      f"status -> {db_status_l}")
+                with self._lock:
+                    self._prg_items.pop(key, None)
+                    self._pending_dec.pop(key, None)
+                removed_prg = True
+                continue
+
+            if db_status_l == VALID_STATUS and _was_terminal_live(
+                    'PRG', owner_id, account_id):
+                print(f"      [PRG][MANUAL] owner={owner_id} "
+                      f"account={account_id} removed — pipeline confirmed live")
+                with self._lock:
+                    self._prg_items.pop(key, None)
+                    self._pending_dec.pop(key, None)
+                removed_prg = True
+                continue
+
+            print(f"      [PRG][MANUAL] owner={owner_id} "
+                  f"account={account_id} still pending (db={db_status_l!r})")
+
+        if removed_sa:
+            self._request_refresh('SA')
+        if removed_prg:
+            self._request_refresh('PRG')
 
 
 _MANUAL_WINDOW = _ManualLoginWindow()
+
 
 # ==============================================================================
 #  [SA] / [PRG] row fetchers
