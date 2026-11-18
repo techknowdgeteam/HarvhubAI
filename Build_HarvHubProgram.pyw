@@ -26,96 +26,6 @@ OUTPUT_EXE = APP_DIR / "release" / "HarvHubAI.exe"
 BUILD_EXCLUDED_DIRS = {".build-venv", "build", "release", "dist", "__pycache__", ".git"}
 BUILD_INPUT_SUFFIXES = {".py", ".pyw", ".vbs", ".bat", ".txt", ".spec", ".md"}
 
-REQUIRED_PAYLOAD_FILES = (
-    "mysqlremote.py",
-    "brokerdetails.py",
-    "brokercharts.py",
-    "programme_training.py",
-    "programmesignals_trading.py",
-    "signals_provision_challenge.py",
-    "ip.py",
-    "notification_email.py",
-    "notification_service.py",
-    "harvhub_ipc.py",
-    "requirements-runtime.txt",
-)
-DEFAULT_RUNTIME_REQUIREMENTS = "\n".join((
-    "MetaTrader5", "pytz", "tzdata", "requests", "urllib3", "certifi",
-    "selenium", "beautifulsoup4", "webdriver-manager",
-)) + "\n"
-
-
-def prepare_payload_sources() -> Path:
-    """Ensure the PyInstaller/deployment payload contains every required file.
-
-    GitHub projects may keep the service modules beside the builder instead
-    of inside payload/. In that layout, stage them into payload/ here so both
-    the EXE bundle and the post-build source deployment use the same files.
-    """
-    payload = APP_DIR / "payload"
-    payload.mkdir(parents=True, exist_ok=True)
-
-    for name in REQUIRED_PAYLOAD_FILES:
-        target = payload / name
-
-        # Root-level files are the canonical source in the current repository.
-        # Always synchronize a changed root source into payload/. The previous
-        # size-only shortcut kept an older payload copy forever, meaning a
-        # service fix (including its console logging) could be omitted from
-        # the next EXE even after the root source had been replaced.
-        root_source = APP_DIR / name
-        if root_source.is_file() and root_source.stat().st_size >= 100:
-            needs_copy = not target.is_file()
-            if not needs_copy:
-                try:
-                    needs_copy = (
-                        root_source.stat().st_size != target.stat().st_size
-                        or hashlib.sha256(root_source.read_bytes()).digest()
-                        != hashlib.sha256(target.read_bytes()).digest()
-                    )
-                except OSError:
-                    needs_copy = True
-            if needs_copy:
-                shutil.copy2(root_source, target)
-            continue
-
-        if target.is_file() and target.stat().st_size >= 100:
-            continue
-
-        # A nested source folder is also supported, excluding generated build
-        # output and virtual environments to avoid copying stale artifacts.
-        candidates = []
-        for candidate in APP_DIR.rglob(name):
-            if candidate == target or not candidate.is_file():
-                continue
-            relative_parts = {part.lower() for part in candidate.relative_to(APP_DIR).parts}
-            if relative_parts.intersection({".build-venv", "build", "release", "dist", ".git"}):
-                continue
-            if "payload" in relative_parts:
-                continue
-            if candidate.stat().st_size >= 100:
-                candidates.append(candidate)
-        if candidates:
-            candidates.sort(key=lambda item: (len(item.relative_to(APP_DIR).parts), str(item).lower()))
-            shutil.copy2(candidates[0], target)
-            continue
-
-        if name == "requirements-runtime.txt":
-            target.write_text(DEFAULT_RUNTIME_REQUIREMENTS, encoding="utf-8")
-            continue
-
-        raise FileNotFoundError(
-            f"Required HarvHub source '{name}' is missing. Expected it in "
-            f"'{payload}' or beside the project builder in '{APP_DIR}'."
-        )
-
-    # Fail before PyInstaller starts if any of the six console-managed services
-    # or their shared modules are absent from the staged payload.
-    missing = [name for name in REQUIRED_PAYLOAD_FILES if not (payload / name).is_file()]
-    if missing:
-        raise FileNotFoundError("Incomplete HarvHub AI payload: " + ", ".join(missing))
-    return payload
-
 
 def newest_build_input_mtime() -> float:
     newest = 0.0
@@ -419,11 +329,8 @@ class Builder:
 
             self.set_status("Installing the packaging tools...")
             self.set_stage(2, "running")
-            self._run([str(BUILD_PYTHON), "-m", "pip", "install", "--disable-pip-version-check", "--upgrade", "pip", "pyinstaller", "certifi"], "Install PyInstaller and TLS certificate bundle", timeout=1800)
+            self._run([str(BUILD_PYTHON), "-m", "pip", "install", "--disable-pip-version-check", "--upgrade", "pip", "pyinstaller"], "Install PyInstaller", timeout=1800)
             self.set_stage(2, "done")
-
-            self.set_status("Checking and staging all HarvHub AI source files...")
-            self.log(f"Source payload ready: {prepare_payload_sources()}")
 
             self.set_status("Creating HarvHubAI.exe...")
             self.set_stage(3, "running")
@@ -432,7 +339,6 @@ class Builder:
                 str(BUILD_PYTHON), "-m", "PyInstaller",
                 "--noconfirm", "--clean", "--onefile", "--windowed", "--uac-admin",
                 "--name", "HarvHubAI",
-                "--collect-data", "certifi",
                 "--distpath", str(APP_DIR / "release"),
                 "--workpath", str(APP_DIR / "build"),
                 "--specpath", str(APP_DIR / "build"),
@@ -634,7 +540,6 @@ BUNDLED_SOURCE_FILES = (
     "ip.py",
     "notification_email.py",
     "notification_service.py",
-    "harvhub_ipc.py",
     "requirements-runtime.txt",
 )
 
@@ -693,7 +598,9 @@ def install_current_release_files() -> Path:
     if not destination.is_file() or sha256_file(destination) != sha256_file(OUTPUT_EXE):
         raise RuntimeError("The installed HarvHubAI.exe did not pass SHA-256 verification.")
 
-    source_root = prepare_payload_sources()
+    source_root = APP_DIR / "payload"
+    if not source_root.is_dir():
+        raise FileNotFoundError(f"The selected latest project has no payload folder: {source_root}")
     python_root = install_root / "python"
     python_root.mkdir(parents=True, exist_ok=True)
     source_manifest = {}

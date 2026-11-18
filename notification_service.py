@@ -1993,56 +1993,6 @@ def record_programme_no_timezone_notification(
     )
 
 
-
-
-def record_programme_no_existing_candle_records_notification(
-    pdo,
-    programme_id: int,
-    programme_name: str,
-    owner_email: str,
-    symbol_count: int = 0,
-    timeframe_count: int = 0,
-) -> Optional[int]:
-    """
-    Notify the programme owner once when none of the selected symbol/timeframe
-    combinations has any stored candle records.
-    """
-    programme_id = int(programme_id or 0)
-    owner_email = (owner_email or '').strip().lower()
-    programme_name = (programme_name or '').strip() or f"programme {programme_id}"
-
-    if programme_id <= 0 or not owner_email or '@' not in owner_email:
-        print('[HarvHub Notification Service] no-existing-candle-records: invalid identity')
-        return None
-
-    message = (
-        f"Your {programme_name} programme has no existing candle records for any "
-        f"of its selected symbols and timeframes. The initial collection can take "
-        f"several hours, depending on the amount of data to collect. More symbols "
-        f"and timeframes mean more market data, so please allow the collection "
-        f"process time to complete. The collector stores the latest candles first, "
-        f"then continues fetching older candles in rotations."
-    )
-
-    return record_programme_notification_once(
-        pdo,
-        programme_id,
-        owner_email,
-        {
-            'notification_key': f'prog-chart-no-existing-candle-records-{programme_id}',
-            'title': 'No Existing Candle Records',
-            'message': message,
-            'type': 'warning',
-            'section': 'Signals',
-            'action_tab': 'signals',
-            'force': False,
-            'send_email': True,
-            'recipient_name': programme_name,
-        },
-    )
-
-
-
 def record_programme_chart_ready_notification(
     pdo,
     programme_id: int,

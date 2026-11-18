@@ -1,10 +1,125 @@
-HARVHUB AI — START HERE
+HarvHub AI — Setup Report
+====================================================
+Windows x64 and HarvHub AI folders are ready.
+Python runtime verified: C:\Users\Administrator\AppData\Local\Programs\Python\Python313\python.exe
+Installing the modules imported by the supplied HarvHub AI programs.
+Running: Upgrade pip
+Requirement already satisfied: pip in C:\Users\Administrator\AppData\Local\Programs\Python\Python313\Lib\site-packages (26.2.2)
+Collecting pip
+  Using cached pip-26.3-py3-none-any.whl.metadata (4.6 kB)
+Using cached pip-26.3-py3-none-any.whl (2.0 MB)
+Installing collected packages: pip
+  Attempting uninstall: pip
+    Found existing installation: pip 26.2.2
+    Uninstalling pip-26.2.2:
+      Successfully uninstalled pip-26.2.2
+  WARNING: The scripts pip.exe, pip3.13.exe and pip3.exe are installed in 'C:\Users\Administrator\AppData\Local\Programs\Python\Python313\Scripts' which is not on PATH.
+  Consider adding this directory to PATH or, if you prefer to suppress this warning, use --no-warn-script-location.
+Successfully installed pip-26.3
+Upgrade pip completed (exit code 0).
+Running: Install HarvHub AI Python modules
+Collecting MetaTrader5 (from -r C:\Users\Administrator\AppData\Local\HarvHubAI\Bootstrap\source\techknowdgeteam-HarvhubAI-d02da58\payload\requirements-runtime.txt (line 2))
+  Downloading metatrader5-5.0.6231-cp313-cp313-win_amd64.whl.metadata (2.5 kB)
+Collecting pytz (from -r C:\Users\Administrator\AppData\Local\HarvHubAI\Bootstrap\source\techknowdgeteam-HarvhubAI-d02da58\payload\requirements-runtime.txt (line 3))
+  Downloading pytz-2026.6-py2.py3-none-any.whl.metadata (22 kB)
+Collecting tzdata (from -r C:\Users\Administrator\AppData\Local\HarvHubAI\Bootstrap\source\techknowdgeteam-HarvhubAI-d02da58\payload\requirements-runtime.txt (line 4))
+  Downloading tzdata-2026.6-py2.py3-none-any.whl.metadata (1.4 kB)
+Collecting requests (from -r C:\Users\Administrator\AppData\Local\HarvHubAI\Bootstrap\source\techknowdgeteam-HarvhubAI-d02da58\payload\requirements-runtime.txt (line 5))
+  Downloading requests-2.34.2-py3-none-any.whl.metadata (4.8 kB)
+Collecting urllib3 (from -r C:\Users\Administrator\AppData\Local\HarvHubAI\Bootstrap\source\techknowdgeteam-HarvhubAI-d02da58\payload\requirements-runtime.txt (line 6))
+  Downloading urllib3-2.8.0-py3-none-any.whl.metadata (7.4 kB)
+Collecting selenium (from -r C:\Users\Administrator\AppData\Local\HarvHubAI\Bootstrap\source\techknowdgeteam-HarvhubAI-d02da58\payload\requirements-runtime.txt (line 7))
+  Downloading selenium-4.52.0-py3-none-any.whl.metadata (7.5 kB)
+Collecting beautifulsoup4 (from -r C:\Users\Administrator\AppData\Local\HarvHubAI\Bootstrap\source\techknowdgeteam-HarvhubAI-d02da58\payload\requirements-runtime.txt (line 8))
+  Downloading beautifulsoup4-4.15.0-py3-none-any.whl.metadata (3.8 kB)
+Collecting webdriver-manager (from -r C:\Users\Administrator\AppData\Local\HarvHubAI\Bootstrap\source\techknowdgeteam-HarvhubAI-d02da58\payload\requirements-runtime.txt (line 9))
+  Downloading webdriver_manager-4.1.2-py3-none-any.whl.metadata (16 kB)
+Collecting numpy>=1.7 (from MetaTrader5->-r C:\Users\Administrator\AppData\Local\HarvHubAI\Bootstrap\source\techknowdgeteam-HarvhubAI-d02da58\payload\requirements-runtime.txt (line 2))
+  Downloading numpy-2.5.5-cp313-cp313-win_amd64.whl.metadata (6.6 kB)
+Collecting charset_normalizer<4,>=2 (from requests->-r C:\Users\Administrator\AppData\Local\HarvHubAI\Bootstrap\source\techknowdgeteam-HarvhubAI-d02da58\payload\requirements-runtime.txt (line 5))
+  Downloading charset_normalizer-3.5.2-cp313-cp313-win_amd64.whl.metadata (47 kB)
+Collecting idna<4,>=2.5 (from requests->-r C:\Users\Administrator\AppData\Local\HarvHubAI\Bootstrap\source\techknowdgeteam-HarvhubAI-d02da58\payload\requirements-runtime.txt (line 5))
+  Downloading idna-3.20-py3-none-any.whl.metadata (7.2 kB)
+Collecting certifi>=2023.5.7 (from requests->-r C:\Users\Administrator\AppData\Local\HarvHubAI\Bootstrap\source\techknowdgeteam-HarvhubAI-d02da58\payload\requirements-runtime.txt (line 5))
+  Downloading certifi-2026.10.23-py3-none-any.whl.metadata (2.5 kB)
+Collecting trio<1.0,>=0.31.0 (from selenium->-r C:\Users\Administrator\AppData\Local\HarvHubAI\Bootstrap\source\techknowdgeteam-HarvhubAI-d02da58\payload\requirements-runtime.txt (line 7))
+  Downloading trio-0.35.0-py3-none-any.whl.metadata (8.5 kB)
+Collecting trio-websocket<1.0,>=0.12.2 (from selenium->-r C:\Users\Administrator\AppData\Local\HarvHubAI\Bootstrap\source\techknowdgeteam-HarvhubAI-d02da58\payload\requirements-runtime.txt (line 7))
+  Downloading trio_websocket-0.12.2-py3-none-any.whl.metadata (5.1 kB)
+Collecting typing_extensions<5.0,>=4.15.0 (from selenium->-r C:\Users\Administrator\AppData\Local\HarvHubAI\Bootstrap\source\techknowdgeteam-HarvhubAI-d02da58\payload\requirements-runtime.txt (line 7))
+  Downloading typing_extensions-4.16.0-py3-none-any.whl.metadata (3.3 kB)
+Collecting websocket-client<2.0,>=1.8.0 (from selenium->-r C:\Users\Administrator\AppData\Local\HarvHubAI\Bootstrap\source\techknowdgeteam-HarvhubAI-d02da58\payload\requirements-runtime.txt (line 7))
+  Downloading websocket_client-1.9.2-py3-none-any.whl.metadata (8.3 kB)
+Collecting attrs>=23.2.0 (from trio<1.0,>=0.31.0->selenium->-r C:\Users\Administrator\AppData\Local\HarvHubAI\Bootstrap\source\techknowdgeteam-HarvhubAI-d02da58\payload\requirements-runtime.txt (line 7))
+  Downloading attrs-26.1.0-py3-none-any.whl.metadata (8.8 kB)
+Collecting sortedcontainers (from trio<1.0,>=0.31.0->selenium->-r C:\Users\Administrator\AppData\Local\HarvHubAI\Bootstrap\source\techknowdgeteam-HarvhubAI-d02da58\payload\requirements-runtime.txt (line 7))
+  Downloading sortedcontainers-2.4.0-py2.py3-none-any.whl.metadata (10 kB)
+Collecting outcome (from trio<1.0,>=0.31.0->selenium->-r C:\Users\Administrator\AppData\Local\HarvHubAI\Bootstrap\source\techknowdgeteam-HarvhubAI-d02da58\payload\requirements-runtime.txt (line 7))
+  Downloading outcome-1.3.0.post0-py2.py3-none-any.whl.metadata (2.6 kB)
+Collecting sniffio>=1.3.0 (from trio<1.0,>=0.31.0->selenium->-r C:\Users\Administrator\AppData\Local\HarvHubAI\Bootstrap\source\techknowdgeteam-HarvhubAI-d02da58\payload\requirements-runtime.txt (line 7))
+  Downloading sniffio-1.3.1-py3-none-any.whl.metadata (3.9 kB)
+Collecting cffi>=1.14 (from trio<1.0,>=0.31.0->selenium->-r C:\Users\Administrator\AppData\Local\HarvHubAI\Bootstrap\source\techknowdgeteam-HarvhubAI-d02da58\payload\requirements-runtime.txt (line 7))
+  Downloading cffi-2.1.1-cp313-cp313-win_amd64.whl.metadata (2.6 kB)
+Collecting wsproto>=0.14 (from trio-websocket<1.0,>=0.12.2->selenium->-r C:\Users\Administrator\AppData\Local\HarvHubAI\Bootstrap\source\techknowdgeteam-HarvhubAI-d02da58\payload\requirements-runtime.txt (line 7))
+  Downloading wsproto-1.3.2-py3-none-any.whl.metadata (5.2 kB)
+Collecting pysocks!=1.5.7,<2.0,>=1.5.6 (from urllib3[socks]<3.0,>=2.6.3->selenium->-r C:\Users\Administrator\AppData\Local\HarvHubAI\Bootstrap\source\techknowdgeteam-HarvhubAI-d02da58\payload\requirements-runtime.txt (line 7))
+  Downloading PySocks-1.7.1-py3-none-any.whl.metadata (13 kB)
+Collecting soupsieve>=1.6.1 (from beautifulsoup4->-r C:\Users\Administrator\AppData\Local\HarvHubAI\Bootstrap\source\techknowdgeteam-HarvhubAI-d02da58\payload\requirements-runtime.txt (line 8))
+  Downloading soupsieve-4.1.1-py3-none-any.whl.metadata (4.4 kB)
+Collecting python-dotenv (from webdriver-manager->-r C:\Users\Administrator\AppData\Local\HarvHubAI\Bootstrap\source\techknowdgeteam-HarvhubAI-d02da58\payload\requirements-runtime.txt (line 9))
+  Downloading python_dotenv-1.2.4-py3-none-any.whl.metadata (29 kB)
+Collecting packaging (from webdriver-manager->-r C:\Users\Administrator\AppData\Local\HarvHubAI\Bootstrap\source\techknowdgeteam-HarvhubAI-d02da58\payload\requirements-runtime.txt (line 9))
+  Using cached packaging-26.3-py3-none-any.whl.metadata (3.5 kB)
+Collecting pycparser (from cffi>=1.14->trio<1.0,>=0.31.0->selenium->-r C:\Users\Administrator\AppData\Local\HarvHubAI\Bootstrap\source\techknowdgeteam-HarvhubAI-d02da58\payload\requirements-runtime.txt (line 7))
+  Downloading pycparser-3.12-py3-none-any.whl.metadata (9.7 kB)
+Collecting h11<1,>=0.16.0 (from wsproto>=0.14->trio-websocket<1.0,>=0.12.2->selenium->-r C:\Users\Administrator\AppData\Local\HarvHubAI\Bootstrap\source\techknowdgeteam-HarvhubAI-d02da58\payload\requirements-runtime.txt (line 7))
+  Downloading h11-0.16.0-py3-none-any.whl.metadata (8.3 kB)
+Downloading metatrader5-5.0.6231-cp313-cp313-win_amd64.whl (47 kB)
+Downloading pytz-2026.6-py2.py3-none-any.whl (506 kB)
+Downloading tzdata-2026.6-py2.py3-none-any.whl (348 kB)
+Downloading requests-2.34.2-py3-none-any.whl (73 kB)
+Downloading urllib3-2.8.0-py3-none-any.whl (135 kB)
+Downloading charset_normalizer-3.5.2-cp313-cp313-win_amd64.whl (206 kB)
+Downloading idna-3.20-py3-none-any.whl (69 kB)
+Downloading selenium-4.52.0-py3-none-any.whl (12.1 MB)
+   ---------------------------------------- 12.1/12.1 MB 22.2 MB/s  0:00:00
+Downloading trio-0.35.0-py3-none-any.whl (513 kB)
+Downloading trio_websocket-0.12.2-py3-none-any.whl (21 kB)
+Downloading typing_extensions-4.16.0-py3-none-any.whl (45 kB)
+Downloading PySocks-1.7.1-py3-none-any.whl (16 kB)
+Downloading websocket_client-1.9.2-py3-none-any.whl (95 kB)
+Downloading beautifulsoup4-4.15.0-py3-none-any.whl (109 kB)
+Downloading webdriver_manager-4.1.2-py3-none-any.whl (32 kB)
+Downloading attrs-26.1.0-py3-none-any.whl (67 kB)
+Downloading certifi-2026.10.23-py3-none-any.whl (135 kB)
+Downloading cffi-2.1.1-cp313-cp313-win_amd64.whl (185 kB)
+Downloading numpy-2.5.5-cp313-cp313-win_amd64.whl (12.6 MB)
+   ---------------------------------------- 12.6/12.6 MB 14.7 MB/s  0:00:00
+Downloading outcome-1.3.0.post0-py2.py3-none-any.whl (10 kB)
+Downloading sniffio-1.3.1-py3-none-any.whl (10 kB)
+Downloading soupsieve-4.1.1-py3-none-any.whl (55 kB)
+Downloading wsproto-1.3.2-py3-none-any.whl (24 kB)
+Downloading h11-0.16.0-py3-none-any.whl (37 kB)
+Using cached packaging-26.3-py3-none-any.whl (129 kB)
+Downloading pycparser-3.12-py3-none-any.whl (62 kB)
+Downloading python_dotenv-1.2.4-py3-none-any.whl (23 kB)
+Downloading sortedcontainers-2.4.0-py2.py3-none-any.whl (29 kB)
+Installing collected packages: sortedcontainers, pytz, websocket-client, urllib3, tzdata, typing_extensions, soupsieve, sniffio, python-dotenv, pysocks, pycparser, packaging, numpy, idna, h11, charset_normalizer, certifi, attrs, wsproto, requests, outcome, MetaTrader5, cffi, beautifulsoup4, webdriver-manager, trio, trio-websocket, selenium
+  WARNING: The script wsdump.exe is installed in 'C:\Users\Administrator\AppData\Local\Programs\Python\Python313\Scripts' which is not on PATH.
+  Consider adding this directory to PATH or, if you prefer to suppress this warning, use --no-warn-script-location.
+  WARNING: The script dotenv.exe is installed in 'C:\Users\Administrator\AppData\Local\Programs\Python\Python313\Scripts' which is not on PATH.
+  Consider adding this directory to PATH or, if you prefer to suppress this warning, use --no-warn-script-location.
+  WARNING: The scripts f2py.exe and numpy-config.exe are installed in 'C:\Users\Administrator\AppData\Local\Programs\Python\Python313\Scripts' which is not on PATH.
+  Consider adding this directory to PATH or, if you prefer to suppress this warning, use --no-warn-script-location.
+  WARNING: The script idna.exe is installed in 'C:\Users\Administrator\AppData\Local\Programs\Python\Python313\Scripts' which is not on PATH.
+  Consider adding this directory to PATH or, if you prefer to suppress this warning, use --no-warn-script-location.
+  WARNING: The script normalizer.exe is installed in 'C:\Users\Administrator\AppData\Local\Programs\Python\Python313\Scripts' which is not on PATH.
+  Consider adding this directory to PATH or, if you prefer to suppress this warning, use --no-warn-script-location.
+  WARNING: The script cffi-gen-src.exe is installed in 'C:\Users\Administrator\AppData\Local\Programs\Python\Python313\Scripts' which is not on PATH.
+  Consider adding this directory to PATH or, if you prefer to suppress this warning, use --no-warn-script-location.
 
-1. Extract the complete ZIP to a normal Windows folder.
-2. Run HarvHubAI.vbs as Administrator.
-3. Complete the first-time setup when prompted.
-4. Choose Loop or Once in the top Execution Type selector for Run All.
-5. Open an individual service page to override its execution type before pressing Play.
-
-The MySQL Remote page shows listener and channel usage. The Broker Details page shows
-manual MT5 login requests in the manager window; no separate manual-login window is used.
+Successfully installed MetaTrader5-5.0.6231 attrs-26.1.0 beautifulsoup4-4.15.0 certifi-2026.10.23 cffi-2.1.1 charset_normalizer-3.5.2 h11-0.16.0 idna-3.20 numpy-2.5.5 outcome-1.3.0.post0 packaging-26.3 pycparser-3.12 pysocks-1.7.1 python-dotenv-1.2.4 pytz-2026.6 requests-2.34.2 selenium-4.52.0 sniffio-1.3.1 sortedcontainers-2.4.0 soupsieve-4.1.1 trio-0.35.0 trio-websocket-0.12.2 typing_extensions-4.16.0 tzdata-2026.6 urllib3-2.8.0 webdriver-manager-4.1.2 websocket-client-1.9.2 wsproto-1.3.2
+Install HarvHub AI Python modules completed (exit code 0).
+Python dependencies installed.
+Downloading the official Google Chrome Enterprise x64 installer.
+SETUP FAILED: <urlopen error [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: unable to get local issuer certificate (_ssl.c:1032)>

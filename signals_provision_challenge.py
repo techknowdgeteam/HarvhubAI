@@ -1223,31 +1223,36 @@ def run_scan(db: BridgeClient, vps_ip: Optional[str], programme_id: Optional[int
     return totals
 
 
-def main() -> int:
+def main_loop() -> int:
     parser = argparse.ArgumentParser(
         description="VPS-scoped Signals Provision challenge monitor, publisher and server-approval controller"
     )
-    parser.add_argument("--execution-type", choices=("loop", "once"), default="loop", help="manager execution mode")
-    parser.add_argument("--once", action="store_true", help="run one VPS scan and exit (legacy alias)")
-    parser.add_argument("--interval", type=int, default=DEFAULT_INTERVAL, help=f"seconds between scans (default: {DEFAULT_INTERVAL})")
+    parser.add_argument("--execution-type", choices=("loop", "once"), default=None,
+                        help="run continuously or perform one scan")
+    parser.add_argument("--loop", action="store_true", help="legacy alias for --execution-type=loop")
+    parser.add_argument("--once", action="store_true", help="legacy alias for --execution-type=once")
+    parser.add_argument("--interval", type=int, default=5, help="seconds between scans (default: 5)")
     parser.add_argument("--programme-id", type=int, default=None, help="limit to a programme only if it is still linked to this VPS")
     parser.add_argument("--vps-ip", default=None, help="override the local VPS IP; must match programme_vps.programme_vps_ip_address")
     parser.add_argument("--bridge-host", default=BRIDGE_HOST)
     parser.add_argument("--bridge-port", type=int, default=BRIDGE_PORT)
     args = parser.parse_args()
+    run_as_loop = (args.execution_type == "loop") if args.execution_type else bool(args.loop)
+    if args.once:
+        run_as_loop = False
+    loop_interval = max(5, int(args.interval))
     if args.interval < 5:
         parser.error("--interval must be at least 5 seconds")
-    run_as_loop = args.execution_type == "loop" and not args.once
 
     if notifier is None:
         log.error("notification_service.py import failed; email/in-app notifications will not be sent: %s", _NOTIFICATION_IMPORT_ERROR)
     log.info("Signals Provision Challenge Monitor starting")
-    log.info("Execution mode: %s | scan interval: %ss", "LOOP" if run_as_loop else "ONCE", args.interval)
     log.info("VPS scope: programme_vps direct owner bindings + active programme_vps_hosts_followers")
     log.info("Challenge source: programme_analytics WHERE live_trades=1 AND trade_configured=1")
     log.info("Success action: interest_status=passed, advertisement=1, server_advertisement_approval=1")
     log.info("Failure action: interest_status=failed/breached, advertisement=0, server_advertisement_approval=0")
     log.info("Notifications: deduplicated through notification_service.py and notification_email.py")
+    log.info("Execution type: %s | interval: %ss", "loop" if run_as_loop else "once", args.interval)
 
     db = BridgeClient(args.bridge_host, args.bridge_port, BRIDGE_OWNER)
     stopping = False
@@ -1261,11 +1266,8 @@ def main() -> int:
         signal.signal(signal.SIGTERM, stop)
 
     try:
-        scan_number = 0
         while not stopping:
-            scan_number += 1
             started = time.monotonic()
-            log.info("SCAN #%s STARTED | resolving VPS membership before challenge evaluation", scan_number)
             # Resolve VPS membership before any programme challenge processing.
             vps_ip = args.vps_ip or detect_vps_ip()
             if not vps_ip:
@@ -1288,11 +1290,9 @@ def main() -> int:
                 totals["passed"], totals["failed"], totals["skipped"],
             )
             if not run_as_loop:
-                log.info("One-shot challenge scan finished; exiting")
                 break
             elapsed = time.monotonic() - started
-            sleep_for = max(1, args.interval - int(elapsed))
-            log.info("Next challenge scan in %ss", sleep_for)
+            sleep_for = max(1, loop_interval - int(elapsed))
             for _ in range(sleep_for):
                 if stopping:
                     break
@@ -1305,5 +1305,9 @@ def main() -> int:
     return 0
 
 
+def main() -> int:
+    return main_loop()
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main_loop())
