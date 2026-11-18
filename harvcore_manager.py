@@ -42,7 +42,6 @@ MT5_SETUP_URL = (
 )
 BRIDGE_HOST = "127.0.0.1"
 BRIDGE_PORT = 5599
-MANUAL_UI_EVENT_PREFIX = "@@HARVHUB_MANUAL_LOGIN@@"
 
 # The deployed HarvHub AI root is also the permanent desktop-app installation
 # directory. The VBS launcher installs/updates HarvHubAI.exe here.
@@ -94,7 +93,7 @@ PROGRAMS = [
         "role": "service",
         "runnable": True,
         "bridge": False,
-        "note": "Manual MT5 login requirements are displayed inside this HarvHub AI window.",
+        "note": "Manual MT5 Login confirmation remains available in its own program window when required.",
     },
     {
         "key": "brokercharts",
@@ -460,9 +459,6 @@ class HarvCoreManager:
         self.console_visible: dict[str, bool] = {}
         self.console_toggle_buttons: dict[str, tk.Button] = {}
         self.console_copy_buttons: dict[str, tk.Button] = {}
-        self.manual_login_items: dict[tuple, dict] = {}
-        self.manual_login_panel: Optional[tk.Frame] = None
-        self.manual_login_rows_frame: Optional[tk.Frame] = None
         self.raw_logs: dict[str, list[str]] = {item["key"]: [] for item in PROGRAMS}
         self.setup_raw_lines: list[str] = []
         self.setup_step_states: dict[str, str] = {}
@@ -705,9 +701,6 @@ class HarvCoreManager:
         self.console_toggle_buttons.clear()
         self.console_copy_buttons.clear()
         self.console_visible.clear()
-        self.manual_login_items.clear()
-        self.manual_login_panel = None
-        self.manual_login_rows_frame = None
         self.status_widgets.clear()
         self.setup_rows.clear()
         self.console_placeholders = {}
@@ -1487,26 +1480,6 @@ class HarvCoreManager:
         status.pack(side="right", padx=(10, 0))
         self.status_widgets[item["key"]] = status
 
-        if item["key"] == "brokerdetails":
-            manual_panel = self._card(wrapper, 12)
-            manual_title = tk.Label(
-                manual_panel, text="MANUAL MT5 LOGIN REQUIRED",
-                bg=self.colors["surface"], fg=self.colors["text"],
-                font=("Segoe UI", 10, "bold"),
-            )
-            manual_title.pack(anchor="w")
-            tk.Label(
-                manual_panel,
-                text="Complete the broker login in the account's MT5 terminal, then confirm the credentials below. This panel is part of the HarvHub AI desktop window.",
-                bg=self.colors["surface"], fg=self.colors["muted"],
-                font=("Segoe UI", 9), wraplength=900, justify="left",
-            ).pack(anchor="w", pady=(4, 9))
-            rows_frame = tk.Frame(manual_panel, bg=self.colors["surface"])
-            rows_frame.pack(fill="x", expand=True)
-            self.manual_login_panel = manual_panel
-            self.manual_login_rows_frame = rows_frame
-            manual_panel.pack_forget()
-
         controls = tk.Frame(header, bg=self.colors["surface"])
         controls.pack(fill="x", pady=(15, 0))
         play = self._button(controls, "▶  PLAY", lambda key=item["key"]: self.start_program(key), kind="success")
@@ -1776,163 +1749,6 @@ class HarvCoreManager:
                 button.configure(bg=self.colors["surface"], fg=self.colors["text"],
                                  activebackground=self.colors["surface2"], activeforeground=self.colors["text"])
 
-    def _handle_manual_login_event(self, payload: dict) -> None:
-        action = str(payload.get("action") or "").strip().lower()
-        if action == "upsert":
-            item = payload.get("item")
-            if not isinstance(item, dict):
-                return
-            kind = str(item.get("kind") or "").strip().upper()
-            owner_id = item.get("owner_id")
-            account_id = item.get("account_id")
-            if kind not in ("SA", "PRG") or owner_id is None or account_id is None:
-                return
-            key = (kind, int(owner_id), int(account_id))
-            self.manual_login_items[key] = dict(item)
-            self._render_manual_login_panel()
-            # Bring the requirement into view in the existing app window.
-            self._show_page("brokerdetails")
-        elif action == "remove":
-            kind = str(payload.get("kind") or "").strip().upper()
-            try:
-                key = (kind, int(payload.get("owner_id")), int(payload.get("account_id")))
-            except (TypeError, ValueError):
-                return
-            self.manual_login_items.pop(key, None)
-            self._render_manual_login_panel()
-
-    def _render_manual_login_panel(self) -> None:
-        panel = self.manual_login_panel
-        rows_frame = self.manual_login_rows_frame
-        if panel is None or rows_frame is None:
-            return
-
-        for child in rows_frame.winfo_children():
-            child.destroy()
-
-        if not self.manual_login_items:
-            panel.pack_forget()
-            return
-
-        placeholder = getattr(self, "console_placeholders", {}).get("brokerdetails")
-        if not panel.winfo_manager():
-            if placeholder is not None and placeholder.winfo_exists():
-                panel.pack(fill="x", pady=(0, 10), before=placeholder)
-            else:
-                panel.pack(fill="x", pady=(0, 10))
-
-        ordered = sorted(
-            self.manual_login_items.items(),
-            key=lambda pair: (pair[0][0], pair[0][1], pair[0][2]),
-        )
-        for index, (key, item) in enumerate(ordered, start=1):
-            kind, owner_id, account_id = key
-            label = (f"[SA] Owner {owner_id} | Sub-account {account_id}"
-                     if kind == "SA" else
-                     f"[PRG] Owner {owner_id} | Programme {account_id}")
-            card = tk.Frame(
-                rows_frame, bg=self.colors["surface2"], padx=10, pady=9,
-                highlightbackground=self.colors["border"], highlightthickness=1,
-            )
-            card.pack(fill="x", expand=True, pady=(0, 7))
-            tk.Label(
-                card, text=f"{index}. {label}", bg=self.colors["surface2"],
-                fg=self.colors["text"], font=("Segoe UI", 9, "bold"),
-            ).pack(anchor="w", pady=(0, 5))
-
-            def add_field(field_parent, field_name, value):
-                line = tk.Frame(field_parent, bg=self.colors["surface2"])
-                line.pack(fill="x", pady=1)
-                tk.Label(
-                    line, text=f"{field_name}:", width=10, anchor="w",
-                    bg=self.colors["surface2"], fg=self.colors["muted"],
-                    font=("Segoe UI", 9),
-                ).pack(side="left")
-                tk.Label(
-                    line, text=str(value or "N/A"), anchor="w",
-                    bg=self.colors["surface2"], fg=self.colors["text"],
-                    font=("Segoe UI", 9),
-                ).pack(side="left", fill="x", expand=True)
-                self._button(
-                    line, "COPY", lambda v=value: self._copy_text(str(v or "")),
-                    kind="quiet", width=7,
-                ).pack(side="right", padx=(6, 0))
-
-            add_field(card, "Broker", item.get("broker"))
-            add_field(card, "Server", item.get("server"))
-            add_field(card, "Login", item.get("login"))
-
-            password_line = tk.Frame(card, bg=self.colors["surface2"])
-            password_line.pack(fill="x", pady=1)
-            tk.Label(
-                password_line, text="Password:", width=10, anchor="w",
-                bg=self.colors["surface2"], fg=self.colors["muted"],
-                font=("Segoe UI", 9),
-            ).pack(side="left")
-            password_var = tk.StringVar(master=self.root, value="••••••••")
-            tk.Label(
-                password_line, textvariable=password_var, anchor="w",
-                bg=self.colors["surface2"], fg=self.colors["text"],
-                font=("Segoe UI", 9),
-            ).pack(side="left", fill="x", expand=True)
-
-            def toggle_password(var=password_var, value=str(item.get("password") or "")):
-                var.set(value if var.get().startswith("•") else "••••••••")
-
-            self._button(password_line, "SHOW", toggle_password, kind="quiet", width=7).pack(side="right", padx=(4, 0))
-            self._button(
-                password_line, "COPY",
-                lambda value=str(item.get("password") or ""): self._copy_text(value),
-                kind="quiet", width=7,
-            ).pack(side="right", padx=(4, 0))
-
-            actions = tk.Frame(card, bg=self.colors["surface2"])
-            actions.pack(fill="x", pady=(7, 0))
-            self._button(
-                actions, "OPEN TERMINAL",
-                lambda k=kind, u=owner_id, a=account_id: self._send_manual_login_command({
-                    "action": "focus", "kind": k, "owner_id": u, "account_id": a,
-                }), kind="quiet",
-            ).pack(side="left", padx=(0, 6))
-            self._button(
-                actions, "INVALID CREDENTIALS",
-                lambda k=kind, u=owner_id, a=account_id: self._send_manual_login_decision(k, u, a, "invalid"),
-                kind="danger",
-            ).pack(side="left", expand=True, fill="x", padx=(0, 4))
-            self._button(
-                actions, "VALID CREDENTIALS",
-                lambda k=kind, u=owner_id, a=account_id: self._send_manual_login_decision(k, u, a, "valid"),
-                kind="success",
-            ).pack(side="left", expand=True, fill="x", padx=(4, 0))
-
-    def _send_manual_login_command(self, command: dict) -> bool:
-        with self.process_lock:
-            entry = self.processes.get("brokerdetails")
-            process = entry.process if entry else None
-            if process is None or process.poll() is not None or process.stdin is None:
-                self._append_console("brokerdetails", "[MANUAL LOGIN] Broker Details is not running; action was not sent.", "error")
-                return False
-            try:
-                process.stdin.write(json.dumps(command, ensure_ascii=False) + "\n")
-                process.stdin.flush()
-                return True
-            except Exception as exc:
-                self._append_console("brokerdetails", f"[MANUAL LOGIN] Could not send action: {exc}", "error")
-                return False
-
-    def _send_manual_login_decision(self, kind: str, owner_id: int, account_id: int, decision: str) -> None:
-        sent = self._send_manual_login_command({
-            "action": "decision", "kind": kind,
-            "owner_id": owner_id, "account_id": account_id,
-            "decision": decision,
-        })
-        if sent:
-            self._append_console(
-                "brokerdetails",
-                f"[MANUAL LOGIN] {decision.upper()} decision sent for {kind} account {account_id}.",
-                "success" if decision == "valid" else "dim",
-            )
-
     def _show_page(self, key: str) -> None:
         if key not in self.pages:
             return
@@ -2173,7 +1989,7 @@ class HarvCoreManager:
                     env=env,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
-                    stdin=subprocess.PIPE if key == "brokerdetails" else subprocess.DEVNULL,
+                    stdin=subprocess.DEVNULL,
                     text=True,
                     encoding="utf-8",
                     errors="replace",
@@ -2195,16 +2011,7 @@ class HarvCoreManager:
         try:
             if process.stdout:
                 for line in iter(process.stdout.readline, ""):
-                    line = line.rstrip("\r\n")
-                    if key == "brokerdetails" and line.startswith(MANUAL_UI_EVENT_PREFIX):
-                        try:
-                            payload = json.loads(line[len(MANUAL_UI_EVENT_PREFIX):])
-                            if isinstance(payload, dict):
-                                self.events.put(("manual_login_event", (payload,)))
-                        except Exception as exc:
-                            self.events.put(("console_line", (key, f"[MANAGER] Invalid manual-login host event: {exc}")))
-                        continue
-                    self.events.put(("console_line", (key, line)))
+                    self.events.put(("console_line", (key, line.rstrip("\r\n"))))
         except Exception as exc:
             self.events.put(("console_line", (key, f"[MANAGER] Console reader error: {exc}")))
         try:
@@ -2373,17 +2180,12 @@ class HarvCoreManager:
                 elif event == "console_line":
                     key, line, *rest = data
                     self._append_console(key, str(line), rest[0] if rest else None)
-                elif event == "manual_login_event":
-                    self._handle_manual_login_event(data[0])
                 elif event == "program_status":
                     self._set_program_status(data[0], data[1])
                 elif event == "process_exit":
                     key, code = data
                     self._set_program_status(key, "STOPPED")
                     self._append_console(key, f"[MANAGER] Process exited with code {code}.", "dim" if code in (0, None) else "error")
-                    if key == "brokerdetails":
-                        self.manual_login_items.clear()
-                        self._render_manual_login_panel()
                 elif event == "run_all_finished":
                     self._set_global_run_all_buttons("normal", "▶  RUN ALL")
                 elif event == "setup_cancelled":
