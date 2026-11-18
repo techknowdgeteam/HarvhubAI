@@ -62,7 +62,6 @@ for more details." Deduplicated per sub-account.
 """
 
 import atexit
-import ctypes
 import os
 import re
 import sys
@@ -754,268 +753,157 @@ def delete_mt5_folder(folder_abs, tag='SA'):
         return False
 
 
-# =============================================================================
-#  Terminal launcher — exactly one portable MT5 process per account folder
-# =============================================================================
+# ==============================================================================
+#  Terminal launcher
+# ==============================================================================
 _LAUNCHED_FOLDERS = set()
 _LAUNCH_LOCK      = threading.Lock()
 
 
-def _normalise_executable_path(path):
-    """Normalise a Windows executable path for exact process-path matching."""
-    try:
-        return os.path.normcase(os.path.realpath(os.path.abspath(path)))
-    except Exception:
-        return os.path.normcase(os.path.normpath(str(path)))
-
-
-def _process_image_path(pid):
-    """Return the full executable path for a PID on Windows, or None."""
-    if os.name != 'nt':
-        return None
-
-    try:
-        from ctypes import wintypes
-
-        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
-        kernel32.OpenProcess.argtypes = [
-            wintypes.DWORD, wintypes.BOOL, wintypes.DWORD
-        ]
-        kernel32.OpenProcess.restype = wintypes.HANDLE
-        kernel32.QueryFullProcessImageNameW.argtypes = [
-            wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR,
-            ctypes.POINTER(wintypes.DWORD)
-        ]
-        kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
-        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-        kernel32.CloseHandle.restype = wintypes.BOOL
-
-        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-        handle = kernel32.OpenProcess(
-            PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid)
-        )
-        if not handle:
-            return None
-
-        try:
-            buffer = ctypes.create_unicode_buffer(32768)
-            size = wintypes.DWORD(len(buffer))
-            if not kernel32.QueryFullProcessImageNameW(
-                handle, 0, buffer, ctypes.byref(size)
-            ):
-                return None
-            return buffer.value
-        finally:
-            kernel32.CloseHandle(handle)
-    except Exception as e:
-        print(f"      [PROCESS] could not read executable path for PID {pid}: {e}")
-        return None
-
-
-def _terminal_pids_for_folder(folder_abs):
-    """Find terminal64.exe processes whose full path belongs to this account."""
-    target_exe = os.path.join(folder_abs, 'terminal64.exe')
-    if not os.path.isfile(target_exe) or os.name != 'nt':
-        return []
-
-    target_norm = _normalise_executable_path(target_exe)
-    matching = []
-    for pid in _list_pids_for_image('terminal64.exe'):
-        running_path = _process_image_path(pid)
-        if running_path and _normalise_executable_path(running_path) == target_norm:
-            matching.append(pid)
-    return matching
-
-
 def _terminal_running_for_folder(folder_abs):
-    """True only when this exact account-folder terminal process is running."""
-    return bool(_terminal_pids_for_folder(folder_abs))
-
-
-def _acquire_account_launch_guard(folder_abs):
-    """Acquire a short cross-process lock while checking/starting this account."""
-    if os.name != 'nt':
-        return None
-
-    lock_path = os.path.join(folder_abs, '.brokerdetails_launch_guard')
-    handle = None
+    target_exe = os.path.join(folder_abs, "terminal64.exe")
+    if not os.path.exists(target_exe):
+        return False
     try:
-        import msvcrt
-
-        handle = open(lock_path, 'a+b')
-        handle.seek(0, os.SEEK_END)
-        if handle.tell() == 0:
-            handle.write(b'0')
-            handle.flush()
-        handle.seek(0)
-        msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
-        return handle
-    except Exception as e:
-        if handle is not None:
-            try:
-                handle.close()
-            except Exception:
-                pass
-        raise RuntimeError(f'could not acquire account launch guard: {e}')
-
-
-def _release_account_launch_guard(handle):
-    if handle is None:
-        return
-    try:
-        import msvcrt
-        handle.seek(0)
-        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-    except Exception as e:
-        print(f"      [LAUNCH] account launch guard release warning: {e}")
-    finally:
-        try:
-            handle.close()
-        except Exception:
+        with open(target_exe, 'a'):
             pass
+    except Exception:
+        return True
+    return False
 
 
 def launch_terminal(terminal_exe, folder_abs):
-    """Launch one portable terminal for this account, never a second copy."""
     folder_key = os.path.normcase(os.path.abspath(folder_abs))
 
     with _LAUNCH_LOCK:
         if folder_key in _LAUNCHED_FOLDERS:
-            if _terminal_running_for_folder(folder_abs):
-                print(f"      [LAUNCH] account terminal is already running: {terminal_exe}")
-                return False, True
-            # The process has exited since the previous scan. Remove the stale
-            # in-memory marker so this account can be restarted exactly once.
-            _LAUNCHED_FOLDERS.discard(folder_key)
-            print(f"      [LAUNCH] previous terminal is no longer running; restarting once")
+            print(f"      [LAUNCH] already launched this session: {terminal_exe}")
+            return False, True
 
-        guard = None
-        try:
-            guard = _acquire_account_launch_guard(folder_abs)
-
-            # Check the exact running process path. Opening the EXE file is not
-            # a valid test because Windows normally permits that while running.
-            if _terminal_running_for_folder(folder_abs):
-                _LAUNCHED_FOLDERS.add(folder_key)
-                print(f"      [LAUNCH] exact account terminal already running: {terminal_exe}")
-                return False, True
-
-            DETACHED_PROCESS = 0x00000008
-            CREATE_NEW_PROCESS_GROUP = 0x00000200
-            subprocess.Popen(
-                [terminal_exe, '/portable'],
-                cwd=folder_abs,
-                creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
-                close_fds=True,
-            )
-
-            # Retain the cross-process guard briefly until the new process is
-            # visible, closing the race between Popen and process enumeration.
-            deadline = time.monotonic() + 3.0
-            process_seen = False
-            while time.monotonic() < deadline:
-                if _terminal_running_for_folder(folder_abs):
-                    process_seen = True
-                    break
-                time.sleep(0.1)
-
-            # Popen succeeded: mark it launched even if process enumeration is
-            # temporarily unavailable. A blind second launch is not safe.
+    if _terminal_running_for_folder(folder_abs):
+        with _LAUNCH_LOCK:
             _LAUNCHED_FOLDERS.add(folder_key)
-            if process_seen:
-                print(f"      [LAUNCH] started exactly one portable terminal: {terminal_exe}")
-            else:
-                print(f"      [LAUNCH] Popen succeeded; process not yet confirmed: {terminal_exe}")
-            return True, True
-
-        except Exception as e:
-            print(f"      [LAUNCH] failed: {e}")
-            return False, False
-        finally:
-            _release_account_launch_guard(guard)
-
-
-def _focus_existing_terminal_window(terminal_exe):
-    """Focus a running terminal window without starting another process."""
-    if os.name != 'nt':
-        return False
-
-    folder_abs = os.path.dirname(os.path.abspath(terminal_exe))
-    pids = set(_terminal_pids_for_folder(folder_abs))
-    if not pids:
-        print(f"      [FOCUS] no running terminal process found; refusing to launch another: {terminal_exe}")
-        return False
+        print(f"      [LAUNCH] terminal already running: {terminal_exe}")
+        return False, True
 
     try:
-        from ctypes import wintypes
-
-        user32 = ctypes.WinDLL('user32', use_last_error=True)
-        enum_type = ctypes.WINFUNCTYPE(
-            wintypes.BOOL, wintypes.HWND, wintypes.LPARAM
+        DETACHED_PROCESS = 0x00000008
+        CREATE_NEW_PROCESS_GROUP = 0x00000200
+        subprocess.Popen(
+            [terminal_exe],
+            cwd=folder_abs,
+            creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+            close_fds=True,
         )
-        user32.EnumWindows.argtypes = [enum_type, wintypes.LPARAM]
-        user32.EnumWindows.restype = wintypes.BOOL
-        user32.GetWindowThreadProcessId.argtypes = [
-            wintypes.HWND, ctypes.POINTER(wintypes.DWORD)
-        ]
-        user32.GetWindowThreadProcessId.restype = wintypes.DWORD
-        user32.IsWindowVisible.argtypes = [wintypes.HWND]
-        user32.IsWindowVisible.restype = wintypes.BOOL
-        user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
-        user32.ShowWindow.restype = wintypes.BOOL
-        user32.BringWindowToTop.argtypes = [wintypes.HWND]
-        user32.BringWindowToTop.restype = wintypes.BOOL
-        user32.SetForegroundWindow.argtypes = [wintypes.HWND]
-        user32.SetForegroundWindow.restype = wintypes.BOOL
-
-        windows = []
-
-        def _enum_callback(hwnd, _lparam):
-            pid = wintypes.DWORD()
-            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-            if pid.value in pids and user32.IsWindowVisible(hwnd):
-                windows.append(hwnd)
-            return True
-
-        callback = enum_type(_enum_callback)
-        user32.EnumWindows(callback, 0)
-
-        for hwnd in windows:
-            user32.ShowWindow(hwnd, 9)  # SW_RESTORE
-            user32.BringWindowToTop(hwnd)
-            if user32.SetForegroundWindow(hwnd):
-                print(f"      [FOCUS] focused existing terminal window for PID set {sorted(pids)}")
-                return True
-
-        if windows:
-            print("      [FOCUS] existing terminal window restored; Windows blocked foreground activation")
-            return True
-
-        print("      [FOCUS] terminal process exists but no visible top-level window was found")
-        return False
     except Exception as e:
-        print(f"      [FOCUS] could not focus existing terminal window: {e}")
-        return False
+        print(f"      [LAUNCH] failed: {e}")
+        return False, False
+
+    with _LAUNCH_LOCK:
+        _LAUNCHED_FOLDERS.add(folder_key)
+    print(f"      [LAUNCH] started: {terminal_exe}")
+    return True, True
 
 
 def bring_terminal_to_front(terminal_exe):
-    """Open one terminal if stopped; otherwise focus the existing window."""
-    folder_abs = os.path.dirname(os.path.abspath(terminal_exe))
+    """Focus the already-running account terminal without starting another one."""
+    target_path = os.path.normcase(os.path.abspath(terminal_exe))
 
-    if not _terminal_running_for_folder(folder_abs):
-        print(f"      [FOCUS] terminal is not running; requesting one guarded launch")
-        _started, ok = launch_terminal(terminal_exe, folder_abs)
-        if not ok:
+    if os.name != 'nt':
+        print(f"      [FOCUS] cannot focus MT5 outside Windows: {terminal_exe}")
+        return False
+
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.WinDLL('user32', use_last_error=True)
+        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        SW_RESTORE = 9
+
+        kernel32.OpenProcess.argtypes = (
+            wintypes.DWORD, wintypes.BOOL, wintypes.DWORD,
+        )
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.QueryFullProcessImageNameW.argtypes = (
+            wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR,
+            ctypes.POINTER(wintypes.DWORD),
+        )
+        kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        kernel32.CloseHandle.restype = wintypes.BOOL
+
+        user32.GetWindowThreadProcessId.argtypes = (
+            wintypes.HWND, ctypes.POINTER(wintypes.DWORD),
+        )
+        user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+        user32.IsWindowVisible.argtypes = (wintypes.HWND,)
+        user32.IsWindowVisible.restype = wintypes.BOOL
+        user32.GetWindowTextLengthW.argtypes = (wintypes.HWND,)
+        user32.GetWindowTextLengthW.restype = ctypes.c_int
+        user32.ShowWindow.argtypes = (wintypes.HWND, ctypes.c_int)
+        user32.ShowWindow.restype = wintypes.BOOL
+        user32.SetForegroundWindow.argtypes = (wintypes.HWND,)
+        user32.SetForegroundWindow.restype = wintypes.BOOL
+
+        enum_windows_proc = ctypes.WINFUNCTYPE(
+            wintypes.BOOL, wintypes.HWND, wintypes.LPARAM,
+        )
+        matching_windows = []
+
+        def _process_image_path(pid):
+            handle = kernel32.OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION, False, pid,
+            )
+            if not handle:
+                return None
+            try:
+                buffer = ctypes.create_unicode_buffer(32768)
+                size = wintypes.DWORD(len(buffer))
+                if kernel32.QueryFullProcessImageNameW(
+                    handle, 0, buffer, ctypes.byref(size),
+                ):
+                    return os.path.normcase(os.path.abspath(buffer.value))
+                return None
+            finally:
+                kernel32.CloseHandle(handle)
+
+        @enum_windows_proc
+        def _find_account_window(hwnd, _lparam):
+            if not user32.IsWindowVisible(hwnd):
+                return True
+
+            pid = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            if not pid.value:
+                return True
+
+            image_path = _process_image_path(pid.value)
+            if image_path == target_path and user32.GetWindowTextLengthW(hwnd) > 0:
+                matching_windows.append(hwnd)
+                return False
+            return True
+
+        user32.EnumWindows.argtypes = (enum_windows_proc, wintypes.LPARAM)
+        user32.EnumWindows.restype = wintypes.BOOL
+        user32.EnumWindows(_find_account_window, 0)
+
+        if not matching_windows:
+            print(f"      [FOCUS] existing account terminal window not found; "
+                  f"not starting another copy: {terminal_exe}")
             return False
 
-        # Give Windows time to create the main terminal window after Popen.
-        deadline = time.monotonic() + 5.0
-        while time.monotonic() < deadline:
-            if _terminal_running_for_folder(folder_abs):
-                break
-            time.sleep(0.2)
+        hwnd = matching_windows[0]
+        user32.ShowWindow(hwnd, SW_RESTORE)
+        user32.SetForegroundWindow(hwnd)
+        print(f"      [FOCUS] focused existing terminal: {terminal_exe}")
+        return True
 
-    return _focus_existing_terminal_window(terminal_exe)
+    except Exception as e:
+        print(f"      [FOCUS] could not focus existing terminal: {e}")
+        return False
 
 
 # ==============================================================================
