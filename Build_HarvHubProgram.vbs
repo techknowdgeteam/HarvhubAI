@@ -424,87 +424,118 @@ Function PSChunk11()
         "    Pump-Ui", _
         "}", _
         "function Download-ToFile([string]$Url, [string]$Destination, [string]$Label) {", _
-        "    Add-UiLog('Downloading ' + $Label + '.')", _
-        "    $request = [System.Net.HttpWebRequest]::Create($Url)", _
-        "    $request.Method = 'GET'", _
-        "    $request.UserAgent = 'HarvHubAI-Installer'", _
-        "    $request.Timeout = 120000" _
+        "    Add-UiLog(('Downloading ' + $Label + '.'))", _
+        "    $request = $null; $response = $null; $inputStream = $null; $outputStream = $null", _
+        "    $phase = 'opening a connection to the download server'", _
+        "    try {", _
+        "        $request = [System.Net.HttpWebRequest]::Create($Url)", _
+        "        $request.Method = 'GET'", _
+        "        $request.UserAgent = 'HarvHubAI-Installer'", _
+        "        $request.Timeout = 90000", _
+        "        $request.ReadWriteTimeout = 90000", _
+        "        $request.AllowAutoRedirect = $true", _
+        "        $script:progress.Style = 'Marquee'", _
+        "        $script:progress.MarqueeAnimationSpeed = 25", _
+        "        $script:statusLabel.Text = 'Connecting to GitHub... (90-second response limit)'", _
+        "        Pump-Ui" _
     ), vbCrLf)
 End Function
 
 Function PSChunk12()
     PSChunk12 = Join(Array( _
-        "    $request.ReadWriteTimeout = 120000", _
-        "    $request.AllowAutoRedirect = $true", _
-        "    $asyncResponse = $request.BeginGetResponse($null, $null)", _
-        "    while (!$asyncResponse.IsCompleted) {", _
-        "        Pump-Ui", _
-        "        Start-Sleep -Milliseconds 100", _
-        "    }", _
-        "    $response = $request.EndGetResponse($asyncResponse)", _
-        "    $inputStream = $null", _
-        "    $outputStream = $null", _
-        "    try {", _
+        "        $phase = 'waiting for the server response (90-second limit)'", _
+        "        $responseTimer = [System.Diagnostics.Stopwatch]::StartNew()", _
+        "        $asyncResponse = $request.BeginGetResponse($null, $null)", _
+        "        $lastWaitNotice = 0", _
+        "        while (!$asyncResponse.IsCompleted) {", _
+        "            $waitSeconds = [int]$responseTimer.Elapsed.TotalSeconds", _
+        "            if ($waitSeconds -ge 90) { try { $request.Abort() } catch {}; throw ('Timed out after 90 seconds waiting for GitHub response headers. Check internet access, DNS, firewall, proxy settings, and GitHub availability. URL: ' + $Url) }", _
+        "            if ($waitSeconds -ge ($lastWaitNotice + 15)) { $lastWaitNotice = $waitSeconds; Add-UiLog('Still waiting for GitHub response headers: ' + $waitSeconds + '/90 seconds.'); $script:statusLabel.Text = 'Waiting for GitHub response... ' + $waitSeconds + '/90 seconds' }", _
+        "            Pump-Ui", _
+        "            Start-Sleep -Milliseconds 100", _
+        "        }", _
+        "        $response = $request.EndGetResponse($asyncResponse)", _
         "        $total = [long]$response.ContentLength", _
+        "        if ($total -gt 0) { Add-UiLog('GitHub responded. ZIP size: ' + [Math]::Round($total / 1MB, 2) + ' MB.') } else { Add-UiLog('GitHub responded. The server did not provide a ZIP size; received bytes will be monitored.') }", _
+        "        $phase = 'opening the GitHub ZIP response stream'", _
         "        $inputStream = $response.GetResponseStream()", _
-        "        $outputStream = [System.IO.File]::Create($Destination)" _
+        "        if (!$inputStream) { throw 'GitHub returned an empty response stream.' }", _
+        "        $outputStream = [System.IO.File]::Create($Destination)", _
+        "        $downloadTimer = [System.Diagnostics.Stopwatch]::StartNew()", _
+        "        [long]$received = 0", _
+        "        $lastProgressNotice = 0" _
     ), vbCrLf)
 End Function
 
 Function PSChunk13()
     PSChunk13 = Join(Array( _
+        "        $phase = 'downloading the GitHub ZIP (20-minute total limit; 90-second idle limit)'", _
         "        $buffer = New-Object byte[] 65536", _
-        "        [long]$received = 0", _
         "        while ($true) {", _
+        "            if ($downloadTimer.Elapsed.TotalSeconds -ge 1200) { try { $request.Abort() } catch {}; throw 'GitHub ZIP download exceeded the 20-minute overall limit. The connection was stopped.' }", _
+        "            $readTimer = [System.Diagnostics.Stopwatch]::StartNew()", _
         "            $asyncRead = $inputStream.BeginRead($buffer, 0, $buffer.Length, $null, $null)", _
+        "            $lastIdleNotice = 0", _
         "            while (!$asyncRead.IsCompleted) {", _
+        "                $idleSeconds = [int]$readTimer.Elapsed.TotalSeconds", _
+        "                if ($downloadTimer.Elapsed.TotalSeconds -ge 1200) { try { $request.Abort() } catch {}; throw 'GitHub ZIP download exceeded the 20-minute overall limit. The connection was stopped.' }", _
+        "                if ($idleSeconds -ge 90) { try { $request.Abort() } catch {}; throw ('No ZIP data arrived for 90 seconds. The GitHub download connection appears stalled. Received so far: ' + [Math]::Round($received / 1MB, 2) + ' MB. URL: ' + $Url) }", _
+        "                if ($idleSeconds -ge ($lastIdleNotice + 15)) { $lastIdleNotice = $idleSeconds; Add-UiLog('GitHub is connected but no ZIP data has arrived for ' + $idleSeconds + ' seconds. Received: ' + [Math]::Round($received / 1MB, 2) + ' MB.') }", _
         "                Pump-Ui", _
-        "                Start-Sleep -Milliseconds 50", _
+        "                Start-Sleep -Milliseconds 100", _
         "            }", _
         "            $count = $inputStream.EndRead($asyncRead)", _
         "            if ($count -le 0) { break }", _
         "            $outputStream.Write($buffer, 0, $count)", _
         "            $received += $count", _
-        "            if ($total -gt 0) {", _
-        "                $percent = [int][Math]::Min(100, ($received * 100.0 / $total))" _
+        "            if ($total -gt 0) { $percent = [int][Math]::Min(100, ($received * 100.0 / $total)); $script:progress.Style = 'Blocks'; $script:progress.Value = $percent; $script:statusLabel.Text = $Label + ' - ' + $percent + '% (' + [Math]::Round($received / 1MB, 1) + ' / ' + [Math]::Round($total / 1MB, 1) + ' MB)' } else { $script:progress.Style = 'Marquee'; $script:statusLabel.Text = $Label + ' - ' + [Math]::Round($received / 1MB, 1) + ' MB received' }", _
+        "            $transferSizeText = ''", _
+        "            if ($total -gt 0) { $transferSizeText = ' of ' + [Math]::Round($total / 1MB, 2) + ' MB' }", _
+        "            if ([int]$downloadTimer.Elapsed.TotalSeconds -ge ($lastProgressNotice + 15)) { $lastProgressNotice = [int]$downloadTimer.Elapsed.TotalSeconds; Add-UiLog('GitHub ZIP transfer: ' + [Math]::Round($received / 1MB, 2) + ' MB received' + $transferSizeText + '.') }", _
+        "            Pump-Ui" _
     ), vbCrLf)
 End Function
 
 Function PSChunk14()
     PSChunk14 = Join(Array( _
-        "                $script:progress.Style = 'Blocks'", _
-        "                $script:progress.Value = $percent", _
-        "                $script:statusLabel.Text = $Label + ' - ' + $percent + '%'", _
-        "            } else {", _
-        "                $script:progress.Style = 'Marquee'", _
-        "                $script:progress.MarqueeAnimationSpeed = 25", _
-        "                $script:statusLabel.Text = $Label + ' - downloading'", _
-        "            }", _
-        "            Pump-Ui", _
         "        }", _
+        "        $phase = 'finishing and validating the downloaded ZIP file'", _
         "        $outputStream.Flush()", _
-        "    } finally {", _
-        "        if ($outputStream) { $outputStream.Dispose() }", _
-        "        if ($inputStream) { $inputStream.Dispose() }" _
+        "        $outputStream.Dispose(); $outputStream = $null", _
+        "        $inputStream.Dispose(); $inputStream = $null", _
+        "        $response.Dispose(); $response = $null", _
+        "        if (!(Test-Path -LiteralPath $Destination)) { throw 'The GitHub ZIP file was not created.' }", _
+        "        $actualSize = (Get-Item -LiteralPath $Destination).Length", _
+        "        if ($actualSize -lt 10240) { throw ('The GitHub ZIP is too small or incomplete: ' + $actualSize + ' bytes.') }", _
+        "        if ($total -gt 0 -and $received -ne $total) { throw ('The GitHub ZIP is incomplete. Server declared ' + $total + ' bytes but only ' + $received + ' bytes were received.') }", _
+        "        $script:progress.Style = 'Blocks'", _
+        "        $script:progress.Value = 100", _
+        "        Add-UiLog($Label + ' download completed: ' + [Math]::Round($actualSize / 1MB, 2) + ' MB.')" _
     ), vbCrLf)
 End Function
 
 Function PSChunk15()
     PSChunk15 = Join(Array( _
-        "        $response.Dispose()", _
+        "    } catch {", _
+        "        $exception = $_.Exception", _
+        "        $detail = $exception.Message", _
+        "        $networkDetail = ''", _
+        "        if ($exception -is [System.Net.WebException]) { $networkDetail = ' Network status: ' + $exception.Status + '.'; try { if ($exception.Response) { $networkDetail += ' HTTP response: ' + $exception.Response.StatusCode + ' ' + $exception.Response.StatusDescription + '.' } } catch { } }", _
+        "        try { if ($outputStream) { $outputStream.Dispose(); $outputStream = $null } } catch { }", _
+        "        try { if ($inputStream) { $inputStream.Dispose(); $inputStream = $null } } catch { }", _
+        "        try { if ($response) { $response.Dispose(); $response = $null } } catch { }", _
+        "        try { if ($request) { $request.Abort() } } catch { }", _
+        "        try { Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue } catch { }", _
+        "        $failure = $Label + ' download failed while ' + $phase + '. URL: ' + $Url + '. Cause: ' + $detail + $networkDetail", _
+        "        Add-UiLog('DOWNLOAD FAILED: ' + $failure)", _
+        "        throw $failure", _
+        "    } finally {", _
+        "        if ($outputStream) { try { $outputStream.Dispose() } catch { } }", _
+        "        if ($inputStream) { try { $inputStream.Dispose() } catch { } }", _
+        "        if ($response) { try { $response.Dispose() } catch { } }", _
         "    }", _
-        "    if (!(Test-Path -LiteralPath $Destination) -or (Get-Item -LiteralPath $Destination).Length -lt 10240) {", _
-        "        throw ($Label + ' download is empty or incomplete.')", _
-        "    }", _
-        "    $script:progress.Style = 'Blocks'", _
-        "    $script:progress.Value = 100", _
-        "    Add-UiLog($Label + ' download completed.')", _
         "}", _
-        "function Find-CompatiblePython {", _
-        "    $roots = @((Join-Path $env:LOCALAPPDATA 'Programs\Python'), $env:ProgramFiles)", _
-        "    $versions = @('Python313','Python312','Python311','Python310','Python314')", _
-        "    foreach ($base in $roots) {", _
-        "        if (!$base) { continue }" _
+        "function Find-CompatiblePython {" _
     ), vbCrLf)
 End Function
 
