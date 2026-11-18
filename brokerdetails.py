@@ -793,7 +793,7 @@ def launch_terminal(terminal_exe, folder_abs):
         DETACHED_PROCESS = 0x00000008
         CREATE_NEW_PROCESS_GROUP = 0x00000200
         subprocess.Popen(
-            [terminal_exe],
+            [terminal_exe, "/portable"],
             cwd=folder_abs,
             creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
             close_fds=True,
