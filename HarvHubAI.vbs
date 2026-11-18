@@ -25,13 +25,11 @@ If Not IsAdministrator() Then
     WScript.Quit 0
 End If
 
-appRunning = IsInstalledHarvHubRunning(fso.BuildPath(installRoot, "HarvHubAI.exe"))
-If appRunning Then
-    MsgBox "HarvHub AI or one of its services is currently running. Close HarvHub AI normally before updating. No running service has been terminated.", vbInformation, "HarvHub AI update"
-    WScript.Quit 3
-End If
-
+' Enforce one active HarvHub setup/update session. Older HarvHub manager,
+' bootstrap, builder, and service processes are stopped before files are touched.
+' Unrelated Windows applications and system processes are never targeted.
 Call EnsureFolderTree(cacheRoot)
+Call StopExistingHarvHubProcesses()
 Set processEnv = sh.Environment("PROCESS")
 processEnv("HARVHUBAI_CLICKED_VBS") = clickedVbs
 
@@ -109,7 +107,7 @@ Function ConsoleBootstrapPowerShell()
         "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12", _
         "$cacheRoot = Join-Path $env:LOCALAPPDATA 'HarvHubAI\Bootstrap'", _
         "$extractRoot = Join-Path $cacheRoot 'source'", _
-        "$zipPath = Join-Path $cacheRoot 'HarvHubAI-latest.zip'", _
+        "$zipPath = Join-Path $cacheRoot ('HarvHubAI-' + $PID + '-' + [Guid]::NewGuid().ToString('N') + '.zip')", _
         "$markerPath = Join-Path $cacheRoot 'project_root.txt'", _
         "$pythonMarkerPath = Join-Path $cacheRoot 'pythonw_path.txt'", _
         "$clickedVbs = $env:HARVHUBAI_CLICKED_VBS", _
@@ -118,7 +116,7 @@ Function ConsoleBootstrapPowerShell()
         "function Download-ToFile([string]$Url,[string]$Destination,[string]$Label) {", _
         "  Write-Step ('Downloading ' + $Label + '...')", _
         "  $request = [System.Net.HttpWebRequest]::Create($Url); $request.Method='GET'; $request.UserAgent='HarvHubAI-Installer'; $request.Timeout=120000; $request.ReadWriteTimeout=120000; $request.AllowAutoRedirect=$true", _
-        "  $response=$request.GetResponse(); $inputStream=$response.GetResponseStream(); $outputStream=[System.IO.File]::Create($Destination); $total=[long]$response.ContentLength; [long]$done=0; $buffer=New-Object byte[] 65536", _
+        "  $response=$request.GetResponse(); $inputStream=$response.GetResponseStream(); $outputStream=[System.IO.File]::Open($Destination,[System.IO.FileMode]::CreateNew,[System.IO.FileAccess]::Write,[System.IO.FileShare]::None); $total=[long]$response.ContentLength; [long]$done=0; $buffer=New-Object byte[] 65536", _
         "  try { while(($count=$inputStream.Read($buffer,0,$buffer.Length)) -gt 0) { $outputStream.Write($buffer,0,$count); $done += $count; if($total -gt 0){$pct=[int][Math]::Min(100,($done*100.0/$total)); Write-Progress -Activity $Label -Status ($pct.ToString() + '%') -PercentComplete $pct } else { Write-Progress -Activity $Label -Status ('Downloaded ' + [Math]::Round($done/1MB,1) + ' MB') } } } finally { $outputStream.Dispose(); $inputStream.Dispose(); $response.Dispose() }", _
         "  if(!(Test-Path -LiteralPath $Destination) -or (Get-Item -LiteralPath $Destination).Length -lt 10240){throw ($Label + ' download is empty or incomplete.')}; Write-Progress -Activity $Label -Completed", _
         "}", _
@@ -135,7 +133,7 @@ Function ConsoleBootstrapPowerShell()
         "  Write-Step 'Step 1 of 4: Downloading the latest GitHub repository ZIP.'", _
         "  $githubUrl='https://github.com/techknowdgeteam/HarvhubAI/archive/refs/heads/main.zip'; Download-ToFile $githubUrl $zipPath 'HarvHub AI GitHub ZIP'", _
         "  Write-Step 'Step 2 of 4: Extracting and validating the repository.'", _
-        "  Add-Type -AssemblyName System.IO.Compression.FileSystem; $archive=[System.IO.Compression.ZipFile]::OpenRead($zipPath); try{if($archive.Entries.Count -lt 5){throw 'The GitHub ZIP contains too few files.'}}finally{$archive.Dispose()}; [System.IO.Compression.ZipFile]::ExtractToDirectory($zipPath,$extractRoot)", _
+        "  Add-Type -AssemblyName System.IO.Compression.FileSystem; $archive=[System.IO.Compression.ZipFile]::OpenRead($zipPath); try{if($archive.Entries.Count -lt 5){throw 'The GitHub ZIP contains too few files.'}}finally{$archive.Dispose()}; [System.IO.Compression.ZipFile]::ExtractToDirectory($zipPath,$extractRoot); Remove-Item -LiteralPath $zipPath -Force -ErrorAction SilentlyContinue", _
         "  $builder=Get-ChildItem -LiteralPath $extractRoot -Recurse -File -Filter 'Build_HarvHubProgram.pyw' | Select-Object -First 1; if(!$builder){throw 'GitHub repository is missing Build_HarvHubProgram.pyw.'}; $project=$builder.Directory.FullName", _
         "  $manager=Join-Path $project 'harvcore_manager.py'; if(!(Test-Path -LiteralPath $manager)){throw 'GitHub repository is missing harvcore_manager.py.'}; $payload=Join-Path $project 'payload'; New-Item -ItemType Directory -Path $payload -Force | Out-Null", _
         "  $sourceNames=@('mysqlremote.py','brokerdetails.py','brokercharts.py','programme_training.py','programmesignals_trading.py','signals_provision_challenge.py','ip.py','notification_email.py','notification_service.py','harvhub_ipc.py')", _
@@ -232,7 +230,7 @@ Function PSChunk01()
         "Add-Type -AssemblyName System.Drawing", _
         "[System.Windows.Forms.Application]::EnableVisualStyles()", _
         "$script:cacheRoot = Join-Path $env:LOCALAPPDATA 'HarvHubAI\Bootstrap'", _
-        "$script:zipPath = Join-Path $script:cacheRoot 'HarvHubAI-latest.zip'", _
+        "$script:zipPath = Join-Path $script:cacheRoot ('HarvHubAI-' + $PID + '-' + [Guid]::NewGuid().ToString('N') + '.zip')", _
         "$script:extractRoot = Join-Path $script:cacheRoot 'source'", _
         "$script:markerPath = Join-Path $script:cacheRoot 'project_root.txt'", _
         "$script:pythonMarkerPath = Join-Path $script:cacheRoot 'pythonw_path.txt'", _
@@ -460,7 +458,7 @@ Function PSChunk12()
         "        $phase = 'opening the GitHub ZIP response stream'", _
         "        $inputStream = $response.GetResponseStream()", _
         "        if (!$inputStream) { throw 'GitHub returned an empty response stream.' }", _
-        "        $outputStream = [System.IO.File]::Create($Destination)", _
+        "        $outputStream = [System.IO.File]::Open($Destination, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)", _
         "        $downloadTimer = [System.Diagnostics.Stopwatch]::StartNew()", _
         "        [long]$received = 0", _
         "        $lastProgressNotice = 0" _
@@ -605,6 +603,7 @@ Function PSChunk19()
         "        if ($archive.Entries.Count -lt 5) { throw 'GitHub archive contains too few files.' }", _
         "    } finally { $archive.Dispose() }", _
         "    [System.IO.Compression.ZipFile]::ExtractToDirectory($script:zipPath, $script:extractRoot)", _
+        "    Remove-Item -LiteralPath $script:zipPath -Force -ErrorAction SilentlyContinue", _
         "    $builderFile = Get-ChildItem -LiteralPath $script:extractRoot -Recurse -File -Filter 'Build_HarvHubProgram.pyw' | Select-Object -First 1", _
         "    if (!$builderFile) { throw 'GitHub repository is missing Build_HarvHubProgram.pyw.' }", _
         "    $project = $builderFile.Directory.FullName", _
@@ -738,12 +737,131 @@ Function PSChunk26()
     ), vbCrLf)
 End Function
 
+
+Sub StopExistingHarvHubProcesses()
+    Dim helperPath, helperFile, helperScript, cleanupExit
+    helperPath = fso.BuildPath(cacheRoot, "cleanup_" & Replace(fso.GetTempName(), ".tmp", "") & ".ps1")
+
+    helperScript = Join(Array( _
+        "$ErrorActionPreference = 'Stop'", _
+        "$cacheRoot = Join-Path $env:LOCALAPPDATA 'HarvHubAI\Bootstrap'", _
+        "$logPath = Join-Path $cacheRoot 'process_cleanup.log'", _
+        "New-Item -ItemType Directory -Path $cacheRoot -Force | Out-Null", _
+        "function Add-CleanupLog([string]$Message) { Add-Content -LiteralPath $logPath -Value ('[' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') + '] ' + $Message) -Encoding UTF8 }", _
+        "try {", _
+        "    $all = @(Get-CimInstance -ClassName Win32_Process)", _
+        "    $helper = $all | Where-Object { [int]$_.ProcessId -eq $PID } | Select-Object -First 1", _
+        "    if (!$helper) { throw 'Could not identify the current cleanup process.' }", _
+        "    $launcherPid = [int]$helper.ParentProcessId", _
+        "    $launcher = $all | Where-Object { [int]$_.ProcessId -eq $launcherPid } | Select-Object -First 1", _
+        "    if (!$launcher) { throw 'Could not identify the current HarvHub launcher process.' }", _
+        "    $launchTime = [datetime]$launcher.CreationDate", _
+        "    $protectedIds = New-Object 'System.Collections.Generic.HashSet[int]'", _
+        "    [void]$protectedIds.Add($launcherPid)", _
+        "    $launcherParent = $all | Where-Object { [int]$_.ProcessId -eq [int]$launcher.ParentProcessId } | Select-Object -First 1", _
+        "    if ($launcherParent -and ([string]$launcherParent.Name -match '^(wscript|cscript)\.exe$')) { [void]$protectedIds.Add([int]$launcherParent.ProcessId) }", _
+        "    $processById = @{}", _
+        "    foreach ($proc in $all) { $processById[[int]$proc.ProcessId] = $proc }", _
+        "    $rootIds = New-Object 'System.Collections.Generic.HashSet[int]'", _
+        "    foreach ($proc in $all) {", _
+        "        $procId = [int]$proc.ProcessId", _
+        "        if ($protectedIds.Contains($procId)) { continue }", _
+        "        $name = ([string]$proc.Name).ToLowerInvariant()", _
+        "        $cmd = [string]$proc.CommandLine", _
+        "        $isHarvHub = $false", _
+        "        if ($name -eq 'harvhubai.exe') { $isHarvHub = $true }", _
+        "        elseif (($name -eq 'wscript.exe' -or $name -eq 'cscript.exe') -and $cmd -match '(?i)(HarvHubAI|Build_HarvHubProgram)\.vbs') { $isHarvHub = $true }", _
+        "        elseif ($name -eq 'powershell.exe' -and $cmd -match '(?i)(visible_bootstrap\.ps1|console_first_bootstrap\.ps1)') { $isHarvHub = $true }", _
+        "        elseif ($name -eq 'cmd.exe' -and $cmd -match '(?i)HarvHubAI_First_Time_Setup\.cmd') { $isHarvHub = $true }", _
+        "        elseif (($name -eq 'python.exe' -or $name -eq 'pythonw.exe') -and $cmd -match '(?i)(Build_HarvHubProgram\.pyw|mysqlremote\.py|brokerdetails\.py|brokercharts\.py|programme_training\.py|programmesignals_trading\.py|signals_provision_challenge\.py)') { $isHarvHub = $true }", _
+        "        elseif ($name -match '^python-3\..*-amd64\.exe$' -and $cmd -match '(?i)HarvHubAI\\Bootstrap') { $isHarvHub = $true }", _
+        "        if (!$isHarvHub) { continue }", _
+        "        $older = $false", _
+        "        try {", _
+        "            $started = [datetime]$proc.CreationDate", _
+        "            if ($started -le $launchTime) { $older = $true }", _
+        "        } catch { $older = $true }", _
+        "        if ($older) { [void]$rootIds.Add($procId) }", _
+        "    }", _
+        "    $targetIds = New-Object 'System.Collections.Generic.HashSet[int]'", _
+        "    foreach ($id in $rootIds) { [void]$targetIds.Add([int]$id) }", _
+        "    $changed = $true", _
+        "    while ($changed) {", _
+        "        $changed = $false", _
+        "        foreach ($proc in $all) {", _
+        "            $procId = [int]$proc.ProcessId", _
+        "            $parentId = [int]$proc.ParentProcessId", _
+        "            if (!$protectedIds.Contains($procId) -and !$targetIds.Contains($procId) -and $targetIds.Contains($parentId)) {", _
+        "                [void]$targetIds.Add($procId); $changed = $true", _
+        "            }", _
+        "        }", _
+        "    }", _
+        "    $targets = @($all | Where-Object { $targetIds.Contains([int]$_.ProcessId) })", _
+        "    $depthById = @{}", _
+        "    foreach ($proc in $targets) {", _
+        "        $depth = 0; $parentId = [int]$proc.ParentProcessId", _
+        "        while ($targetIds.Contains($parentId) -and $depth -lt 64) {", _
+        "            $depth++", _
+        "            if (!$processById.ContainsKey($parentId)) { break }", _
+        "            $parentId = [int]$processById[$parentId].ParentProcessId", _
+        "        }", _
+        "        $depthById[[int]$proc.ProcessId] = $depth", _
+        "    }", _
+        "    $ordered = @($targets | Sort-Object -Property @{ Expression = { $depthById[[int]$_.ProcessId] }; Descending = $true })", _
+        "    foreach ($proc in $ordered) {", _
+        "        try {", _
+        "            Stop-Process -Id ([int]$proc.ProcessId) -Force -ErrorAction Stop", _
+        "            Add-CleanupLog ('Stopped older HarvHub process: ' + $proc.Name + ' (PID ' + $proc.ProcessId + ')')", _
+        "        } catch {", _
+        "            $stillThere = Get-Process -Id ([int]$proc.ProcessId) -ErrorAction SilentlyContinue", _
+        "            if ($stillThere) { Add-CleanupLog ('ERROR stopping ' + $proc.Name + ' (PID ' + $proc.ProcessId + '): ' + $_.Exception.Message) }", _
+        "        }", _
+        "    }", _
+        "    $deadline = (Get-Date).AddSeconds(12)", _
+        "    do {", _
+        "        $remaining = @(Get-CimInstance -ClassName Win32_Process | Where-Object { $targetIds.Contains([int]$_.ProcessId) })", _
+        "        if ($remaining.Count -eq 0) { break }", _
+        "        Start-Sleep -Milliseconds 250", _
+        "    } while ((Get-Date) -lt $deadline)", _
+        "    if ($remaining.Count -gt 0) {", _
+        "        $details = ($remaining | ForEach-Object { $_.Name + ' (PID ' + $_.ProcessId + ')' }) -join ', '", _
+        "        throw ('Could not close all older HarvHub processes: ' + $details)", _
+        "    }", _
+        "    foreach ($stale in @('project_root.txt','pythonw_path.txt','bootstrap_error.txt')) {", _
+        "        $stalePath = Join-Path $cacheRoot $stale", _
+        "        if (Test-Path -LiteralPath $stalePath) { Remove-Item -LiteralPath $stalePath -Force -ErrorAction SilentlyContinue }", _
+        "    }", _
+        "    Get-ChildItem -LiteralPath $cacheRoot -Filter 'HarvHubAI-*.zip' -File -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue", _
+        "    Add-CleanupLog ('Cleanup completed. Stopped ' + $targets.Count + ' older HarvHub process(es); current launcher PID ' + $launcherPid + ' is retained.')", _
+        "    exit 0", _
+        "} catch {", _
+        "    Add-CleanupLog ('FATAL: ' + ($_ | Out-String).Trim())", _
+        "    exit 1", _
+        "}" _
+    ), vbCrLf)
+
+    Set helperFile = fso.CreateTextFile(helperPath, True, False)
+    helperFile.Write helperScript
+    helperFile.Close
+
+    cleanupExit = sh.Run("powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File """ & helperPath & """", 0, True)
+    On Error Resume Next
+    If fso.FileExists(helperPath) Then fso.DeleteFile helperPath, True
+    On Error GoTo 0
+
+    If cleanupExit <> 0 Then
+        MsgBox "HarvHub AI could not stop all earlier HarvHub setup, manager, build, or service processes. Setup has been stopped to prevent two instances from using the same files." & vbCrLf & vbCrLf & "Review: " & fso.BuildPath(cacheRoot, "process_cleanup.log"), vbCritical, "HarvHub AI process cleanup"
+        WScript.Quit 13
+    End If
+End Sub
+
 Function IsAdministrator()
     Dim result
     result = sh.Run("powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden -Command ""$p=New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent()); if($p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){exit 0}else{exit 1}""", 0, True)
     IsAdministrator = (result = 0)
 End Function
 
+' Retained for compatibility with older launcher copies; startup now force-cleans older HarvHub processes.
 Function IsInstalledHarvHubRunning(ByVal targetPath)
     Dim wmi, processes, proc, executablePath, commandLine, processName, workerNames, workerName
     IsInstalledHarvHubRunning = False
