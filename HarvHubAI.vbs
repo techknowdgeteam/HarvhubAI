@@ -2,8 +2,8 @@ Option Explicit
 
 Dim fso, sh, shellApp, processEnv, localAppData, installRoot, cacheRoot
 Dim psScriptPath, markerPath, pythonMarkerPath, psFile, psExit, projectRoot
-Dim pythonwPath, builderScript, adminResult, appRunning, clickedVbs
-Dim consolePSPath, consoleCmdPath, consoleFile, cmdFile, consoleExit, pythonAvailable
+Dim pythonwPath, pythonExePath, builderScript, adminResult, appRunning, clickedVbs
+Dim visibleCmdPath, visibleCmdFile, builderCmdPath, builderCmdFile, builderExit
 
 Set fso = CreateObject("Scripting.FileSystemObject")
 Set sh = CreateObject("WScript.Shell")
@@ -15,8 +15,8 @@ cacheRoot = fso.BuildPath(localAppData, "HarvHubAI\Bootstrap")
 psScriptPath = fso.BuildPath(cacheRoot, "visible_bootstrap.ps1")
 markerPath = fso.BuildPath(cacheRoot, "project_root.txt")
 pythonMarkerPath = fso.BuildPath(cacheRoot, "pythonw_path.txt")
-consolePSPath = fso.BuildPath(cacheRoot, "console_first_bootstrap.ps1")
-consoleCmdPath = fso.BuildPath(cacheRoot, "HarvHubAI_First_Time_Setup.cmd")
+visibleCmdPath = fso.BuildPath(cacheRoot, "HarvHubAI_Visible_Installer.cmd")
+builderCmdPath = fso.BuildPath(cacheRoot, "HarvHubAI_Visible_Build.cmd")
 clickedVbs = WScript.ScriptFullName
 
 ' Elevate before downloading so the visible installer is not restarted midway.
@@ -30,42 +30,45 @@ End If
 ' Unrelated Windows applications and system processes are never targeted.
 Call EnsureFolderTree(cacheRoot)
 Call StopExistingHarvHubProcesses()
+
+' Always open the visible Windows Forms installer, regardless of whether Python
+' is already installed. A visible CMD host is kept underneath it so PowerShell
+' startup/parse errors are readable and remain on screen instead of disappearing.
 Set processEnv = sh.Environment("PROCESS")
 processEnv("HARVHUBAI_CLICKED_VBS") = clickedVbs
 
-' The bootstrap is independent of Python. Use the visible GUI bootstrap when a
-' compatible Python/Tk runtime already exists. On a fresh VPS, use a visible CMD
-' window so no Python-powered UI is required before Python has been installed.
-pythonAvailable = HasCompatiblePython()
-If Not pythonAvailable Then
-    Set consoleFile = fso.CreateTextFile(consolePSPath, True, False)
-    consoleFile.Write ConsoleBootstrapPowerShell()
-    consoleFile.Close
+Set psFile = fso.CreateTextFile(psScriptPath, True, False)
+psFile.Write BootstrapPowerShell()
+psFile.Close
 
-    Set cmdFile = fso.CreateTextFile(consoleCmdPath, True, False)
-    cmdFile.WriteLine "@echo off"
-    cmdFile.WriteLine "title HarvHub AI - First-Time Setup"
-    cmdFile.WriteLine "color 0E"
-    cmdFile.WriteLine "echo."
-    cmdFile.WriteLine "echo  HARVHUB AI - FIRST-TIME VPS BOOTSTRAP"
-    cmdFile.WriteLine "echo  Downloading GitHub files and preparing Python before opening the desktop installer."
-    cmdFile.WriteLine "echo."
-    cmdFile.WriteLine "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File """ & consolePSPath & """"
-    cmdFile.WriteLine "set BOOTSTRAP_EXIT=%ERRORLEVEL%"
-    cmdFile.WriteLine "if not ""%BOOTSTRAP_EXIT%""==""0"" (echo. & echo HarvHub AI bootstrap failed with exit code %BOOTSTRAP_EXIT%. & echo Review the error above. & pause & exit /b %BOOTSTRAP_EXIT%)"
-    cmdFile.WriteLine "echo."
-    cmdFile.WriteLine "echo Python and the GitHub source are verified. Returning to HarvHub AI..."
-    cmdFile.Close
+Set visibleCmdFile = fso.CreateTextFile(visibleCmdPath, True, False)
+visibleCmdFile.WriteLine "@echo off"
+visibleCmdFile.WriteLine "title HarvHub AI - Visible Installer Bootstrap"
+visibleCmdFile.WriteLine "color 0E"
+visibleCmdFile.WriteLine "echo."
+visibleCmdFile.WriteLine "echo  HARVHUB AI - INSTALLER STARTUP"
+visibleCmdFile.WriteLine "echo  This window remains visible for diagnostics while the installer opens."
+visibleCmdFile.WriteLine "echo."
+visibleCmdFile.WriteLine "powershell.exe -NoLogo -NoProfile -STA -ExecutionPolicy Bypass -File """ & psScriptPath & """"
+visibleCmdFile.WriteLine "set ""BOOTSTRAP_EXIT=%ERRORLEVEL%"""
+visibleCmdFile.WriteLine "if not ""%BOOTSTRAP_EXIT%""==""0"" ("
+visibleCmdFile.WriteLine "  echo."
+visibleCmdFile.WriteLine "  echo  ERROR: The HarvHub visual bootstrap exited with code %BOOTSTRAP_EXIT%."
+visibleCmdFile.WriteLine "  echo  The PowerShell error output above explains why the installer did not open."
+visibleCmdFile.WriteLine "  echo."
+visibleCmdFile.WriteLine "  pause"
+visibleCmdFile.WriteLine "  exit /b %BOOTSTRAP_EXIT%"
+visibleCmdFile.WriteLine ")"
+visibleCmdFile.WriteLine "exit /b 0"
+visibleCmdFile.Close
 
-    consoleExit = sh.Run("cmd.exe /d /c """ & consoleCmdPath & """", 1, True)
-    If consoleExit <> 0 Then WScript.Quit consoleExit
-Else
-    Set psFile = fso.CreateTextFile(psScriptPath, True, False)
-    psFile.Write BootstrapPowerShell()
-    psFile.Close
-    ' Only the PowerShell console is hidden; the WinForms HarvHub AI installer is visible.
-    psExit = sh.Run("powershell.exe -NoLogo -NoProfile -STA -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File """ & psScriptPath & """", 0, True)
-    If psExit <> 0 Then WScript.Quit psExit
+psExit = sh.Run("cmd.exe /d /c """ & visibleCmdPath & """", 1, True)
+On Error Resume Next
+If fso.FileExists(visibleCmdPath) Then fso.DeleteFile visibleCmdPath, True
+On Error GoTo 0
+If psExit <> 0 Then
+    MsgBox "HarvHub AI setup could not complete its visible bootstrap. The diagnostic CMD window displayed the exact error.", vbCritical, "HarvHub AI bootstrap"
+    WScript.Quit psExit
 End If
 
 projectRoot = Trim(ReadAllText(markerPath))
@@ -86,100 +89,42 @@ If Not fso.FileExists(builderScript) Then
 End If
 
 Call EnsureFolderTree(installRoot)
+pythonExePath = fso.BuildPath(fso.GetParentFolderName(pythonwPath), "python.exe")
+If Not fso.FileExists(pythonExePath) Then
+    MsgBox "The matching python.exe console runtime was not found beside pythonw.exe: " & pythonExePath, vbCritical, "HarvHub AI build startup"
+    WScript.Quit 14
+End If
+
 processEnv("HARVHUBAI_SOURCE_ROOT") = projectRoot
 processEnv("HARVHUBAI_ROOT") = installRoot
 processEnv("HARVHUBAI_BOOTSTRAPPED") = "1"
 processEnv("HARVHUBAI_GITHUB_BOOTSTRAPPED") = "1"
-sh.Run """" & pythonwPath & """ """ & builderScript & """ --install --force-rebuild", 0, False
+
+' Start the builder through python.exe (not pythonw.exe). The Tk build window
+' remains the main UI, and this console exposes Python tracebacks/startup errors.
+' If the builder exits unexpectedly, the CMD wrapper pauses and keeps the error visible.
+Set builderCmdFile = fso.CreateTextFile(builderCmdPath, True, False)
+builderCmdFile.WriteLine "@echo off"
+builderCmdFile.WriteLine "title HarvHub AI - Build and Installation"
+builderCmdFile.WriteLine "color 0E"
+builderCmdFile.WriteLine "echo."
+builderCmdFile.WriteLine "echo  HARVHUB AI - BUILD AND INSTALLATION"
+builderCmdFile.WriteLine "echo  The HarvHub build window should now appear. This console shows diagnostics."
+builderCmdFile.WriteLine "echo."
+builderCmdFile.WriteLine """" & pythonExePath & """" & " " & """" & builderScript & """" & " --install --force-rebuild"
+builderCmdFile.WriteLine "set ""BUILDER_EXIT=%ERRORLEVEL%"""
+builderCmdFile.WriteLine "if not ""%BUILDER_EXIT%""==""0"" ("
+builderCmdFile.WriteLine "  echo."
+builderCmdFile.WriteLine "  echo  ERROR: HarvHub AI builder exited with code %BUILDER_EXIT%."
+builderCmdFile.WriteLine "  echo  Read the Python traceback or error above."
+builderCmdFile.WriteLine "  pause"
+builderCmdFile.WriteLine "  exit /b %BUILDER_EXIT%"
+builderCmdFile.WriteLine ")"
+builderCmdFile.WriteLine "exit /b 0"
+builderCmdFile.Close
+
+builderExit = sh.Run("cmd.exe /d /c """ & builderCmdPath & """", 1, False)
 WScript.Quit 0
-
-Function HasCompatiblePython()
-    Dim command, result
-    command = "powershell.exe -NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -Command ""$ErrorActionPreference='SilentlyContinue'; $bases=@((Join-Path $env:LOCALAPPDATA 'Programs\Python'),$env:ProgramFiles); $versions=@('Python313','Python312','Python311','Python310','Python314'); $candidates=@(); foreach($base in $bases){ if(!$base){continue}; foreach($version in $versions){$candidates += (Join-Path (Join-Path $base $version) 'python.exe')} }; $cmd=Get-Command python.exe -ErrorAction SilentlyContinue; if($cmd){$candidates += $cmd.Source}; foreach($py in ($candidates | Select-Object -Unique)){if(Test-Path -LiteralPath $py){$out=& $py -c 'import sys,struct,tkinter; print(sys.version_info.major,sys.version_info.minor,struct.calcsize(chr(80))*8)' 2>$null; if($LASTEXITCODE -eq 0 -and (($out -join ' ').Trim() -match '^3\s+13\s+64$')){exit 0}}}; exit 1"""
-    result = sh.Run(command, 0, True)
-    HasCompatiblePython = (result = 0)
-End Function
-
-Function ConsoleBootstrapPowerShell()
-    ConsoleBootstrapPowerShell = Join(Array( _
-        "$ErrorActionPreference = 'Stop'", _
-        "$ProgressPreference = 'SilentlyContinue'", _
-        "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12", _
-        "$cacheRoot = Join-Path $env:LOCALAPPDATA 'HarvHubAI\Bootstrap'", _
-        "$extractRoot = Join-Path $cacheRoot 'source'", _
-        "$zipPath = Join-Path $cacheRoot ('HarvHubAI-' + $PID + '-' + [Guid]::NewGuid().ToString('N') + '.zip')", _
-        "$markerPath = Join-Path $cacheRoot 'project_root.txt'", _
-        "$pythonMarkerPath = Join-Path $cacheRoot 'pythonw_path.txt'", _
-        "$clickedVbs = $env:HARVHUBAI_CLICKED_VBS", _
-        "New-Item -ItemType Directory -Path $cacheRoot -Force | Out-Null", _
-        "function Write-Step([string]$Message) { Write-Host ('[' + (Get-Date -Format 'HH:mm:ss') + '] ' + $Message) -ForegroundColor Yellow }", _
-        "function Download-ToFile([string]$Url,[string]$Destination,[string]$Label) {", _
-        "  Write-Step ('Downloading ' + $Label + '...')", _
-        "  $request = [System.Net.HttpWebRequest]::Create($Url); $request.Method='GET'; $request.UserAgent='HarvHubAI-Installer'; $request.Timeout=120000; $request.ReadWriteTimeout=120000; $request.AllowAutoRedirect=$true", _
-        "  $response=$request.GetResponse(); $inputStream=$response.GetResponseStream(); $outputStream=[System.IO.File]::Open($Destination,[System.IO.FileMode]::CreateNew,[System.IO.FileAccess]::Write,[System.IO.FileShare]::None); $total=[long]$response.ContentLength; [long]$done=0; $buffer=New-Object byte[] 65536", _
-        "  try { while(($count=$inputStream.Read($buffer,0,$buffer.Length)) -gt 0) { $outputStream.Write($buffer,0,$count); $done += $count; if($total -gt 0){$pct=[int][Math]::Min(100,($done*100.0/$total)); Write-Progress -Activity $Label -Status ($pct.ToString() + '%') -PercentComplete $pct } else { Write-Progress -Activity $Label -Status ('Downloaded ' + [Math]::Round($done/1MB,1) + ' MB') } } } finally { $outputStream.Dispose(); $inputStream.Dispose(); $response.Dispose() }", _
-        "  if(!(Test-Path -LiteralPath $Destination) -or (Get-Item -LiteralPath $Destination).Length -lt 10240){throw ($Label + ' download is empty or incomplete.')}; Write-Progress -Activity $Label -Completed", _
-        "}", _
-        "function Find-CompatiblePython {", _
-        "  $bases=@((Join-Path $env:LOCALAPPDATA 'Programs\Python'),$env:ProgramFiles); $versions=@('Python313','Python312','Python311','Python310','Python314'); $candidates=@()", _
-        "  foreach($base in $bases){if(!$base){continue}; foreach($version in $versions){$candidates += (Join-Path (Join-Path $base $version) 'python.exe')}}", _
-        "  $cmd=Get-Command python.exe -ErrorAction SilentlyContinue; if($cmd){$candidates += $cmd.Source}", _
-        "  foreach($py in ($candidates | Select-Object -Unique)){if(Test-Path -LiteralPath $py){try{$out=& $py -c 'import sys,struct,tkinter; print(sys.version_info.major,sys.version_info.minor,struct.calcsize(chr(80))*8)' 2>$null; if($LASTEXITCODE -eq 0 -and (($out -join ' ').Trim() -match '^3\s+13\s+64$')){return $py}}catch{}}}; return $null", _
-        "}", _
-        "try {", _
-        "  Write-Host ''; Write-Host 'HARVHUB AI - FIRST-TIME VPS SETUP' -ForegroundColor Cyan; Write-Host 'This CMD stage does not require Python.' -ForegroundColor Gray; Write-Host ''", _
-        "  Remove-Item -LiteralPath $markerPath,$pythonMarkerPath -Force -ErrorAction SilentlyContinue; Remove-Item -LiteralPath $zipPath -Force -ErrorAction SilentlyContinue", _
-        "  if(Test-Path -LiteralPath $extractRoot){Remove-Item -LiteralPath $extractRoot -Recurse -Force}; New-Item -ItemType Directory -Path $extractRoot -Force | Out-Null", _
-        "  Write-Step 'Step 1 of 4: Downloading the latest GitHub repository ZIP.'", _
-        "  $githubUrl='https://github.com/techknowdgeteam/HarvhubAI/archive/refs/heads/main.zip'; Download-ToFile $githubUrl $zipPath 'HarvHub AI GitHub ZIP'", _
-        "  Write-Step 'Step 2 of 4: Extracting and validating the repository.'", _
-        "  Add-Type -AssemblyName System.IO.Compression.FileSystem; $archive=[System.IO.Compression.ZipFile]::OpenRead($zipPath); try{if($archive.Entries.Count -lt 5){throw 'The GitHub ZIP contains too few files.'}}finally{$archive.Dispose()}; [System.IO.Compression.ZipFile]::ExtractToDirectory($zipPath,$extractRoot); Remove-Item -LiteralPath $zipPath -Force -ErrorAction SilentlyContinue", _
-        "  $builder=Get-ChildItem -LiteralPath $extractRoot -Recurse -File -Filter 'Build_HarvHubProgram.pyw' | Select-Object -First 1; if(!$builder){throw 'GitHub repository is missing Build_HarvHubProgram.pyw.'}; $project=$builder.Directory.FullName", _
-        "  $manager=Join-Path $project 'harvcore_manager.py'; if(!(Test-Path -LiteralPath $manager)){throw 'GitHub repository is missing harvcore_manager.py.'}; $payload=Join-Path $project 'payload'; New-Item -ItemType Directory -Path $payload -Force | Out-Null", _
-        "  $sourceNames=@('mysqlremote.py','brokerdetails.py','brokercharts.py','programme_training.py','programmesignals_trading.py','signals_provision_challenge.py','ip.py','notification_email.py','notification_service.py','harvhub_ipc.py')", _
-        "  foreach($name in $sourceNames) {", _
-        "    $target = Join-Path $payload $name", _
-        "    $base = [System.IO.Path]::GetFileNameWithoutExtension($name)", _
-        "    $ext = [System.IO.Path]::GetExtension($name)", _
-        "    $pattern = '^' + [regex]::Escape($base) + '(?:\s*\([^)]*\))?$'", _
-        "    $rootSource = Get-ChildItem -LiteralPath $project -File | Where-Object { $_.Extension -ieq $ext -and ($_.BaseName -ieq $base -or $_.BaseName -match $pattern) } | Sort-Object @{Expression={if($_.Name -ieq $name){0}else{1}}},FullName | Select-Object -First 1", _
-        "    if ($rootSource) { Copy-Item -LiteralPath $rootSource.FullName -Destination $target -Force }", _
-        "    elseif (!(Test-Path -LiteralPath $target)) {", _
-        "      $found = Get-ChildItem -LiteralPath $project -Recurse -File | Where-Object { $_.Extension -ieq $ext -and ($_.BaseName -ieq $base -or $_.BaseName -match $pattern) -and $_.FullName -notmatch '\\\\(build|release|dist|\\.build-venv|\\.git)\\\\' } | Sort-Object @{Expression={if($_.Name -ieq $name){0}else{1}}},FullName | Select-Object -First 1", _
-        "      if (!$found) { throw ('Required Python source is missing: ' + $name) }", _
-        "      Copy-Item -LiteralPath $found.FullName -Destination $target -Force", _
-        "    }", _
-        "    if (!(Test-Path -LiteralPath $target) -or (Get-Item -LiteralPath $target).Length -lt 100) { throw ('Python source is incomplete: ' + $name) }", _
-        "  }", _
-        "  $requirements=Join-Path $payload 'requirements-runtime.txt'; if(!(Test-Path -LiteralPath $requirements)){$requiredText=@('# HarvHub AI runtime requirements','MetaTrader5','pytz','tzdata','requests','urllib3','certifi','selenium','beautifulsoup4','webdriver-manager') -join [Environment]::NewLine; [IO.File]::WriteAllText($requirements,$requiredText,[Text.Encoding]::ASCII)}", _
-        "  if(!$clickedVbs -or !(Test-Path -LiteralPath $clickedVbs)){throw 'The standalone HarvHubAI.vbs file is no longer accessible.'}; Copy-Item -LiteralPath $clickedVbs -Destination (Join-Path $project 'HarvHubAI.vbs') -Force; Copy-Item -LiteralPath $clickedVbs -Destination (Join-Path $project 'Build_HarvHubProgram.vbs') -Force", _
-        "  foreach($required in @('Build_HarvHubProgram.pyw','harvcore_manager.py','HarvHubAI.vbs','Build_HarvHubProgram.vbs')){if(!(Test-Path -LiteralPath (Join-Path $project $required))){throw ('Required installer file is missing: '+$required)}}", _
-        "  [IO.File]::WriteAllText($markerPath,$project,[Text.Encoding]::Unicode); Write-Step 'GitHub archive extracted and all ten Python source files validated.'", _
-        "  Write-Step 'Step 3 of 4: Checking for a compatible 64-bit Python runtime with Tkinter.'", _
-        "  $python=Find-CompatiblePython", _
-        "  if (!$python) {", _
-        "    Write-Step 'Python not found. Downloading verified Python 3.13.17 x64.'", _
-        "    $pythonInstaller = Join-Path $cacheRoot 'python-3.13.17-amd64.exe'", _
-        "    $pythonUrl = 'https://www.python.org/ftp/python/3.13.17/python-3.13.17-amd64.exe'", _
-        "    Download-ToFile $pythonUrl $pythonInstaller 'Python 3.13.17 x64'", _
-        "    $expected = '5da012101ba2e17113a9a1cd901e9ce1441086f2b7ecb5de06ec94163899a190'", _
-        "    $actual = (Get-FileHash -LiteralPath $pythonInstaller -Algorithm SHA256).Hash.ToLowerInvariant()", _
-        "    if ($actual -ne $expected) { throw 'Python installer SHA-256 verification failed.' }", _
-        "    $sig = Get-AuthenticodeSignature -FilePath $pythonInstaller", _
-        "    if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'Python Software Foundation') { throw ('Python installer signature verification failed: ' + $sig.Status + ' ' + $sig.SignerCertificate.Subject) }", _
-        "    $targetPython = Join-Path $env:LOCALAPPDATA 'Programs\Python\Python313'", _
-        "    $pythonArgs = '/quiet InstallAllUsers=0 Include_launcher=1 Include_tcltk=1 Include_pip=1 Include_test=0 Shortcuts=0 PrependPath=0 AssociateFiles=0 TargetDir=""' + $targetPython + '""'", _
-        "    $installerProcess = Start-Process -FilePath $pythonInstaller -ArgumentList $pythonArgs -PassThru -Wait", _
-        "    if ($installerProcess.ExitCode -notin @(0,3010)) { throw ('Python installer failed with exit code ' + $installerProcess.ExitCode) }", _
-        "    $python = Join-Path $targetPython 'python.exe'", _
-        "  }", _
-        "  if(!(Test-Path -LiteralPath $python)){throw ('Python executable was not found after setup: '+$python)}; $test=& $python -c 'import sys,struct,tkinter; print(sys.version_info.major,sys.version_info.minor,struct.calcsize(chr(80))*8)' 2>$null; if($LASTEXITCODE -ne 0 -or (($test -join ' ').Trim() -notmatch '^3\s+13\s+64$')){throw 'Python failed the 64-bit and Tkinter runtime check.'}", _
-        "  $pythonw=Join-Path (Split-Path -Parent $python) 'pythonw.exe'; if(!(Test-Path -LiteralPath $pythonw)){throw 'pythonw.exe is missing; Tk desktop support is unavailable.'}; [IO.File]::WriteAllText($pythonMarkerPath,$pythonw,[Text.Encoding]::Unicode)", _
-        "  Write-Step ('Python runtime verified: '+$python); Write-Step 'Step 4 of 4: GitHub source and Python are ready.'; Write-Host ''; Write-Host 'Bootstrap complete. HarvHub AI desktop build window will now open.' -ForegroundColor Green", _
-        "  exit 0", _
-        "} catch { Write-Host ''; Write-Host ('HARVHUB AI BOOTSTRAP FAILED: '+($_ | Out-String).Trim()) -ForegroundColor Red; exit 1 }" _
-    ), vbCrLf)
-End Function
 
 Function BootstrapPowerShell()
     BootstrapPowerShell = BootstrapPartA() & vbCrLf & BootstrapPartB()
@@ -739,8 +684,9 @@ End Function
 
 
 Sub StopExistingHarvHubProcesses()
-    Dim helperPath, helperFile, helperScript, cleanupExit
+    Dim helperPath, helperFile, helperScript, cleanupExit, cleanupCmdPath, cleanupCmdFile
     helperPath = fso.BuildPath(cacheRoot, "cleanup_" & Replace(fso.GetTempName(), ".tmp", "") & ".ps1")
+    cleanupCmdPath = fso.BuildPath(cacheRoot, "cleanup_" & Replace(fso.GetTempName(), ".tmp", "") & ".cmd")
 
     helperScript = Join(Array( _
         "$ErrorActionPreference = 'Stop'", _
@@ -748,6 +694,7 @@ Sub StopExistingHarvHubProcesses()
         "$logPath = Join-Path $cacheRoot 'process_cleanup.log'", _
         "New-Item -ItemType Directory -Path $cacheRoot -Force | Out-Null", _
         "function Add-CleanupLog([string]$Message) { Add-Content -LiteralPath $logPath -Value ('[' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') + '] ' + $Message) -Encoding UTF8 }", _
+        "Write-Host '[HarvHub AI] Scanning for earlier HarvHub setup, manager, builder, and service processes...' -ForegroundColor Cyan", _
         "try {", _
         "    $all = @(Get-CimInstance -ClassName Win32_Process)", _
         "    $helper = $all | Where-Object { [int]$_.ProcessId -eq $PID } | Select-Object -First 1", _
@@ -771,8 +718,8 @@ Sub StopExistingHarvHubProcesses()
         "        $isHarvHub = $false", _
         "        if ($name -eq 'harvhubai.exe') { $isHarvHub = $true }", _
         "        elseif (($name -eq 'wscript.exe' -or $name -eq 'cscript.exe') -and $cmd -match '(?i)(HarvHubAI|Build_HarvHubProgram)\.vbs') { $isHarvHub = $true }", _
-        "        elseif ($name -eq 'powershell.exe' -and $cmd -match '(?i)(visible_bootstrap\.ps1|console_first_bootstrap\.ps1)') { $isHarvHub = $true }", _
-        "        elseif ($name -eq 'cmd.exe' -and $cmd -match '(?i)HarvHubAI_First_Time_Setup\.cmd') { $isHarvHub = $true }", _
+        "        elseif ($name -eq 'powershell.exe' -and $cmd -match '(?i)(visible_bootstrap\.ps1|console_first_bootstrap\.ps1|cleanup_[^\\]*\.ps1)') { $isHarvHub = $true }", _
+        "        elseif ($name -eq 'cmd.exe' -and $cmd -match '(?i)(HarvHubAI_First_Time_Setup\.cmd|HarvHubAI_Visible_(Installer|Build)\.cmd|cleanup_[^\\]*\.cmd)') { $isHarvHub = $true }", _
         "        elseif (($name -eq 'python.exe' -or $name -eq 'pythonw.exe') -and $cmd -match '(?i)(Build_HarvHubProgram\.pyw|mysqlremote\.py|brokerdetails\.py|brokercharts\.py|programme_training\.py|programmesignals_trading\.py|signals_provision_challenge\.py)') { $isHarvHub = $true }", _
         "        elseif ($name -match '^python-3\..*-amd64\.exe$' -and $cmd -match '(?i)HarvHubAI\\Bootstrap') { $isHarvHub = $true }", _
         "        if (!$isHarvHub) { continue }", _
@@ -797,6 +744,7 @@ Sub StopExistingHarvHubProcesses()
         "        }", _
         "    }", _
         "    $targets = @($all | Where-Object { $targetIds.Contains([int]$_.ProcessId) })", _
+        "    Write-Host ('[HarvHub AI] Found ' + $targets.Count + ' older HarvHub process(es) to stop.') -ForegroundColor Yellow", _
         "    $depthById = @{}", _
         "    foreach ($proc in $targets) {", _
         "        $depth = 0; $parentId = [int]$proc.ParentProcessId", _
@@ -810,8 +758,10 @@ Sub StopExistingHarvHubProcesses()
         "    $ordered = @($targets | Sort-Object -Property @{ Expression = { $depthById[[int]$_.ProcessId] }; Descending = $true })", _
         "    foreach ($proc in $ordered) {", _
         "        try {", _
+        "            Write-Host ('[HarvHub AI] Stopping ' + $proc.Name + ' (PID ' + $proc.ProcessId + ')...')", _
         "            Stop-Process -Id ([int]$proc.ProcessId) -Force -ErrorAction Stop", _
         "            Add-CleanupLog ('Stopped older HarvHub process: ' + $proc.Name + ' (PID ' + $proc.ProcessId + ')')", _
+        "            Write-Host ('[HarvHub AI] Stopped ' + $proc.Name + ' (PID ' + $proc.ProcessId + ').') -ForegroundColor Green", _
         "        } catch {", _
         "            $stillThere = Get-Process -Id ([int]$proc.ProcessId) -ErrorAction SilentlyContinue", _
         "            if ($stillThere) { Add-CleanupLog ('ERROR stopping ' + $proc.Name + ' (PID ' + $proc.ProcessId + '): ' + $_.Exception.Message) }", _
@@ -833,9 +783,11 @@ Sub StopExistingHarvHubProcesses()
         "    }", _
         "    Get-ChildItem -LiteralPath $cacheRoot -Filter 'HarvHubAI-*.zip' -File -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue", _
         "    Add-CleanupLog ('Cleanup completed. Stopped ' + $targets.Count + ' older HarvHub process(es); current launcher PID ' + $launcherPid + ' is retained.')", _
+        "    Write-Host '[HarvHub AI] Previous HarvHub processes are cleared. Current setup is protected.' -ForegroundColor Green", _
         "    exit 0", _
         "} catch {", _
         "    Add-CleanupLog ('FATAL: ' + ($_ | Out-String).Trim())", _
+        "    Write-Host ('[HarvHub AI] CLEANUP ERROR: ' + ($_ | Out-String).Trim()) -ForegroundColor Red", _
         "    exit 1", _
         "}" _
     ), vbCrLf)
@@ -844,9 +796,33 @@ Sub StopExistingHarvHubProcesses()
     helperFile.Write helperScript
     helperFile.Close
 
-    cleanupExit = sh.Run("powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File """ & helperPath & """", 0, True)
+    Set cleanupCmdFile = fso.CreateTextFile(cleanupCmdPath, True, False)
+    cleanupCmdFile.WriteLine "@echo off"
+    cleanupCmdFile.WriteLine "title HarvHub AI - Previous Process Cleanup"
+    cleanupCmdFile.WriteLine "color 0E"
+    cleanupCmdFile.WriteLine "echo."
+    cleanupCmdFile.WriteLine "echo  HARVHUB AI - SINGLE INSTANCE CHECK"
+    cleanupCmdFile.WriteLine "echo  Older HarvHub processes are being stopped before the new setup starts."
+    cleanupCmdFile.WriteLine "echo."
+    cleanupCmdFile.WriteLine "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File """ & helperPath & """"
+    cleanupCmdFile.WriteLine "set ""CLEANUP_EXIT=%ERRORLEVEL%"""
+    cleanupCmdFile.WriteLine "if not ""%CLEANUP_EXIT%""==""0"" ("
+    cleanupCmdFile.WriteLine "  echo."
+    cleanupCmdFile.WriteLine "  echo  ERROR: Previous HarvHub processes could not all be stopped."
+    cleanupCmdFile.WriteLine "  echo  Cleanup log: """ & fso.BuildPath(cacheRoot, "process_cleanup.log") & """"
+    cleanupCmdFile.WriteLine "  type """ & fso.BuildPath(cacheRoot, "process_cleanup.log") & """"
+    cleanupCmdFile.WriteLine "  pause"
+    cleanupCmdFile.WriteLine "  exit /b %CLEANUP_EXIT%"
+    cleanupCmdFile.WriteLine ")"
+    cleanupCmdFile.WriteLine "echo."
+    cleanupCmdFile.WriteLine "echo  HarvHub single-instance cleanup completed."
+    cleanupCmdFile.WriteLine "exit /b 0"
+    cleanupCmdFile.Close
+
+    cleanupExit = sh.Run("cmd.exe /d /c """ & cleanupCmdPath & """", 1, True)
     On Error Resume Next
     If fso.FileExists(helperPath) Then fso.DeleteFile helperPath, True
+    If fso.FileExists(cleanupCmdPath) Then fso.DeleteFile cleanupCmdPath, True
     On Error GoTo 0
 
     If cleanupExit <> 0 Then
