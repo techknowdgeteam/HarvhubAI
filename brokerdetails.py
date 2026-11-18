@@ -1997,9 +1997,32 @@ class _ManualLoginWindow:
 
     def _send(self, payload):
         if manager_request is None:
-            print("      [MANUAL] HarvHub manager IPC helper is unavailable.", flush=True)
+            print("      [MANUAL][UI ERROR] HarvHub manager IPC helper is unavailable; manual-login request cannot be shown in the manager.", flush=True)
             return None
-        return manager_request(payload, timeout=2.0)
+
+        operation = str(payload.get("op") or "").strip().lower()
+        # Upsert/remove are idempotent, so retry briefly if the manager's local
+        # IPC listener is still binding or momentarily busy. A decision read is
+        # deliberately not retried because it consumes the queued decision.
+        attempts = 3 if operation in {"manual_login_upsert", "manual_login_remove"} else 1
+        response = None
+        for attempt in range(attempts):
+            response = manager_request(payload, timeout=2.0)
+            if isinstance(response, dict) and response.get("ok") is True:
+                return response
+            if attempt + 1 < attempts:
+                time.sleep(0.25 * (attempt + 1))
+
+        item = payload.get("item") if isinstance(payload.get("item"), dict) else {}
+        kind = str(item.get("kind", payload.get("kind", "SA"))).upper()
+        owner = str(item.get("owner_id", payload.get("owner_id", "")))
+        account = str(item.get("account_id", payload.get("account_id", "")))
+        print(
+            f"      [MANUAL][UI ERROR] Manager did not acknowledge {operation or 'manual-login'} "
+            f"for {kind} {account} (owner {owner}); check that HarvHub AI is open and its local control listener is available.",
+            flush=True,
+        )
+        return response
 
     def add_item(self, kind, owner_id, account_id, broker, server,
                  login, password, terminal_exe):
@@ -2018,7 +2041,12 @@ class _ManualLoginWindow:
         store = self._sa_items if kind == "SA" else self._prg_items
         with self._lock:
             store[key] = item
-        self._send({"op": "manual_login_upsert", "item": item})
+        response = self._send({"op": "manual_login_upsert", "item": item})
+        if isinstance(response, dict) and response.get("ok") is True:
+            print(
+                f"      [MANUAL][UI] {kind} {account_id} owner={owner_id} added to HarvHub's manual-login attention list.",
+                flush=True,
+            )
 
     def remove_item(self, kind, owner_id, account_id):
         kind = str(kind).upper()
@@ -3095,15 +3123,18 @@ def main_loop():
     _build_timeframe_map()
     print(f"\n{'#'*70}")
     print("#  brokerdetails — broker login monitoring")
-    print(f"#  started at {datetime.now().isoformat(timespec='seconds')}")
-    print(f"#  execution type: {'loop' if run_as_loop else 'once'} | interval: {loop_interval}s")
+    print(f"#  started at {datetime.now().isoformat(timespec='seconds')}", flush=True)
+    print(f"#  execution type: {'loop' if run_as_loop else 'once'} | interval: {loop_interval}s", flush=True)
     print(f"{'#'*70}")
 
     try:
+        cycle_number = 0
         while True:
+            cycle_number += 1
+            print(f"\n[main] broker login scan #{cycle_number} starting...", flush=True)
             try:
                 result = check_if_broker_is_logged_in()
-                print(f"[main] {result.get('message')}")
+                print(f"[main] scan #{cycle_number} result: {result.get('message')}", flush=True)
             except Exception as e:
                 print(f"[main] check_if_broker_is_logged_in raised: {e}")
                 traceback.print_exc()
@@ -3114,7 +3145,7 @@ def main_loop():
                 # unresolved rows so Valid/Invalid clicks can be applied safely.
                 if not _MANUAL_WINDOW.has_pending_items():
                     break
-                print("[main] Waiting for manual MT5 login decisions in the HarvHub window.")
+                print("[main] Waiting for manual MT5 login decisions in the HarvHub window.", flush=True)
                 while _MANUAL_WINDOW.has_pending_items():
                     time.sleep(float(loop_interval))
                     try:

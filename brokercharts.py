@@ -1349,7 +1349,7 @@ def main_loop():
             except ValueError:
                 pass
     print("\n" + "=" * 60)
-    print("           BROKERCHARTS — PROGRAMME OHLC COLLECTOR")
+    print("           BROKERCHARTS — PROGRAMME OHLC COLLECTOR", flush=True)
     print("=" * 60)
     print(f"  Loop Mode: {'ENABLED' if run_as_loop else 'DISABLED'}")
     if run_as_loop:
@@ -1369,10 +1369,12 @@ def main_loop():
             loop_count += 1
             if run_as_loop:
                 print("\n" + "=" * 60)
-                print(f"LOOP #{loop_count} STARTED")
+                print(f"LOOP #{loop_count} STARTED", flush=True)
                 print("=" * 60)
             try:
+                print(f"[CHARTS] Loop #{loop_count}: querying programme candidates...", flush=True)
                 programmes = _fetch_candidate_programmes()
+                print(f"[CHARTS] Loop #{loop_count}: found {len(programmes)} candidate programme(s).", flush=True)
                 if not programmes:
                     print(" └─ 🔘 No candidate programmes found.")
                     if not run_as_loop:
@@ -1380,7 +1382,7 @@ def main_loop():
                         break
                     time.sleep(loop_interval)
                     continue
-                print(f"📊 Submitting {len(programmes)} programme job(s)")
+                print(f"📊 Submitting {len(programmes)} programme job(s)", flush=True)
                 t0 = time.time()
                 async_jobs = [
                     pool.apply_async(process_programme_job, args=(p,))
@@ -1401,7 +1403,7 @@ def main_loop():
                 total = sum(int((r or {}).get('inserted', 0) or 0)
                             for r in results if r)
                 print(f"--- Cycle complete in {elapsed:.2f}s | "
-                      f"ok={ok}/{len(programmes)} | inserted={total} ---")
+                      f"ok={ok}/{len(programmes)} | inserted={total} ---", flush=True)
             except Exception as e:
                 print(f"Critical error in loop: {e}")
                 traceback.print_exc()

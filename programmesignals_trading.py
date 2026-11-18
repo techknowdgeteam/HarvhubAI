@@ -118,8 +118,8 @@ except Exception:
 # ==============================================================================
 #  REBRANDED MT5 PATHS — must match brokerdetails.py exactly
 # ==============================================================================
-DEFAULT_MT5_PATH     = r"C:\xampp\htdocs\harvhubAI\mt5\MetaTrader 5"
-MT5_DESTINATION_PATH = r"C:\xampp\htdocs\harvhubAI\mt5"
+DEFAULT_MT5_PATH     = r"C:\xampp\htdocs\harvcore\mt5\MetaTrader 5"
+MT5_DESTINATION_PATH = r"C:\xampp\htdocs\harvcore\mt5"
 
 
 # ==============================================================================
@@ -13881,8 +13881,10 @@ def discover_investor_jobs():
 
 
 def main_loop():
-    run_as_loop = False
-    loop_interval = 5
+    # The manager supplies a standard execution-type/interval pair to every
+    # service. Preserve the legacy --loop=... switches for direct callers.
+    run_as_loop = os.environ.get('HARVHUB_EXECUTION_TYPE', 'once').strip().lower() == 'loop'
+    loop_interval = max(1, int(os.environ.get('HARVHUB_LOOP_INTERVAL', '5') or 5))
     max_loops = None
     args = list(sys.argv[1:])
 
@@ -13890,13 +13892,13 @@ def main_loop():
         lower = arg.lower()
         if lower.startswith('--execution-type='):
             run_as_loop = lower.split('=', 1)[1].strip() == 'loop'
-        elif lower in ('--loop', '--loop=true', '--loop=yes', '--loop=1'):
-            run_as_loop = True
-        elif lower in ('--once', '--loop=false', '--loop=no', '--loop=0'):
-            run_as_loop = False
+        elif lower == '--execution-type' and index + 1 < len(args):
+            run_as_loop = args[index + 1].strip().lower() == 'loop'
+        elif lower.startswith('--loop='):
+            run_as_loop = arg.split('=')[1].lower() in ('true', 'yes', '1', 'on')
         elif lower.startswith('--interval='):
             try:
-                loop_interval = max(1, int(lower.split('=', 1)[1]))
+                loop_interval = max(1, int(arg.split('=', 1)[1]))
             except ValueError:
                 pass
         elif lower == '--interval' and index + 1 < len(args):
@@ -13906,12 +13908,12 @@ def main_loop():
                 pass
         elif lower.startswith('--max-loops='):
             try:
-                max_loops = int(lower.split('=', 1)[1])
+                max_loops = int(arg.split('=')[1])
             except ValueError:
                 pass
 
     print("\n" + "=" * 60)
-    print("         PROGRAMMETRADES — PROGRAMME REQUEST + TRADE ORCHESTRATOR")
+    print("         PROGRAMMETRADES — PROGRAMME REQUEST + TRADE ORCHESTRATOR", flush=True)
     print("=" * 60)
     print("  Magic mapping: subaccount-scoped + programme_analytics root/family identity")
     print("  Safety: cross-programme duplicate magic values are excluded from MT5 management")
@@ -13936,17 +13938,19 @@ def main_loop():
             loop_count += 1
             if run_as_loop:
                 print("\n" + "=" * 60)
-                print(f"LOOP #{loop_count} STARTED")
+                print(f"LOOP #{loop_count} STARTED", flush=True)
                 print("=" * 60)
 
             try:
+                print("[ORCHESTRATOR] Discovering active investor jobs from the database bridge...", flush=True)
                 jobs = discover_investor_jobs()
+                print(f"[ORCHESTRATOR] Job discovery complete: {len(jobs)} active investor job(s).", flush=True)
 
                 if not jobs:
-                    print(" └─ 🔘 No active investor jobs returned by DB for this VPS.")
-                    if run_as_loop:
-                        time.sleep(loop_interval)
-                        continue
+                    print(f" └─ 🔘 No active investor jobs returned by DB for "
+                          f"this VPS. Sleeping {loop_interval}s.", flush=True)
+                    time.sleep(loop_interval)
+                    continue
 
                 print(f"📊 Submitting {len(jobs)} investor job(s) "
                       f"via persistent pool")
