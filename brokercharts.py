@@ -56,8 +56,10 @@ For every selected (symbol, timeframe) pair:
      historical backfill to position 0, because that would re-fetch the newest
      bars and create overlap.
   4. Insert every new candle in the page, refresh the latest page, and repeat.
-  5. Stop when MT5 returns an empty page, an API/database error occurs, or
-     the pair reaches 5,000 stored candles.
+  5. Stop when repeated empty responses confirm no more history is available
+     or the pair reaches 5,000 stored candles. Failed API requests retry at the
+     same position with smaller requests; a persistent one-bar error never
+     advances the cursor or silently skips the candle.
 Rows are scoped by programme, symbol, and timeframe. If the pair already
 contains more than 5,000 rows, the oldest rows are deleted first.
 BATCHING
@@ -82,13 +84,18 @@ import struct
 import threading
 import traceback
 import multiprocessing as mp
-from datetime import datetime, timedelta, timezone
+import urllib.request
+from datetime import datetime
 try:
     import pytz
     from zoneinfo import ZoneInfo
 except Exception:
     pytz = None
     ZoneInfo = None
+try:
+    import tzlocal as _tzlocal
+except Exception:
+    _tzlocal = None
 try:
     import MetaTrader5 as mt5
 except Exception:
@@ -390,6 +397,132 @@ def _resolve_timezone(tz_name):
         except Exception:
             pass
     return None
+
+
+_COMPUTER_TIMEZONE_CACHE = None
+_COMPUTER_TIMEZONE_CACHE_AT = 0.0
+_COMPUTER_TIMEZONE_CACHE_SECONDS = 300
+
+def _detect_computer_timezone():
+    """
+    Detect the computer's current network/proxy timezone, then fall back to
+    the computer's configured OS timezone.
+
+    The IP timezone request uses urllib's normal proxy discovery, including
+    active Python/environment or supported system proxy settings. ipapi returns
+    an IANA timezone. If network geolocation is unavailable, tzlocal and the
+    standard-library OS timezone sources are used instead.
+
+    Returns (display_name, tzinfo). The result is cached briefly so a programme
+    loop does not repeatedly call the geolocation service.
+    """
+    global _COMPUTER_TIMEZONE_CACHE, _COMPUTER_TIMEZONE_CACHE_AT
+
+    now_monotonic = time.monotonic()
+    if (
+        _COMPUTER_TIMEZONE_CACHE is not None
+        and now_monotonic - _COMPUTER_TIMEZONE_CACHE_AT < _COMPUTER_TIMEZONE_CACHE_SECONDS
+    ):
+        return _COMPUTER_TIMEZONE_CACHE
+
+    # Resolve the outbound IP first. urllib automatically uses active proxy
+    # settings, so this detects the proxy's egress region when one is configured.
+    try:
+        request = urllib.request.Request(
+            'https://ipapi.co/timezone/',
+            headers={'User-Agent': 'brokercharts/1.0'},
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            network_timezone = response.read(256).decode('utf-8', errors='replace').strip()
+        network_zone = _resolve_timezone(network_timezone)
+        if network_zone is not None:
+            _COMPUTER_TIMEZONE_CACHE = (
+                f'{network_timezone} (proxy/public IP)', network_zone
+            )
+            _COMPUTER_TIMEZONE_CACHE_AT = now_monotonic
+            return _COMPUTER_TIMEZONE_CACHE
+    except Exception as exc:
+        print(f"[CHARTS][TIMEZONE] network/proxy timezone lookup unavailable: {exc}")
+
+    candidates = []
+    native_timezone_name = None
+
+    if _tzlocal is not None:
+        try:
+            getter = getattr(_tzlocal, 'get_localzone_name', None)
+            if callable(getter):
+                name = getter()
+                if name:
+                    candidates.append(str(name).strip())
+        except Exception:
+            pass
+        try:
+            local_zone = _tzlocal.get_localzone()
+            zone_key = getattr(local_zone, 'key', None) or getattr(local_zone, 'zone', None)
+            if zone_key:
+                candidates.append(str(zone_key).strip())
+        except Exception:
+            pass
+
+    env_timezone = os.environ.get('TZ')
+    if env_timezone:
+        candidates.append(env_timezone.strip().lstrip(':'))
+
+    if os.name == 'nt':
+        try:
+            import winreg
+            with winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE,
+                r'SYSTEM\CurrentControlSet\Control\TimeZoneInformation'
+            ) as key:
+                windows_name = winreg.QueryValueEx(key, 'TimeZoneKeyName')[0]
+            if windows_name:
+                native_timezone_name = str(windows_name).strip()
+                candidates.append(native_timezone_name)
+        except Exception:
+            pass
+    else:
+        try:
+            with open('/etc/timezone', 'r', encoding='utf-8') as handle:
+                file_timezone = handle.read().strip()
+            if file_timezone:
+                candidates.append(file_timezone)
+        except Exception:
+            pass
+        try:
+            localtime_path = os.path.realpath('/etc/localtime')
+            marker = os.sep + 'zoneinfo' + os.sep
+            if marker in localtime_path:
+                candidates.append(localtime_path.split(marker, 1)[1])
+        except Exception:
+            pass
+
+    seen = set()
+    for candidate in candidates:
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        zone = _resolve_timezone(candidate)
+        if zone is not None:
+            _COMPUTER_TIMEZONE_CACHE = (candidate, zone)
+            _COMPUTER_TIMEZONE_CACHE_AT = now_monotonic
+            return _COMPUTER_TIMEZONE_CACHE
+
+    # A Windows native timezone name may not be an IANA identifier. The
+    # conversion then uses the operating system's local timezone rules.
+    if native_timezone_name:
+        _COMPUTER_TIMEZONE_CACHE = (native_timezone_name, None)
+    else:
+        try:
+            local_now = datetime.now().astimezone()
+            display_name = local_now.tzname() or str(local_now.tzinfo) or 'system-local'
+        except Exception:
+            display_name = 'system-local'
+        _COMPUTER_TIMEZONE_CACHE = (display_name, None)
+
+    _COMPUTER_TIMEZONE_CACHE_AT = now_monotonic
+    return _COMPUTER_TIMEZONE_CACHE
+
 # ==============================================================================
 #  TERMINAL PATH RESOLUTION (mirrors brokerdetails.py)
 # ==============================================================================
@@ -490,6 +623,112 @@ def mt5_copy_rates_from_pos(symbol, timeframe_const, start_pos, count):
             return mt5.copy_rates_from_pos(symbol, timeframe_const, start_pos, count)
         except Exception:
             return None
+
+# A request is retried at the same MT5 position before its size is reduced.
+# A persistent API error at a one-candle request is retried without advancing
+# the position, so a failed page cannot be mistaken for completed history.
+MT5_FETCH_RETRIES_PER_SIZE = 3
+MT5_FETCH_RETRY_DELAY = 0.75
+MT5_FETCH_ERROR_RETRY_DELAY = 5.0
+
+def _mt5_fetch_complete_page(symbol, timeframe_const, start_pos, requested, label):
+    """
+    Fetch a contiguous MT5 history window without silently skipping positions.
+
+    Failed requests are retried at the same position and then retried with a
+    smaller count. Short non-empty responses continue from the exact next MT5
+    position until the requested window is full or MT5 repeatedly confirms
+    that no more bars are available. Persistent API errors at a one-bar request
+    keep retrying the same position; the cursor never moves on an API failure.
+
+    Returns (rates_as_list, request_failed, history_exhausted).
+    """
+    cursor = max(0, int(start_pos))
+    remaining = max(0, int(requested))
+    collected = []
+    if remaining <= 0:
+        return collected, False, False
+
+    while remaining > 0:
+        chunk_size = remaining
+        while True:
+            nonempty_rates = None
+            empty_responses = 0
+
+            for attempt in range(1, MT5_FETCH_RETRIES_PER_SIZE + 1):
+                rates = mt5_copy_rates_from_pos(
+                    symbol, timeframe_const, cursor, chunk_size
+                )
+                if rates is None:
+                    try:
+                        mt5_error = mt5.last_error() if mt5 is not None else 'MT5 unavailable'
+                    except Exception:
+                        mt5_error = 'unknown MT5 error'
+                    print(
+                        f"      [CHARTS][FETCH RETRY] {label}: request at "
+                        f"start_pos={cursor}, count={chunk_size} failed "
+                        f"({attempt}/{MT5_FETCH_RETRIES_PER_SIZE}); {mt5_error}"
+                    )
+                else:
+                    try:
+                        rate_count = len(rates)
+                    except Exception:
+                        rate_count = -1
+                    if rate_count > 0:
+                        nonempty_rates = rates
+                        break
+                    if rate_count == 0:
+                        empty_responses += 1
+
+                if attempt < MT5_FETCH_RETRIES_PER_SIZE:
+                    time.sleep(MT5_FETCH_RETRY_DELAY)
+
+            if nonempty_rates is not None:
+                take = min(len(nonempty_rates), remaining, chunk_size)
+                collected.extend(list(nonempty_rates[:take]))
+                cursor += take
+                remaining -= take
+                break
+
+            if empty_responses == MT5_FETCH_RETRIES_PER_SIZE:
+                # Try smaller page sizes before accepting that the source has
+                # no bar at this position.
+                if chunk_size > 1:
+                    smaller = max(1, chunk_size // 2)
+                    print(
+                        f"      [CHARTS][FETCH REDUCE] {label}: no bars returned "
+                        f"at start_pos={cursor}; reducing request {chunk_size} "
+                        f"-> {smaller} and retrying"
+                    )
+                    chunk_size = smaller
+                    continue
+                print(
+                    f"      [CHARTS][FETCH END] {label}: MT5 confirmed no "
+                    f"bar at start_pos={cursor} after retries"
+                )
+                return collected, False, True
+
+            # An API error (None/invalid response) does not move the cursor.
+            # Retry with smaller pages; at one bar, continue retrying that same
+            # position instead of skipping the candle or the timeframe.
+            if chunk_size > 1:
+                smaller = max(1, chunk_size // 2)
+                print(
+                    f"      [CHARTS][FETCH REDUCE] {label}: MT5 request failed "
+                    f"at start_pos={cursor}; reducing request {chunk_size} "
+                    f"-> {smaller} and retrying"
+                )
+                chunk_size = smaller
+                continue
+
+            print(
+                f"      [CHARTS][FETCH WAIT] {label}: one-candle request at "
+                f"start_pos={cursor} is still failing; retrying same position"
+            )
+            time.sleep(MT5_FETCH_ERROR_RETRY_DELAY)
+
+    return collected, False, False
+
 # ==============================================================================
 #  PROGRAMME FETCH
 # ==============================================================================
@@ -753,30 +992,40 @@ def _insert_candle_rows_batched(rows):
 # ==============================================================================
 #  CANDLE BUILD (MT5 rates -> candle_records rows)
 # ==============================================================================
-def _mt5_epoch_to_programme_time(timestamp_seconds, programme_tz):
+def _mt5_epoch_to_programme_time(timestamp_seconds, programme_tz,
+                                  computer_tz=None):
     """
-    Convert one MT5 bar timestamp into the programme's local wall-clock time.
-    MetaTrader 5 returns bar timestamps as Unix seconds representing UTC.
-    Always attach UTC explicitly before converting to the programme timezone.
-    This is deliberately independent of the computer's configured timezone.
-    Returns an aware datetime in programme_tz. The database writer removes
-    tzinfo only after conversion because candle_records uses MySQL DATETIME
-    columns and stores the IANA timezone name in its separate `timezone` field.
+    Convert an MT5 Unix timestamp using the computer's configured timezone
+    first, then the programme's selected timezone. The timestamp is an absolute
+    Unix instant; fromtimestamp applies the computer's timezone and its historic
+    daylight-saving rules before astimezone converts that instant to programme_tz.
+
+    If no IANA computer timezone can be identified (for example, a Windows
+    timezone registry name without tzlocal installed), the OS local timezone
+    engine is used directly. Returns an aware datetime in programme_tz.
     """
     if programme_tz is None:
         raise ValueError("A valid programme timezone is required")
-    utc_dt = datetime.fromtimestamp(int(timestamp_seconds), tz=timezone.utc)
-    return utc_dt.astimezone(programme_tz)
+    timestamp_seconds = int(timestamp_seconds)
+    if computer_tz is not None:
+        computer_local_dt = datetime.fromtimestamp(
+            timestamp_seconds, tz=computer_tz
+        )
+    else:
+        computer_local_dt = datetime.fromtimestamp(
+            timestamp_seconds
+        ).astimezone()
+    return computer_local_dt.astimezone(programme_tz)
+
 def _rates_to_rows(programme_id, userid, symbol, timeframe_key,
-                   tz_obj, tz_name, rates):
+                   tz_obj, tz_name, rates, computer_tz=None):
     """
-    Convert MT5 `rates` (structured ndarray) into rows for candle_records.
-    MT5 rates['time'] is a Unix timestamp in UTC, not a naive timestamp in
-    the broker's timezone or the computer's local timezone. Convert the exact
-    UTC instant into the programme's selected IANA timezone for every bar.
-    open_time / close_time / candle_time / last_recorded_candle_time are
-    stored as naive programme-local datetimes to match the existing MySQL
-    DATETIME schema. The `timezone` column records the IANA timezone name.
+    Convert MT5 rates into candle_records rows. Each Unix timestamp is first
+    localized to the computer's configured timezone and then converted to the
+    programme's selected IANA timezone. Candle open and close instants are
+    converted independently for correct daylight-saving handling. MySQL
+    DATETIME values remain naive programme-local values, with the target IANA
+    timezone stored in the existing timezone column.
     """
     if rates is None or len(rates) == 0:
         return []
@@ -797,13 +1046,14 @@ def _rates_to_rows(programme_id, userid, symbol, timeframe_key,
             )
             continue
         try:
-            # Convert both ends from UTC independently. Do not add the candle
-            # duration to a naive programme-local time: that would produce
-            # incorrect local times across daylight-saving transitions.
-            open_utc = datetime.fromtimestamp(ts_unix, tz=timezone.utc)
-            close_utc = open_utc + timedelta(seconds=tf_sec)
-            open_local_aware = _mt5_epoch_to_programme_time(ts_unix, tz_obj)
-            close_local_aware = close_utc.astimezone(tz_obj)
+            # Convert both Unix instants independently through computer local
+            # time into programme local time, preserving DST transitions.
+            open_local_aware = _mt5_epoch_to_programme_time(
+                ts_unix, tz_obj, computer_tz
+            )
+            close_local_aware = _mt5_epoch_to_programme_time(
+                ts_unix + tf_sec, tz_obj, computer_tz
+            )
             # MySQL DATETIME has no timezone metadata. Keep the converted
             # programme wall-clock values and retain the IANA name separately.
             open_dt = open_local_aware.replace(tzinfo=None)
@@ -863,29 +1113,27 @@ def _round_target_from_filled(filled):
             return target
     return MAX_BARS_PER_TF
 def _latest_pass(programme_id, userid, symbol, timeframe_key,
-                 tf_const, tz_obj, tz_name):
+                 tf_const, tz_obj, tz_name, computer_tz=None):
     """
     Capture the newest MT5 page and insert any bars not already stored.
     Returns (source_bars_fetched, rows_inserted, insert_failed).
     source_bars_fetched is important: the next historical start_pos is a
     position in the MT5 series, not the number of rows newly inserted.
     """
-    rates = mt5_copy_rates_from_pos(symbol, tf_const, 0, LATEST_PROBE_BARS)
-    if rates is None:
-        try:
-            mt5_error = mt5.last_error() if mt5 is not None else 'MT5 unavailable'
-        except Exception:
-            mt5_error = 'unknown MT5 error'
-        print(f"      [CHARTS][LATEST] {symbol} {timeframe_key}: "
-              f"copy_rates_from_pos failed: {mt5_error}")
+    rates, fetch_failed, history_exhausted = _mt5_fetch_complete_page(
+        symbol, tf_const, 0, LATEST_PROBE_BARS,
+        f"{symbol} {timeframe_key} latest",
+    )
+    if fetch_failed:
         return 0, 0, True
-    if len(rates) == 0:
+    if not rates:
         print(f"      [CHARTS][LATEST] {symbol} {timeframe_key}: "
-              "MT5 returned no latest bars")
+              "MT5 returned no latest bars after retries")
         return 0, 0, False
     fetched = len(rates)
     rows = _rates_to_rows(
-        programme_id, userid, symbol, timeframe_key, tz_obj, tz_name, rates
+        programme_id, userid, symbol, timeframe_key, tz_obj, tz_name, rates,
+        computer_tz=computer_tz,
     )
     if not rows:
         return fetched, 0, False
@@ -919,7 +1167,8 @@ def _latest_pass(programme_id, userid, symbol, timeframe_key,
           f"fetched={fetched} new={len(fresh)} inserted={inserted}")
     return fetched, inserted, failed
 def _backfill_pass(programme_id, userid, symbol, timeframe_key,
-                   tf_const, tz_obj, tz_name, start_pos, requested):
+                   tf_const, tz_obj, tz_name, start_pos, requested,
+                   computer_tz=None):
     """
     Fetch exactly the next older MT5 page and insert every candle in it.
     MT5 bar positions count backwards from the present (position zero).
@@ -933,20 +1182,18 @@ def _backfill_pass(programme_id, userid, symbol, timeframe_key,
     requested = max(0, int(requested))
     if requested <= 0:
         return 0, 0, False
-    rates = mt5_copy_rates_from_pos(symbol, tf_const, start_pos, requested)
-    if rates is None:
-        try:
-            mt5_error = mt5.last_error() if mt5 is not None else 'MT5 unavailable'
-        except Exception:
-            mt5_error = 'unknown MT5 error'
-        print(f"      [CHARTS][BACKFILL] {symbol} {timeframe_key}: "
-              f"MT5 error at start_pos={start_pos}: {mt5_error}")
+    rates, fetch_failed, history_exhausted = _mt5_fetch_complete_page(
+        symbol, tf_const, start_pos, requested,
+        f"{symbol} {timeframe_key} backfill",
+    )
+    if fetch_failed:
         return 0, 0, True
     fetched = len(rates)
     if fetched == 0:
         return 0, 0, False
     rows = _rates_to_rows(
-        programme_id, userid, symbol, timeframe_key, tz_obj, tz_name, rates
+        programme_id, userid, symbol, timeframe_key, tz_obj, tz_name, rates,
+        computer_tz=computer_tz,
     )
     if not rows:
         print(f"      [CHARTS][BACKFILL] {symbol} {timeframe_key}: "
@@ -984,7 +1231,7 @@ def _backfill_pass(programme_id, userid, symbol, timeframe_key,
 #  SYNC ONE (programme, symbol, timeframe) — ONE ROUND
 # ==============================================================================
 def _sync_one_symbol_timeframe(programme_id, userid, symbol, timeframe_key,
-                               tf_const, tz_obj, tz_name):
+                               tf_const, tz_obj, tz_name, computer_tz=None):
     """
     Synchronize one programme/symbol/timeframe pair while retaining no more
     than MAX_BARS_PER_TF candles. Existing excess rows are pruned first;
@@ -1005,7 +1252,8 @@ def _sync_one_symbol_timeframe(programme_id, userid, symbol, timeframe_key,
     latest_page_fetched = 0
     # ---- Rotation 1: newest bars ---------------------------------------
     latest_page_fetched, n_latest, latest_failed = _latest_pass(
-        programme_id, userid, symbol, timeframe_key, tf_const, tz_obj, tz_name
+        programme_id, userid, symbol, timeframe_key, tf_const, tz_obj, tz_name,
+        computer_tz=computer_tz,
     )
     latest_inserted += n_latest
     if latest_failed:
@@ -1040,6 +1288,7 @@ def _sync_one_symbol_timeframe(programme_id, userid, symbol, timeframe_key,
             fetched, inserted, page_failed = _backfill_pass(
                 programme_id, userid, symbol, timeframe_key, tf_const,
                 tz_obj, tz_name, next_start_pos, request_count,
+                computer_tz=computer_tz,
             )
             if fetched <= 0:
                 history_exhausted = not page_failed
@@ -1063,7 +1312,7 @@ def _sync_one_symbol_timeframe(programme_id, userid, symbol, timeframe_key,
             # all older MT5 position indexes by the number of new bars.
             latest_fetched_again, latest_new, latest_failed_again = _latest_pass(
                 programme_id, userid, symbol, timeframe_key,
-                tf_const, tz_obj, tz_name,
+                tf_const, tz_obj, tz_name, computer_tz=computer_tz,
             )
             latest_inserted += latest_new
             next_start_pos += latest_new
@@ -1175,13 +1424,10 @@ def _process_programme(programme, tf_map):
     print(f"[CHARTS] terminal = {terminal_path}")
     print(f"[CHARTS] symbols  = {selected_symbols}")
     print(f"[CHARTS] timeframes = {selected_timeframes}")
-    try:
-        computer_timezone = datetime.now().astimezone().tzname() or "unknown"
-    except Exception:
-        computer_timezone = "unknown"
-    print(f"[CHARTS] computer local timezone = {computer_timezone} (diagnostic only)")
+    computer_timezone, computer_tz_obj = _detect_computer_timezone()
+    print(f"[CHARTS] detected computer timezone = {computer_timezone}")
     print(f"[CHARTS] programme timezone = {tz_name}")
-    print(f"[CHARTS] candle conversion = MT5 UTC timestamps -> {tz_name}")
+    print(f"[CHARTS] candle conversion = {computer_timezone} -> {tz_name}")
     # ---- MT5 init, no login attempt ----
     ok = mt5_connect_quick(terminal_path, timeout_ms=10000)
     if not ok:
@@ -1220,10 +1466,9 @@ def _process_programme(programme, tf_map):
     total_inserted = 0
     per_pair_summary = []
     try:
-        # Round-robin: outer loop = symbol, inner loop = timeframe.
-        # Every cycle we visit every pair exactly once. The pair's own
-        # round (based on how many rows it already has) decides how much
-        # to fetch.
+        # Complete every selected timeframe for the current symbol before
+        # moving to the next symbol. Each pair's stored row count determines
+        # how much history remains to fetch.
         for symbol in selected_symbols:
             for tf_key in selected_timeframes:
                 tf_const = tf_map.get(tf_key)
@@ -1238,6 +1483,7 @@ def _process_programme(programme, tf_map):
                         tf_const=tf_const,
                         tz_obj=tz_obj,
                         tz_name=tz_name,
+                        computer_tz=computer_tz_obj,
                     )
                     n = int(res.get('inserted', 0) or 0)
                     total_inserted += n
