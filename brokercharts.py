@@ -50,12 +50,14 @@ MT5 BEHAVIOUR
 CANDLE SYNCHRONIZATION — PAGINATED ROTATIONS
 -------------------------------------------
 For every selected (symbol, timeframe) pair:
-  1. Fetch the newest 1,500 MT5 bars from position 0 and insert missing rows.
+  1. Fetch the newest 1,500 MT5 bars from position 0; only fully closed,
+     OHLC-valid, gap-free candles may be inserted.
   2. Fetch the next older page using copy_rates_from_pos(..., start_pos, count).
   3. Advance start_pos by the exact number of source bars fetched. Never reset
      historical backfill to position 0, because that would re-fetch the newest
      bars and create overlap.
-  4. Insert every new candle in the page, refresh the latest page, and repeat.
+  4. Reject candles whose open is outside the immediately preceding
+     consecutive candle range; refresh existing candles from MT5 and repeat.
   5. Stop when repeated empty responses confirm no more history is available
      or the pair reaches 5,000 stored candles. Failed API requests retry at the
      same position with smaller requests; a persistent one-bar error never
@@ -1103,11 +1105,24 @@ def _update_existing_candle_rows_batched(programme_id, userid, symbol,
     return updated_total, failed
 
 
-def _cleanup_broken_candle_rows(programme_id, userid, symbol, timeframe):
+def _cleanup_broken_candle_rows(programme_id, userid, symbol, timeframe, tz_name=None):
     """
-    Remove structurally invalid OHLC rows and duplicate timestamps for this
-    exact programme/symbol/timeframe. Valid-looking historical snapshots are
-    corrected by _update_existing_candle_rows_batched() from MT5 source data.
+    Delete malformed, duplicate, unfinished and opening-gap candles for one
+    exact programme/user/symbol/timeframe.
+
+    Strict continuity policy requested for Programme Training:
+      - the first retained candle establishes the accepted price range;
+      - each next source/database candle must open inside the last accepted
+        candle's [low, high] range;
+      - if a candle is rejected, it does NOT become the next comparison anchor;
+        this prevents a chain of broken candles from surviving after the first
+        bad candle is removed;
+      - this rule intentionally applies across timestamps as well, so a row
+        cannot remain as a visible price jump merely because an earlier bad row
+        was deleted.
+
+    This is deliberately strict. Genuine broker/market opening gaps are also
+    removed; use this only when the chart is required to be continuous.
     """
     scope = (
         " WHERE programmeid = " + _sql_int(programme_id) +
@@ -1115,6 +1130,7 @@ def _cleanup_broken_candle_rows(programme_id, userid, symbol, timeframe):
         " AND symbol = " + _sql_quote(symbol) +
         " AND timeframe = " + _sql_quote(timeframe)
     )
+
     invalid_sql = (
         "DELETE FROM candle_records" + scope + " AND ("
         "`open` IS NULL OR `high` IS NULL OR `low` IS NULL OR `close` IS NULL OR "
@@ -1135,8 +1151,7 @@ def _cleanup_broken_candle_rows(programme_id, userid, symbol, timeframe):
         )
         return None
 
-    # A repeated timestamp creates two adjacent chart slots for one bar.
-    # Keep the newest auto-increment row for each identical scoped timestamp.
+    # Keep only the newest ID when duplicate timestamps exist.
     duplicate_sql = (
         "DELETE older FROM candle_records AS older "
         "INNER JOIN candle_records AS newer ON "
@@ -1160,12 +1175,134 @@ def _cleanup_broken_candle_rows(programme_id, userid, symbol, timeframe):
         )
         return None
 
-    total_deleted = int(invalid_deleted or 0) + int(duplicate_deleted or 0)
+    # A not-yet-closed candle is an incomplete snapshot, never chart history.
+    incomplete_deleted = 0
+    programme_tz = _resolve_timezone(tz_name) if tz_name else None
+    if programme_tz is not None:
+        now_wall = datetime.now(programme_tz).replace(tzinfo=None).strftime('%Y-%m-%d %H:%M:%S')
+        incomplete_sql = (
+            "DELETE FROM candle_records" + scope +
+            " AND close_time IS NOT NULL AND close_time > " + _sql_dt(now_wall)
+        )
+        ok, incomplete_deleted, message = db_execute(
+            incomplete_sql, None, timeout=90.0, quiet=True
+        )
+        if not ok:
+            print(
+                f"      [CHARTS][CLEANUP FAIL] {symbol} {timeframe}: "
+                f"unfinished-candle cleanup failed: {message}"
+            )
+            return None
+
+    # Scan the remaining ordered series in Python. The accepted anchor is not
+    # advanced when a gap candle is removed, so a sequence of bad opens cannot
+    # evade cleanup by following another rejected candle.
+    rows = db_fetch_all(
+        """SELECT id, candle_time, open_time, close_time, open, high, low, close, volume
+             FROM candle_records
+            WHERE programmeid = %s AND userid = %s
+              AND symbol = %s AND timeframe = %s
+            ORDER BY candle_time ASC, id ASC""",
+        [programme_id, userid, symbol, timeframe],
+        timeout=90.0, quiet=True,
+    )
+
+    gap_ids = []
+    invalid_after_scan_ids = []
+    accepted_anchor = None
+    for stored in rows:
+        row_id = _coerce_int(_raw_first_key(stored, 'id'))
+        if row_id is None or row_id <= 0:
+            continue
+        candle_time = _parse_db_datetime(_raw_first_key(stored, 'candle_time'))
+        open_time = _parse_db_datetime(_raw_first_key(stored, 'open_time'))
+        close_time = _parse_db_datetime(_raw_first_key(stored, 'close_time'))
+        try:
+            o = float(_raw_first_key(stored, 'open'))
+            h = float(_raw_first_key(stored, 'high'))
+            l = float(_raw_first_key(stored, 'low'))
+            c = float(_raw_first_key(stored, 'close'))
+            v = float(_raw_first_key(stored, 'volume'))
+        except (TypeError, ValueError, OverflowError):
+            invalid_after_scan_ids.append(row_id)
+            continue
+
+        if (candle_time is None or open_time is None or close_time is None or
+                abs((open_time - candle_time).total_seconds()) > 1 or
+                close_time <= open_time or
+                not all(math.isfinite(value) for value in (o, h, l, c, v)) or
+                h < max(o, c) or l > min(o, c) or h < l or v < 0):
+            invalid_after_scan_ids.append(row_id)
+            continue
+
+        if accepted_anchor is not None:
+            epsilon = max(
+                1.0e-8,
+                abs(accepted_anchor['high']) * 1.0e-10,
+                abs(accepted_anchor['low']) * 1.0e-10,
+                abs(o) * 1.0e-10,
+            )
+            if (o > accepted_anchor['high'] + epsilon or
+                    o < accepted_anchor['low'] - epsilon):
+                gap_ids.append(row_id)
+                print(
+                    f"      [CHARTS][GAP DELETE] {symbol} {timeframe}: "
+                    f"id={row_id} time={candle_time} open={o:.8f} "
+                    f"outside last accepted range "
+                    f"[{accepted_anchor['low']:.8f}, {accepted_anchor['high']:.8f}]"
+                )
+                # Keep the prior accepted anchor. The next row must also be
+                # continuous with the last candle that remains in the table.
+                continue
+
+        accepted_anchor = {
+            'candle_time': candle_time,
+            'high': h,
+            'low': l,
+        }
+
+    def _delete_ids(ids, label):
+        if not ids:
+            return 0, True
+        deleted_total = 0
+        for offset in range(0, len(ids), 400):
+            batch = ids[offset:offset + 400]
+            placeholders = ', '.join(['%s'] * len(batch))
+            sql = (
+                "DELETE FROM candle_records WHERE programmeid = %s AND userid = %s "
+                "AND symbol = %s AND timeframe = %s AND id IN (" + placeholders + ")"
+            )
+            ok, affected, msg = db_execute(
+                sql, [programme_id, userid, symbol, timeframe] + batch,
+                timeout=90.0, quiet=True,
+            )
+            if not ok:
+                print(
+                    f"      [CHARTS][CLEANUP FAIL] {symbol} {timeframe}: "
+                    f"{label} deletion failed: {msg}"
+                )
+                return deleted_total, False
+            deleted_total += int(affected or 0)
+        return deleted_total, True
+
+    invalid_scan_deleted, scan_ok = _delete_ids(invalid_after_scan_ids, 'non-finite/malformed')
+    if not scan_ok:
+        return None
+    gap_deleted, gap_ok = _delete_ids(gap_ids, 'opening-gap')
+    if not gap_ok:
+        return None
+
+    total_deleted = (
+        int(invalid_deleted or 0) + int(duplicate_deleted or 0) +
+        int(incomplete_deleted or 0) + invalid_scan_deleted + gap_deleted
+    )
     if total_deleted:
         print(
             f"      [CHARTS][CLEANUP] {symbol} {timeframe}: removed "
-            f"{int(invalid_deleted or 0)} invalid and "
-            f"{int(duplicate_deleted or 0)} duplicate candle row(s)"
+            f"{int(invalid_deleted or 0) + invalid_scan_deleted} invalid, "
+            f"{int(duplicate_deleted or 0)} duplicate, "
+            f"{gap_deleted} opening-gap and "
+            f"{int(incomplete_deleted or 0)} unfinished candle row(s)"
         )
     return total_deleted
 
@@ -1238,6 +1375,13 @@ def _rates_to_rows(programme_id, userid, symbol, timeframe_key,
             # programme wall-clock values and retain the IANA name separately.
             open_dt = open_local_aware.replace(tzinfo=None)
             close_dt = close_local_aware.replace(tzinfo=None)
+
+            # Never insert an unfinished MT5 bar. Its OHLC values are snapshots
+            # that can change until the timeframe closes; the completed bar will
+            # be collected on the next pass. This also removes the old partial-
+            # candle snapshot problem at its source.
+            if close_local_aware > datetime.now(tz_obj):
+                continue
         except Exception as exc:
             # Never silently fall back to UTC and label it as another zone.
             print(
@@ -1310,6 +1454,127 @@ def _rates_to_rows(programme_id, userid, symbol, timeframe_key,
             'volume':                    v,
         })
     return rows
+
+def _reject_interbar_gap_rows(rows, timeframe_key, label):
+    """
+    Enforce continuous price ranges on MT5 source bars before UPDATE/INSERT.
+
+    Every candidate open must be inside the last accepted candle's full
+    [low, high] range. A rejected bar does not become the next comparison
+    anchor; this rejects a chain of bad source bars rather than only the first.
+    Rejected timestamps are also deleted from candle_records so a stale old
+    snapshot cannot survive simply because its corrected MT5 source was rejected.
+
+    This is intentionally strict and also rejects genuine broker/market gaps.
+    """
+    if not rows:
+        return []
+
+    ordered = sorted(rows, key=lambda item: item['candle_time'])
+    first_time = ordered[0]['candle_time']
+    first_text = (
+        first_time.strftime('%Y-%m-%d %H:%M:%S')
+        if isinstance(first_time, datetime) else str(first_time)
+    )
+    first = ordered[0]
+    previous_row = db_fetch_one(
+        """SELECT candle_time, high, low
+             FROM candle_records
+            WHERE programmeid = %s AND userid = %s
+              AND symbol = %s AND timeframe = %s
+              AND candle_time < %s
+            ORDER BY candle_time DESC, id DESC
+            LIMIT 1""",
+        [first.get('programmeid'), first.get('userid'),
+         first.get('symbol'), first.get('timeframe'), first_text],
+        timeout=15.0, quiet=True,
+    )
+
+    accepted_anchor = None
+    if previous_row:
+        previous_time = _parse_db_datetime(_raw_first_key(previous_row, 'candle_time'))
+        try:
+            previous_high = float(_raw_first_key(previous_row, 'high'))
+            previous_low = float(_raw_first_key(previous_row, 'low'))
+            if (previous_time is not None and math.isfinite(previous_high) and
+                    math.isfinite(previous_low) and previous_high >= previous_low):
+                accepted_anchor = {
+                    'candle_time': previous_time,
+                    'high': previous_high,
+                    'low': previous_low,
+                }
+        except (TypeError, ValueError, OverflowError):
+            accepted_anchor = None
+
+    accepted = []
+    rejected_times = []
+    rejected = 0
+    for row in ordered:
+        current_time = row['candle_time']
+        current_open = float(row['open'])
+        if accepted_anchor is not None:
+            epsilon = max(
+                1.0e-8,
+                abs(accepted_anchor['high']) * 1.0e-10,
+                abs(accepted_anchor['low']) * 1.0e-10,
+                abs(current_open) * 1.0e-10,
+            )
+            outside_previous_range = (
+                current_open > accepted_anchor['high'] + epsilon or
+                current_open < accepted_anchor['low'] - epsilon
+            )
+            if outside_previous_range:
+                rejected += 1
+                rejected_times.append(current_time)
+                print(
+                    f"      [CHARTS][GAP REJECT] {label}: "
+                    f"time={current_time} open={current_open:.8f} "
+                    f"outside last accepted range "
+                    f"[{accepted_anchor['low']:.8f}, {accepted_anchor['high']:.8f}]; "
+                    "existing row will be deleted and source bar will not be written"
+                )
+                continue
+
+        accepted.append(row)
+        accepted_anchor = {
+            'candle_time': current_time,
+            'high': float(row['high']),
+            'low': float(row['low']),
+        }
+
+    # Delete matching stale rows in batches. The DELETE is programme/user/
+    # symbol/timeframe scoped and safe when the rejected timestamp is not stored.
+    if rejected_times:
+        programme_id = first.get('programmeid')
+        userid = first.get('userid')
+        symbol = first.get('symbol')
+        timeframe = first.get('timeframe')
+        for offset in range(0, len(rejected_times), 400):
+            batch = rejected_times[offset:offset + 400]
+            placeholders = ', '.join(['%s'] * len(batch))
+            sql = (
+                "DELETE FROM candle_records WHERE programmeid = %s AND userid = %s "
+                "AND symbol = %s AND timeframe = %s AND candle_time IN (" + placeholders + ")"
+            )
+            ok, affected, message = db_execute(
+                sql, [programme_id, userid, symbol, timeframe] + batch,
+                timeout=90.0, quiet=True,
+            )
+            if not ok:
+                print(
+                    f"      [CHARTS][GAP DELETE FAIL] {label}: "
+                    f"could not delete rejected existing rows: {message}"
+                )
+                # Rejected source bars remain excluded regardless; a later
+                # cleanup pass will retry removal of their stored snapshots.
+
+    if rejected:
+        print(
+            f"      [CHARTS][GAP REJECT] {label}: "
+            f"rejected {rejected} opening-gap source candle(s)"
+        )
+    return accepted
+
 # ==============================================================================
 #  ROTATION-ROUND HELPERS
 # ==============================================================================
@@ -1363,6 +1628,9 @@ def _repair_existing_history_once(programme_id, userid, symbol, timeframe_key,
         programme_id, userid, symbol, timeframe_key, tz_obj, tz_name, rates,
         computer_tz=computer_tz,
     )
+    rows = _reject_interbar_gap_rows(
+        rows, timeframe_key, f"{symbol} {timeframe_key} existing-history repair"
+    )
     rows.sort(key=lambda row: row['candle_time'])
     if not rows:
         print(
@@ -1412,6 +1680,9 @@ def _latest_pass(programme_id, userid, symbol, timeframe_key,
     rows = _rates_to_rows(
         programme_id, userid, symbol, timeframe_key, tz_obj, tz_name, rates,
         computer_tz=computer_tz,
+    )
+    rows = _reject_interbar_gap_rows(
+        rows, timeframe_key, f"{symbol} {timeframe_key} latest"
     )
     if not rows:
         return fetched, 0, False
@@ -1484,6 +1755,9 @@ def _backfill_pass(programme_id, userid, symbol, timeframe_key,
         programme_id, userid, symbol, timeframe_key, tz_obj, tz_name, rates,
         computer_tz=computer_tz,
     )
+    rows = _reject_interbar_gap_rows(
+        rows, timeframe_key, f"{symbol} {timeframe_key} backfill"
+    )
     if not rows:
         print(f"      [CHARTS][BACKFILL] {symbol} {timeframe_key}: "
               f"fetched={fetched} at start_pos={start_pos}, but no valid rows")
@@ -1534,18 +1808,24 @@ def _sync_one_symbol_timeframe(programme_id, userid, symbol, timeframe_key,
     if not mt5_symbol_select(symbol, True):
         print(f"      [CHARTS] {symbol} {timeframe_key}: symbol_select failed")
         return {'inserted': 0, 'skipped': True}
-    # First reconcile existing rows against the broker source. This lets MT5
-    # replace a stale/inconsistent snapshot before the cleanup removes rows
-    # that remain structurally invalid or duplicated.
+    # Remove malformed and price-discontinuous stored rows first. The MT5
+    # reconciliation must never use a known-bad database row as its predecessor.
+    initial_cleanup = _cleanup_broken_candle_rows(
+        programme_id, userid, symbol, timeframe_key, tz_name=tz_name,
+    )
+    if initial_cleanup is None:
+        return {'inserted': 0, 'skipped': True, 'reason': 'candle_cleanup_failed'}
+    # Reconcile the remaining retained history against broker OHLC. Any source
+    # gap bar is rejected and its stale database snapshot is deleted as well.
     _repair_existing_history_once(
         programme_id, userid, symbol, timeframe_key, tf_const,
         tz_obj, tz_name, computer_tz=computer_tz,
     )
-    initial_cleanup = _cleanup_broken_candle_rows(
-        programme_id, userid, symbol, timeframe_key,
+    repair_cleanup = _cleanup_broken_candle_rows(
+        programme_id, userid, symbol, timeframe_key, tz_name=tz_name,
     )
-    if initial_cleanup is None:
-        return {'inserted': 0, 'skipped': True, 'reason': 'candle_cleanup_failed'}
+    if repair_cleanup is None:
+        return {'inserted': 0, 'skipped': True, 'reason': 'post_repair_cleanup_failed'}
     initial_trim = _trim_oldest_rows(programme_id, userid, symbol, timeframe_key)
     if initial_trim is None:
         return {'inserted': 0, 'skipped': True, 'reason': 'retention_cleanup_failed'}
@@ -1561,6 +1841,11 @@ def _sync_one_symbol_timeframe(programme_id, userid, symbol, timeframe_key,
         computer_tz=computer_tz,
     )
     latest_inserted += n_latest
+    latest_cleanup = _cleanup_broken_candle_rows(
+        programme_id, userid, symbol, timeframe_key, tz_name=tz_name,
+    )
+    if latest_cleanup is None:
+        latest_failed = True
     if latest_failed:
         insert_failed = True
         print(f"      [CHARTS] {symbol} {timeframe_key}: latest insert failed; "
@@ -1609,6 +1894,11 @@ def _sync_one_symbol_timeframe(programme_id, userid, symbol, timeframe_key,
             rotations += 1
             backfill_inserted += inserted
             next_start_pos += fetched
+            page_cleanup = _cleanup_broken_candle_rows(
+                programme_id, userid, symbol, timeframe_key, tz_name=tz_name,
+            )
+            if page_cleanup is None:
+                page_failed = True
             if page_failed:
                 insert_failed = True
                 break
@@ -1638,7 +1928,7 @@ def _sync_one_symbol_timeframe(programme_id, userid, symbol, timeframe_key,
             # A short MT5 page is not assumed to be the end. The next request
             # probes the next position. Only an empty response ends history.
     final_cleanup = _cleanup_broken_candle_rows(
-        programme_id, userid, symbol, timeframe_key,
+        programme_id, userid, symbol, timeframe_key, tz_name=tz_name,
     )
     if final_cleanup is None:
         insert_failed = True
