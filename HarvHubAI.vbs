@@ -1,4 +1,4 @@
-﻿Option Explicit
+Option Explicit
 
 Dim fso, sh, shellApp, processEnv, localAppData, installRoot, cacheRoot
 Dim psScriptPath, markerPath, pythonMarkerPath, psFile, psExit, projectRoot
@@ -368,29 +368,29 @@ Function PSChunk11()
         "        $request.Method = 'GET'", _
         "        $request.UserAgent = 'HarvHubAI-Installer/2.0'", _
         "        $request.Accept = 'application/zip, application/octet-stream;q=0.9, */*;q=0.8'", _
-        "        $request.Timeout = 45000", _
-        "        $request.ReadWriteTimeout = 30000", _
+        "        $request.Timeout = 90000", _
+        "        $request.ReadWriteTimeout = 90000", _
         "        $request.KeepAlive = $true", _
         "        $request.ProtocolVersion = [Version]'1.1'", _
         "        $request.ServicePoint.ConnectionLimit = 8", _
         "        $request.ServicePoint.UseNagleAlgorithm = $false", _
         "        $request.AllowAutoRedirect = $true", _
         "        $script:progress.Style = 'Blocks'", _
-        "        $script:statusLabel.Text = 'Connecting to download server... (45-second response limit)'", _
+        "        $script:statusLabel.Text = 'Connecting to download server... (90-second response limit)'", _
         "        Pump-Ui" _
     ), vbCrLf)
 End Function
 
 Function PSChunk12()
     PSChunk12 = Join(Array( _
-        "        $phase = 'waiting for the server response (45-second limit)'", _
+        "        $phase = 'waiting for the server response (90-second limit)'", _
         "        $responseTimer = [System.Diagnostics.Stopwatch]::StartNew()", _
         "        $asyncResponse = $request.BeginGetResponse($null, $null)", _
         "        $lastWaitNotice = 0", _
         "        while (!$asyncResponse.IsCompleted) {", _
         "            $waitSeconds = [int]$responseTimer.Elapsed.TotalSeconds", _
-        "            if ($waitSeconds -ge 45) { try { $request.Abort() } catch {}; throw ('Timed out after 45 seconds waiting for download response headers. Check internet access, DNS, firewall, proxy settings, and server availability. URL: ' + $Url) }", _
-        "            if ($waitSeconds -ge ($lastWaitNotice + 15)) { $lastWaitNotice = $waitSeconds; Add-UiLog('Still waiting for response headers: ' + $waitSeconds + '/45 seconds.'); $script:statusLabel.Text = 'Waiting for download server... ' + $waitSeconds + '/45 seconds' }", _
+        "            if ($waitSeconds -ge 90) { try { $request.Abort() } catch {}; throw ('Timed out after 90 seconds waiting for download response headers. Check internet access, DNS, firewall, proxy settings, and server availability. URL: ' + $Url) }", _
+        "            if ($waitSeconds -ge ($lastWaitNotice + 15)) { $lastWaitNotice = $waitSeconds; Add-UiLog('Still waiting for response headers: ' + $waitSeconds + '/90 seconds.'); $script:statusLabel.Text = 'Waiting for download server... ' + $waitSeconds + '/90 seconds' }", _
         "            Pump-Ui", _
         "            Start-Sleep -Milliseconds 100", _
         "        }", _
@@ -412,18 +412,18 @@ End Function
 
 Function PSChunk13()
     PSChunk13 = Join(Array( _
-        "        $phase = 'downloading the archive (5-minute route limit; 30-second idle limit)'", _
-        "        $buffer = New-Object byte[] 1048576", _
+        "        $phase = 'downloading the archive (20-minute total limit; 90-second idle limit)'", _
+        "        $buffer = New-Object byte[] 262144", _
         "        while ($true) {", _
-        "            if ($downloadTimer.Elapsed.TotalSeconds -ge 300) { try { $request.Abort() } catch {}; throw 'Download exceeded the 5-minute route limit. The connection was stopped.' }", _
+        "            if ($downloadTimer.Elapsed.TotalSeconds -ge 1200) { try { $request.Abort() } catch {}; throw 'Download exceeded the 20-minute overall limit. The connection was stopped.' }", _
         "            $readTimer = [System.Diagnostics.Stopwatch]::StartNew()", _
         "            $asyncRead = $inputStream.BeginRead($buffer, 0, $buffer.Length, $null, $null)", _
         "            $lastIdleNotice = 0", _
         "            while (!$asyncRead.IsCompleted) {", _
         "                $idleSeconds = [int]$readTimer.Elapsed.TotalSeconds", _
-        "                if ($downloadTimer.Elapsed.TotalSeconds -ge 300) { try { $request.Abort() } catch {}; throw 'Download exceeded the 5-minute route limit. The connection was stopped.' }", _
-        "                if ($idleSeconds -ge 30) { try { $request.Abort() } catch {}; throw ('No archive data arrived for 30 seconds. The connection appears stalled. Received so far: ' + [Math]::Round($received / 1MB, 2) + ' MB. URL: ' + $Url) }", _
-        "                if ($idleSeconds -ge ($lastIdleNotice + 10)) { $lastIdleNotice = $idleSeconds; Add-UiLog('Connected, but no archive data has arrived for ' + $idleSeconds + ' seconds. Received: ' + [Math]::Round($received / 1MB, 2) + ' MB.') }", _
+        "                if ($downloadTimer.Elapsed.TotalSeconds -ge 1200) { try { $request.Abort() } catch {}; throw 'Download exceeded the 20-minute overall limit. The connection was stopped.' }", _
+        "                if ($idleSeconds -ge 90) { try { $request.Abort() } catch {}; throw ('No archive data arrived for 90 seconds. The connection appears stalled. Received so far: ' + [Math]::Round($received / 1MB, 2) + ' MB. URL: ' + $Url) }", _
+        "                if ($idleSeconds -ge ($lastIdleNotice + 15)) { $lastIdleNotice = $idleSeconds; Add-UiLog('Connected, but no archive data has arrived for ' + $idleSeconds + ' seconds. Received: ' + [Math]::Round($received / 1MB, 2) + ' MB.') }", _
         "                Pump-Ui", _
         "                Start-Sleep -Milliseconds 100", _
         "            }", _
@@ -443,11 +443,11 @@ Function PSChunk13()
         "                $script:progress.Value = [Math]::Max($script:progress.Value, $estimatedFill)", _
         "                $script:statusLabel.Text = $Label + ' - ' + [Math]::Round($received / 1MB, 2) + ' MB received | ' + [Math]::Round($averageKBps, 1) + ' KB/s'", _
         "            }", _
-        "            if ($speedSampleTimer.Elapsed.TotalSeconds -ge 15) {", _
+        "            if ($speedSampleTimer.Elapsed.TotalSeconds -ge 30) {", _
         "                $sampleKBps = $speedSampleBytes / [Math]::Max(1, $speedSampleTimer.Elapsed.TotalSeconds) / 1KB", _
         "                Add-UiLog('Current download speed: ' + [Math]::Round($sampleKBps, 1) + ' KB/s; average: ' + [Math]::Round($averageKBps, 1) + ' KB/s.')", _
-        "                if ($downloadTimer.Elapsed.TotalSeconds -ge 30 -and $sampleKBps -lt 128) { $slowSpeedWindows++ } else { $slowSpeedWindows = 0 }", _
-        "                if ($slowSpeedWindows -ge 2) { try { $request.Abort() } catch {}; throw ('HARVHUB_SLOW_ROUTE: Download route averaged less than 128 KB/s across two consecutive 15-second samples. Received: ' + [Math]::Round($received / 1MB, 2) + ' MB. Switching to the alternate GitHub route.') }", _
+        "                if ($Label -like '*Codeload direct*' -and $downloadTimer.Elapsed.TotalSeconds -ge 45 -and $sampleKBps -lt 24) { $slowSpeedWindows++ } else { $slowSpeedWindows = 0 }", _
+        "                if ($slowSpeedWindows -ge 2) { try { $request.Abort() } catch {}; throw ('HARVHUB_SLOW_ROUTE: Download route averaged less than 24 KB/s across two consecutive 30-second samples. Received: ' + [Math]::Round($received / 1MB, 2) + ' MB. Switching to the alternate GitHub route.') }", _
         "                $speedSampleBytes = 0", _
         "                $speedSampleTimer.Restart()", _
         "            }", _
@@ -503,7 +503,7 @@ Function PSChunk15()
         "    foreach ($route in $routes) {", _
         "        try {", _
         "            if (Test-Path -LiteralPath $Destination) { Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue }", _
-        "            Add-UiLog('Trying download route: ' + $route.Name + ' (5-minute maximum; slow-route detection enabled).')", _
+        "            Add-UiLog('Trying download route: ' + $route.Name + '.')", _
         "            Download-ToFile $route.Url $Destination ($route.Name + ' repository ZIP')", _
         "            return", _
         "        } catch {", _

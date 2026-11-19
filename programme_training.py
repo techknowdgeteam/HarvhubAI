@@ -1,22 +1,25 @@
 #!/usr/bin/env python3
 """Python counterpart of programme_training.php's saved-configuration matcher.
 
-Only programmes with a successful Begin Test recorded in
-signals_provider_interest.begin_test = 1 are considered. VPS/IP scoping is
-intentionally disabled for this stage and can be integrated later. Only roots
-with apply_to_chart enabled are processed. The worker fetches the exact configured
-symbol/timeframe candle scopes, restores the saved configuration into the same
-JS-shaped runtime model, writes both into temporary JSON, reloads that JSON, and
-then runs root/tree matching, confirmation projection and historical trade
-calculations without chart rendering.
+Only programmes assigned to this computer's VPS IP are considered, including
+active follower programmes hosted by a directly assigned owner programme. Only
+roots with apply_to_chart enabled are processed. Begin Test does not control
+programme discovery: when enabled, only newly detected pending-entry orders are
+written to programme_analytics with live_trades=1; every other analytics record
+is History (live_trades=0). When Begin Test is disabled, all records are History.
 
-Results are written to programme_analytics with live_trades=0 (History). It never
-modifies candle_records, creates broker orders, or writes to programme_trades.
+The worker fetches the exact configured symbol/timeframe candle scopes, restores
+the saved configuration into the same JS-shaped runtime model, writes both into
+temporary JSON, reloads that JSON, and then runs root/tree matching,
+confirmation projection and historical trade calculations without chart
+rendering. It never modifies candle_records, creates broker orders, or writes to
+programme_trades.
 """
 from __future__ import annotations
 
 import argparse
 import hashlib
+import ipaddress
 import json
 import logging
 import os
@@ -28,6 +31,7 @@ import sys
 import time
 import traceback
 import tempfile
+import urllib.request
 from pathlib import Path
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -1915,71 +1919,172 @@ def match_row(programme_id: int, user_id: int, symbol: str, timeframe: str,
     }
 
 
-# ------------------------------- Begin Test scope -------------------------------
-def discover_programmes(db: BridgeClient,
-                       programme_id: Optional[int] = None) -> List[Dict[str, Any]]:
-    """Return programmes whose Signals Provision has actually begun testing.
+# ------------------------------- VPS/IP scope ---------------------------------
+def detect_vps_ip() -> Optional[str]:
+    """Return this machine's public IP, preferring the configured override.
 
-    signals_provision_request.php::spc_startProvisionTest() is the source of
-    truth: a successful Begin Test writes begin_test=1, interest_status='ongoing'
-    and signal_testing_started_at. The PHP deliberately leaves begin_test=1
-    when a test later passes or fails; cancelling an interest resets it to 0.
-
-    Therefore this worker includes every programme with a persisted
-    begin_test=1 record (ongoing, failed/breached or passed). It does not use
-    programme_vps, follower bindings, or this computer's IP. A programme-id
-    argument only narrows this already Begin-Test-qualified set.
+    programme_vps.programme_vps_ip_address stores the public VPS address, so a
+    private interface address is not a safe substitute. If detection fails the
+    caller must fail closed rather than scanning programmes without an IP scope.
     """
-    if not table_exists(db, "signals_provider_interest"):
-        raise RuntimeError(
-            "signals_provider_interest table does not exist; the worker cannot "
-            "verify which programmes have begun their provision test."
-        )
+    configured = str(os.environ.get("HARVHUB_VPS_IP") or "").strip()
+    if configured:
+        try:
+            return str(ipaddress.ip_address(configured))
+        except ValueError:
+            log.warning("HARVHUB_VPS_IP is not a valid IP address: %r", configured)
 
-    sql = (
-        "SELECT p.*, "
-        "spi.id AS begin_test_interest_id, "
-        "spi.begin_test AS begin_test_flag, "
-        "spi.interest_status AS begin_test_status, "
-        "spi.signal_testing_started_at AS begin_test_started_at "
-        "FROM `programme` p "
-        "INNER JOIN `signals_provider_interest` spi "
-        "  ON spi.programme_id = p.id AND spi.user_id = p.userid "
-        "WHERE COALESCE(spi.begin_test, 0) = 1 "
-        "ORDER BY p.id ASC, spi.id DESC"
+    endpoints = (
+        "https://api.ipify.org",
+        "https://checkip.amazonaws.com",
+        "https://icanhazip.com",
     )
-    rows = db.fetch_all(sql, timeout=120)
-
-    # A programme may have more than one provision-interest row. Retain the
-    # newest row that actually began a test, matching the PHP's latest-interest
-    # ordering while ensuring one Python processing pass per programme.
-    programmes_by_id: Dict[int, Dict[str, Any]] = {}
-    for row in rows:
-        pid = as_int(row.get("id"))
-        if pid is None or pid <= 0:
-            continue
-        programmes_by_id.setdefault(pid, row)
-
-    programmes = [programmes_by_id[pid] for pid in sorted(programmes_by_id)]
-    if programme_id is not None:
-        programmes = [
-            row for row in programmes
-            if as_int(row.get("id")) == int(programme_id)
-        ]
-        if not programmes:
-            log.warning(
-                "Programme %s has no matching signals_provider_interest row "
-                "with begin_test=1; skipped",
-                programme_id,
+    for url in endpoints:
+        try:
+            request = urllib.request.Request(
+                url,
+                headers={"User-Agent": "HarvHubAI-ProgrammeTraining/1.0"},
             )
+            with urllib.request.urlopen(request, timeout=8) as response:
+                candidate = response.read(128).decode("ascii", errors="ignore").strip()
+            return str(ipaddress.ip_address(candidate))
+        except Exception as exc:
+            log.warning("Public IP detection failed via %s: %s", url, str(exc)[:240])
+    return None
+
+
+def _in_sql(values: Iterable[int]) -> Tuple[str, List[int]]:
+    clean = sorted({int(value) for value in values if int(value) > 0})
+    if not clean:
+        return "", []
+    return ",".join(["%s"] * len(clean)), clean
+
+
+# ------------------------------- VPS programme scope ---------------------------
+def discover_programmes(db: BridgeClient,
+                       programme_id: Optional[int] = None,
+                       vps_ip: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Return programmes bound to this VPS IP, plus active hosted followers.
+
+    The newest Signals Provider interest row is attached only as a status flag;
+    Begin Test never restricts which VPS-associated programmes are processed.
+    If the IP or required VPS schema cannot be verified, discovery fails closed.
+    """
+    local_ip = str(vps_ip or detect_vps_ip() or "").strip()
+    if not local_ip:
+        log.error("VPS scope unavailable: public IP could not be detected; refusing an unscoped programme scan")
+        return []
+    try:
+        local_ip = str(ipaddress.ip_address(local_ip))
+    except ValueError:
+        log.error("VPS scope unavailable: invalid VPS IP %r; refusing an unscoped programme scan", local_ip)
+        return []
+
+    if not table_exists(db, "programme_vps"):
+        log.error("VPS scope unavailable: programme_vps table does not exist; refusing an unscoped programme scan")
+        return []
+
+    vps_columns = {name.lower() for name in get_columns(db, "programme_vps")}
+    required = {"programme_id", "user_id", "programme_vps_ip_address"}
+    if not required.issubset(vps_columns):
+        log.error(
+            "VPS scope unavailable: programme_vps is missing required column(s): %s",
+            ", ".join(sorted(required - vps_columns)),
+        )
+        return []
+
+    owner_rows = db.fetch_all(
+        "SELECT `programme_id`,`user_id` FROM `programme_vps` "
+        "WHERE `programme_vps_ip_address`=%s",
+        [local_ip], timeout=90,
+    )
+    owner_user_by_programme: Dict[int, int] = {}
+    for row in owner_rows:
+        pid = as_int(row.get("programme_id"))
+        uid = as_int(row.get("user_id"))
+        if pid and pid > 0 and uid and uid > 0:
+            owner_user_by_programme[pid] = uid
+
+    roles: Dict[int, set[str]] = {pid: {"owner"} for pid in owner_user_by_programme}
+    follower_owner: Dict[int, set[int]] = {}
+    if owner_user_by_programme and table_exists(db, "programme_vps_hosts_followers"):
+        follower_columns = {name.lower() for name in get_columns(db, "programme_vps_hosts_followers")}
+        follower_required = {"owner_programme_id", "follower_programme_id", "host_status"}
+        if follower_required.issubset(follower_columns):
+            marks, params = _in_sql(owner_user_by_programme.keys())
+            follower_rows = db.fetch_all(
+                "SELECT `owner_programme_id`,`follower_programme_id`,`host_status` "
+                "FROM `programme_vps_hosts_followers` "
+                f"WHERE `owner_programme_id` IN ({marks}) AND `host_status`='active'",
+                params, timeout=90,
+            )
+            for row in follower_rows:
+                owner_pid = as_int(row.get("owner_programme_id"))
+                follower_pid = as_int(row.get("follower_programme_id"))
+                if owner_pid in owner_user_by_programme and follower_pid and follower_pid > 0:
+                    roles.setdefault(follower_pid, set()).add("active follower")
+                    follower_owner.setdefault(follower_pid, set()).add(owner_pid)
+
+    associated_ids = sorted(roles)
+    if not associated_ids:
+        log.info("VPS %s has no direct programme or active follower bindings", local_ip)
+        return []
+
+    marks, params = _in_sql(associated_ids)
+    programme_rows = db.fetch_all(
+        f"SELECT * FROM `programme` WHERE `id` IN ({marks}) ORDER BY `id` ASC",
+        params, timeout=120,
+    )
+
+    latest_interest: Dict[Tuple[int, int], Dict[str, Any]] = {}
+    if table_exists(db, "signals_provider_interest"):
+        interest_rows = db.fetch_all(
+            f"SELECT * FROM `signals_provider_interest` WHERE `programme_id` IN ({marks}) ORDER BY `id` DESC",
+            params, timeout=120,
+        )
+        for row in interest_rows:
+            pid = as_int(row.get("programme_id"))
+            uid = as_int(row.get("user_id"))
+            if pid and uid:
+                latest_interest.setdefault((pid, uid), row)
+
+    output: List[Dict[str, Any]] = []
+    for programme in programme_rows:
+        pid = as_int(programme.get("id"))
+        uid = as_int(programme.get("userid"))
+        if not pid or not uid or pid not in roles:
+            continue
+        # A direct VPS owner binding must still match programme.userid. Active
+        # followers are independently owned and are allowed through their host.
+        if "owner" in roles[pid] and owner_user_by_programme.get(pid) != uid:
+            log.warning(
+                "Ignoring mismatched VPS owner binding: programme=%s database_owner=%s vps_owner=%s",
+                pid, uid, owner_user_by_programme.get(pid),
+            )
+            roles[pid].discard("owner")
+            if not roles[pid]:
+                continue
+
+        interest = latest_interest.get((pid, uid), {})
+        programme["vps_associated"] = 1
+        programme["vps_ip_address"] = local_ip
+        programme["vps_role"] = ", ".join(sorted(roles[pid]))
+        programme["vps_host_programme_ids"] = sorted(follower_owner.get(pid, set()))
+        programme["begin_test_interest_id"] = interest.get("id")
+        programme["begin_test_flag"] = as_int(interest.get("begin_test"), 0) or 0
+        programme["begin_test_status"] = interest.get("interest_status") or "not started"
+        programme["begin_test_started_at"] = interest.get("signal_testing_started_at")
+        output.append(programme)
+
+    if programme_id is not None:
+        output = [item for item in output if as_int(item.get("id")) == int(programme_id)]
 
     log.info(
-        "Begin Test scope: %s started interest record(s), %s unique programme(s)%s",
-        len(rows), len(programmes),
+        "VPS scope resolved: IP=%s | direct owner bindings=%s | associated programmes=%s%s",
+        local_ip, len(owner_user_by_programme), len(output),
         f" (programme filter {programme_id})" if programme_id is not None else "",
     )
-    return programmes
-
+    return output
 
 # ------------------------------- DB operations --------------------------------
 ANALYTICS_COLUMNS = [
@@ -2223,7 +2328,7 @@ def _insert_or_refresh_row(
 
 def persist_pair(db: BridgeClient, programme_id: int, user_id: int, symbol: str, timeframe: str,
                  records: List[Dict[str, Any]]) -> Dict[str, int]:
-    """Persist family/trade analytics as History (live_trades=0)."""
+    """Persist analytics using each record's already-decided live/history flag."""
     if not table_exists(db, "programme_analytics"):
         raise RuntimeError("Required table programme_analytics does not exist; create the analytics schema first.")
 
@@ -2251,7 +2356,7 @@ def persist_pair(db: BridgeClient, programme_id: int, user_id: int, symbol: str,
     counters = {"inserted": 0, "upserted": 0, "updated": 0, "preserved": 0}
     unique_identity = _has_exact_unique_identity(db, "programme_analytics", ANALYTICS_IDENTITY_COLUMNS)
     for record in _deduplicate_records(records):
-        record["live_trades"] = 0
+        record["live_trades"] = 1 if as_int(record.get("live_trades"), 0) == 1 else 0
         status = _insert_or_refresh_row(
             db, "programme_analytics", record, ANALYTICS_COLUMNS,
             ANALYTICS_IDENTITY_COLUMNS, unique_identity,
@@ -2262,6 +2367,22 @@ def persist_pair(db: BridgeClient, programme_id: int, user_id: int, symbol: str,
     if not records:
         log.info("    %s %s: no matched families to write; existing historical analytics were not deleted", symbol, timeframe.upper())
     return counters
+
+
+def reset_programme_live_trades(db: BridgeClient, programme_id: int, user_id: int) -> int:
+    """Set all existing analytics for this programme to History before recalculation."""
+    if not table_exists(db, "programme_analytics"):
+        return 0
+    columns = {name.lower() for name in get_columns(db, "programme_analytics")}
+    if "live_trades" not in columns:
+        # persist_pair() adds the column if needed; its default is History (0).
+        return 0
+    return db.execute(
+        "UPDATE `programme_analytics` SET `live_trades`=0 "
+        "WHERE `programme_id`=%s AND `userid`=%s",
+        [programme_id, user_id], timeout=120,
+    )
+
 
 def print_persistent_analytics_summary(db: BridgeClient, programme_id: int, user_id: int) -> None:
     """Show what the PHP dashboard can already read before this scan writes anything."""
@@ -2350,6 +2471,31 @@ def _deduplicate_records(records: Sequence[Dict[str, Any]]) -> List[Dict[str, An
     return list(deduplicated.values())
 
 
+def apply_live_trade_policy(
+    records_by_pair: Dict[Tuple[str, str], List[Dict[str, Any]]],
+    begin_test_enabled: bool,
+) -> Tuple[int, int]:
+    """Mark only configured pending-entry orders Live during an active Begin Test."""
+    live_pending_count = 0
+    history_trade_count = 0
+    for pair_records in records_by_pair.values():
+        for record in pair_records:
+            is_pending_order = (
+                as_int(record.get("trade_configured"), 0) == 1
+                and (
+                    as_int(record.get("pending_entry"), 0) == 1
+                    or str(record.get("outcome") or "").strip().lower() == "pending entry"
+                )
+            )
+            is_live = bool(begin_test_enabled and is_pending_order)
+            record["live_trades"] = 1 if is_live else 0
+            if is_live:
+                live_pending_count += 1
+            elif as_int(record.get("trade_configured"), 0) == 1:
+                history_trade_count += 1
+    return live_pending_count, history_trade_count
+
+
 def process_programme(db: BridgeClient, programme: Dict[str, Any]) -> Dict[str, int]:
     """Run the complete PHP-equivalent historical matching chain for one programme."""
     programme_id = int(programme.get("id") or 0)
@@ -2360,13 +2506,17 @@ def process_programme(db: BridgeClient, programme: Dict[str, Any]) -> Dict[str, 
     print(f"PROGRAMME: {programme_name} (ID {programme_id})")
     print("=" * 82)
     print(f"Owner user ID: {user_id}")
-    begin_status = str(programme.get("begin_test_status") or "unknown").strip().lower()
+    begin_test_enabled = truthy(programme.get("begin_test_flag"), False)
+    begin_status = str(programme.get("begin_test_status") or "not started").strip().lower()
     begin_started = programme.get("begin_test_started_at") or "not recorded"
-    begin_interest_id = programme.get("begin_test_interest_id") or "unknown"
+    begin_interest_id = programme.get("begin_test_interest_id") or "none"
+    print(f"VPS IP: {programme.get('vps_ip_address') or 'unknown'} | VPS role: {programme.get('vps_role') or 'unknown'}")
     print(
-        f"{programme_name} Begin Test = yes "
+        f"{programme_name} Begin Test = {'enabled' if begin_test_enabled else 'disabled'} "
         f"(interest #{begin_interest_id}, status={begin_status}, started_at={begin_started})"
     )
+    demoted = reset_programme_live_trades(db, programme_id, user_id)
+    print(f"Existing analytics reset to History before recalculation: {demoted} row(s)")
 
     print("fetching saved programme training configuration..")
     roots, confirmation_roots, parent_rows, confirmation_rows = load_programme_config(
@@ -2452,8 +2602,11 @@ def process_programme(db: BridgeClient, programme: Dict[str, Any]) -> Dict[str, 
             "program_name": programme_name,
             "selected_symbols": programme.get("selected_symbols"),
             "begin_test_interest_id": programme.get("begin_test_interest_id"),
+            "begin_test_flag": int(begin_test_enabled),
             "begin_test_status": programme.get("begin_test_status"),
             "begin_test_started_at": programme.get("begin_test_started_at"),
+            "vps_ip_address": programme.get("vps_ip_address"),
+            "vps_role": programme.get("vps_role"),
         },
         "scope": {
             "programme_id": programme_id,
@@ -2461,7 +2614,8 @@ def process_programme(db: BridgeClient, programme: Dict[str, Any]) -> Dict[str, 
             "symbols": symbols,
             "required_timeframes": required_timeframes,
             "required_pairs": [{"symbol": symbol, "timeframe": tf} for symbol, tf in required_pairs_ordered],
-            "programme_filter": "signals_provider_interest.begin_test = 1",
+            "programme_filter": "programme_vps IP match (direct owner or active follower)",
+            "begin_test_policy": "only pending_entry trade records are live when Begin Test is enabled",
             "root_filter": "apply_to_chart = 1 only",
         },
         "configuration": {
@@ -2554,7 +2708,6 @@ def process_programme(db: BridgeClient, programme: Dict[str, Any]) -> Dict[str, 
                                 source_timeframe=parent_tf,
                             )
                         record = trade if trade else base
-                        record["live_trades"] = 0
                         parent_records.append(record)
                         if trade:
                             trade_count += 1
@@ -2810,7 +2963,6 @@ def process_programme(db: BridgeClient, programme: Dict[str, Any]) -> Dict[str, 
                                 source_timeframe=parent_tf,
                             )
                         final_record = trade if trade else base
-                        final_record["live_trades"] = 0
                         records_by_pair.setdefault((symbol, child_tf), []).append(final_record)
                         confirmation_records.setdefault(int(winning_cr.get("id") or 0), []).append(final_record)
                         if trade:
@@ -2825,6 +2977,20 @@ def process_programme(db: BridgeClient, programme: Dict[str, Any]) -> Dict[str, 
                         if bool(cr.get("useForTrades")) and trade_for == "root_confirmation":
                             print(f"  found {trade_count} trades, check analytics in programme analytics")
 
+        # Only an untriggered pending-entry order is Live, and only while Begin
+        # Test is enabled. Matched families, active positions, and completed
+        # trades are always History. This is deliberately applied after matching
+        # so both parent and confirmation trade records follow the same rule.
+        live_pending_count, history_trade_count = apply_live_trade_policy(
+            records_by_pair, begin_test_enabled
+        )
+
+        print(
+            f"Live/History policy: Begin Test={'ON' if begin_test_enabled else 'OFF'} | "
+            f"pending orders set Live={live_pending_count} | "
+            f"trade records set History={history_trade_count}"
+        )
+
         # Create a separate result JSON before writing to programme_analytics.
         result_rows = []
         for (symbol, timeframe), records in records_by_pair.items():
@@ -2834,7 +3000,8 @@ def process_programme(db: BridgeClient, programme: Dict[str, Any]) -> Dict[str, 
             "schema": "programme_training_analytics_result_v1",
             "programme_id": programme_id,
             "user_id": user_id,
-            "live_trades": 0,
+            "begin_test_enabled": bool(begin_test_enabled),
+            "live_trade_policy": "pending_entry_only_when_begin_test_enabled",
             "results": result_rows,
         }
         _snapshot_write(result_path, result_payload)
@@ -2866,19 +3033,23 @@ def process_programme(db: BridgeClient, programme: Dict[str, Any]) -> Dict[str, 
         f"{totals['families']} matched family record(s), {totals['trades']} configured trade record(s), "
         f"{totals['candles']:,} candles fetched"
     )
-    print("History mode: every analytics record is saved with live_trades = 0")
+    print("Analytics status: only pending-entry orders are Live when Begin Test is enabled; all others are History")
     return totals
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Programme Training: Begin-Test historical matcher and programme analytics writer"
+        description="Programme Training: VPS-scoped chart matcher with Begin-Test pending-order status"
     )
     parser.add_argument("--execution-type", choices=("loop", "once"), default="loop", help="manager execution mode")
     parser.add_argument("--once", action="store_true", help="run one complete scan and exit (legacy alias)")
     parser.add_argument("--interval", type=int, default=60, help="seconds between complete scans (default: 60)")
     parser.add_argument(
         "--programme-id", type=int, default=None,
-        help="optionally limit to one programme, but only when signals_provider_interest.begin_test=1",
+        help="optionally limit to one programme already assigned to this VPS IP",
+    )
+    parser.add_argument(
+        "--vps-ip", default=None,
+        help="override detected public VPS IP (must match programme_vps.programme_vps_ip_address)",
     )
     parser.add_argument("--bridge-host", default=BRIDGE_HOST)
     parser.add_argument("--bridge-port", type=int, default=BRIDGE_PORT)
@@ -2888,8 +3059,8 @@ def main() -> int:
     run_as_loop = args.execution_type == "loop" and not args.once
 
     print(f"Programme Training starting | mode={'LOOP' if run_as_loop else 'ONCE'} | interval={args.interval}s", flush=True)
-    print("Programme Training scope: all programmes with signals_provider_interest.begin_test = 1")
-    print("VPS/IP limitation: disabled for now; programme discovery is based on Begin Test only")
+    print("Programme Training scope: programmes bound to this VPS IP (direct owner + active followers)")
+    print("Begin Test policy: enabled = pending-entry orders Live; disabled = all trades History")
     print("Root filter: apply_to_chart = 1 only; disabled roots and their confirmations are skipped")
     db = BridgeClient(args.bridge_host, args.bridge_port, BRIDGE_OWNER)
     stopping = False
@@ -2903,19 +3074,27 @@ def main() -> int:
         signal.signal(signal.SIGTERM, stop)
 
     try:
+        local_vps_ip = args.vps_ip or detect_vps_ip()
+        if local_vps_ip:
+            print(f"Detected VPS public IP: {local_vps_ip}", flush=True)
+        else:
+            print("VPS public IP could not be detected. Programme discovery will fail closed; no unscoped programmes will run.", flush=True)
+
         while not stopping:
             started = time.monotonic()
             print("\n" + "=" * 82, flush=True)
             print(f"PROGRAMME TRAINING SCAN STARTED | cycle={int(started)} | mode={'LOOP' if run_as_loop else 'ONCE'}", flush=True)
-            print("Discovering programmes with signals_provider_interest.begin_test = 1...", flush=True)
-            programmes = discover_programmes(db, args.programme_id)
-            print(f"Programme discovery returned {len(programmes)} candidate programme(s).", flush=True)
+            print(f"Discovering programmes assigned to VPS IP {local_vps_ip or '(unavailable)'}...", flush=True)
+            programmes = discover_programmes(db, args.programme_id, local_vps_ip)
+            print(f"Programme discovery returned {len(programmes)} VPS-associated candidate programme(s).", flush=True)
             totals = {"programmes": 0, "pairs": 0, "families": 0, "trades": 0, "candles": 0}
             if not programmes:
-                if args.programme_id is None:
-                    print("No programmes have signals_provider_interest.begin_test = 1; nothing to scan.")
+                if not local_vps_ip:
+                    print("No scan performed because the VPS IP is unavailable; refusing to process programmes without an IP match.")
+                elif args.programme_id is None:
+                    print(f"No programmes are assigned to VPS IP {local_vps_ip}; nothing to scan.")
                 else:
-                    print(f"Programme {args.programme_id} has not begun a provision test; nothing to scan.")
+                    print(f"Programme {args.programme_id} is not assigned to VPS IP {local_vps_ip}; nothing to scan.")
             for programme in programmes:
                 if stopping:
                     break
@@ -2934,8 +3113,8 @@ def main() -> int:
             print(f"Matched families     : {totals['families']}")
             print(f"Trade records        : {totals['trades']}")
             print(f"Candles fetched      : {totals['candles']:,}")
-            print("Live flag            : 0 (History)")
-            print("Programme scope      : Begin Test flag only (no VPS/IP restriction)")
+            print("Live flag            : pending-entry orders only, and only when Begin Test is enabled")
+            print(f"Programme scope      : VPS IP match ({local_vps_ip or 'unavailable'}); direct owner + active followers")
             print("-" * 82)
 
             if not run_as_loop:
