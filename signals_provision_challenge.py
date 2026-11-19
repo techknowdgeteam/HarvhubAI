@@ -18,7 +18,8 @@ notification keys prevent duplicate emails across repeated monitoring scans.
 
 Run continuously (recommended):
     python signals_provision_challenge.py --interval 30
-The legacy --once flag is accepted for compatibility but does not stop this worker.
+Run one scan:
+    python signals_provision_challenge.py --once
 Override VPS detection when needed:
     python signals_provision_challenge.py --vps-ip 203.0.113.10
 
@@ -342,8 +343,6 @@ def ensure_monitor_schema(db: BridgeClient) -> bool:
             )
             return False
         return True
-    except BridgeError:
-        raise
     except Exception as exc:
         log.error("Challenge schema verification/migration failed: %s", str(exc)[:1200])
         return False
@@ -394,8 +393,6 @@ def restricted_calendar(
                 developer_id = _int(rows[0].get("id"))
                 if developer_id > 0:
                     developer_ids.append(developer_id)
-        except BridgeError:
-            raise
         except Exception as exc:
             log.warning("Could not resolve developer ID for restricted calendar: %s", str(exc)[:400])
     if not developer_ids and user_id > 0:
@@ -773,8 +770,6 @@ def owner_contact(db: BridgeClient, user_id: int) -> Dict[str, str]:
             "email": _clean(row.get("email")).lower(),
             "name": _clean(row.get("first_name")) or _clean(row.get("fullname")),
         }
-    except BridgeError:
-        raise
     except Exception as exc:
         log.warning("Owner contact lookup failed for user %s: %s", user_id, str(exc)[:500])
         return {"email": "", "name": ""}
@@ -818,8 +813,6 @@ def send_programme_notice(
             log.info("Notification recorded and emailed | programme=%s | key=%s | id=%s", programme_id, key, result)
         else:
             log.info("Notification already recorded or not sent | programme=%s | key=%s", programme_id, key)
-    except BridgeError:
-        raise
     except Exception as exc:
         log.error("Programme notification failed | programme=%s | key=%s | error=%s", programme_id, key, str(exc)[:1000])
 
@@ -1224,87 +1217,37 @@ def run_scan(db: BridgeClient, vps_ip: Optional[str], programme_id: Optional[int
             else:
                 totals["skipped"] += 1
             log.info("Programme %s monitor result: %s", pid, state)
-        except BridgeError:
-            # A failed bridge operation invalidates the scan. Re-raise it so the
-            # worker reconnects and retries the scan instead of silently skipping
-            # this programme with incomplete data.
-            raise
         except Exception:
             totals["skipped"] += 1
             log.error("Programme %s challenge evaluation failed:\n%s", pid, traceback.format_exc())
     return totals
 
 
-def _discard_bridge_client(db: BridgeClient) -> None:
-    """Close a failed client without issuing a release request over a dead bridge."""
-    try:
-        db.channel_id = None
-    except Exception:
-        pass
-    try:
-        close_socket = getattr(db, "_close", None)
-        if callable(close_socket):
-            close_socket()
-        else:
-            sock = getattr(db, "sock", None)
-            if sock is not None:
-                try:
-                    sock.close()
-                except Exception:
-                    pass
-                try:
-                    db.sock = None
-                except Exception:
-                    pass
-    except Exception as exc:
-        log.warning("Could not discard failed mysqlremote client cleanly: %s", str(exc)[:500])
-
-
-def _interruptible_sleep(seconds: int, should_stop) -> None:
-    """Sleep in short intervals so an intentional service stop is responsive."""
-    for _ in range(max(1, int(seconds))):
-        if should_stop():
-            break
-        time.sleep(1)
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="VPS-scoped Signals Provision challenge monitor, publisher and server-approval controller"
     )
-    parser.add_argument(
-        "--execution-type", choices=("loop", "once"), default="loop",
-        help="accepted for compatibility; this worker always runs persistently"
-    )
-    parser.add_argument(
-        "--once", action="store_true",
-        help="legacy compatibility flag; ignored because this worker must remain active"
-    )
-    parser.add_argument("--interval", type=int, default=DEFAULT_INTERVAL, help=f"seconds between successful scans (default: {DEFAULT_INTERVAL})")
+    parser.add_argument("--execution-type", choices=("loop", "once"), default="loop", help="manager execution mode")
+    parser.add_argument("--once", action="store_true", help="run one VPS scan and exit (legacy alias)")
+    parser.add_argument("--interval", type=int, default=DEFAULT_INTERVAL, help=f"seconds between scans (default: {DEFAULT_INTERVAL})")
     parser.add_argument("--programme-id", type=int, default=None, help="limit to a programme only if it is still linked to this VPS")
     parser.add_argument("--vps-ip", default=None, help="override the local VPS IP; must match programme_vps.programme_vps_ip_address")
     parser.add_argument("--bridge-host", default=BRIDGE_HOST)
     parser.add_argument("--bridge-port", type=int, default=BRIDGE_PORT)
     args = parser.parse_args()
-
     if args.interval < 5:
-        log.warning("Requested scan interval %s is below 5 seconds; using 5 seconds", args.interval)
-        args.interval = 5
-
-    if args.execution_type == "once" or args.once:
-        log.warning("One-shot mode was requested but is disabled; Signals Provision will keep running.")
+        parser.error("--interval must be at least 5 seconds")
+    run_as_loop = args.execution_type == "loop" and not args.once
 
     if notifier is None:
         log.error("notification_service.py import failed; email/in-app notifications will not be sent: %s", _NOTIFICATION_IMPORT_ERROR)
-
     log.info("Signals Provision Challenge Monitor starting")
-    log.info("Execution mode: LOOP | scan interval: %ss", args.interval)
+    log.info("Execution mode: %s | scan interval: %ss", "LOOP" if run_as_loop else "ONCE", args.interval)
     log.info("VPS scope: programme_vps direct owner bindings + active programme_vps_hosts_followers")
     log.info("Challenge source: programme_analytics WHERE live_trades=1 AND trade_configured=1")
     log.info("Success action: interest_status=passed, advertisement=1, server_advertisement_approval=1")
     log.info("Failure action: interest_status=failed/breached, advertisement=0, server_advertisement_approval=0")
     log.info("Notifications: deduplicated through notification_service.py and notification_email.py")
-    log.info("Bridge policy: retry indefinitely on connection failures, bridge errors or unanswered requests")
 
     db = BridgeClient(args.bridge_host, args.bridge_port, BRIDGE_OWNER)
     stopping = False
@@ -1312,104 +1255,53 @@ def main() -> int:
     def stop(_signum: int, _frame: Any) -> None:
         nonlocal stopping
         stopping = True
-        log.warning("Stop signal received; finishing the current operation and shutting down cleanly.")
 
     signal.signal(signal.SIGINT, stop)
     if hasattr(signal, "SIGTERM"):
         signal.signal(signal.SIGTERM, stop)
 
-    scan_number = 0
-    retry_delay = 2
-    max_retry_delay = 30
-
     try:
+        scan_number = 0
         while not stopping:
             scan_number += 1
             started = time.monotonic()
-            scan_succeeded = False
             log.info("SCAN #%s STARTED | resolving VPS membership before challenge evaluation", scan_number)
-
-            try:
-                # Resolve VPS membership before any programme challenge processing.
-                vps_ip = args.vps_ip or detect_vps_ip()
-                if not vps_ip:
-                    log.error(
-                        "VPS IP is not available yet. The worker will keep retrying; "
-                        "set HARVHUB_VPS_IP or pass --vps-ip if automatic detection is unavailable."
-                    )
-                    totals = {
-                        "vps_programmes": 0, "checked": 0, "passed": 0,
-                        "failed": 0, "ongoing": 0, "skipped": 0,
-                    }
-                else:
-                    # Scope first, then apply additive challenge schema checks.
-                    scoped = discover_vps_programmes(db, vps_ip, args.programme_id)
-                    if not scoped:
-                        totals = {
-                            "vps_programmes": 0, "checked": 0, "passed": 0,
-                            "failed": 0, "ongoing": 0, "skipped": 0,
-                        }
-                    elif not ensure_monitor_schema(db):
-                        totals = {
-                            "vps_programmes": len(scoped), "checked": 0, "passed": 0,
-                            "failed": 0, "ongoing": 0, "skipped": len(scoped),
-                        }
-                        log.warning("Challenge schema is not ready; it will be checked again on the next scan.")
-                    else:
-                        # run_scan reuses VPS resolution to keep the same safe
-                        # programme set at the point processing starts.
-                        totals = run_scan(db, vps_ip, args.programme_id)
-
-                log.info(
-                    "SCAN COMPLETE | VPS programmes=%s | checked=%s | ongoing=%s | passed=%s | failed=%s | skipped=%s",
-                    totals["vps_programmes"], totals["checked"], totals["ongoing"],
-                    totals["passed"], totals["failed"], totals["skipped"],
-                )
-                scan_succeeded = True
-
-            except BridgeError as exc:
-                log.error(
-                    "MYSQLREMOTE BRIDGE FAILURE | %s | reconnecting and retrying in %ss",
-                    str(exc)[:2500], retry_delay,
-                )
-                # BridgeClient.request() closes its socket after a failed request
-                # but can retain the old channel_id. Discard the complete client
-                # and acquire a fresh channel on the next attempt.
-                _discard_bridge_client(db)
-                db = BridgeClient(args.bridge_host, args.bridge_port, BRIDGE_OWNER)
-
-            except Exception:
-                log.error(
-                    "UNEXPECTED SCAN FAILURE | the worker remains active and will retry in %ss:\\n%s",
-                    retry_delay, traceback.format_exc(),
-                )
-                # Treat an unexpected failed scan as a potentially stale bridge
-                # session as well; a fresh client is harmless for non-bridge
-                # failures and prevents reuse of an uncertain channel.
-                _discard_bridge_client(db)
-                db = BridgeClient(args.bridge_host, args.bridge_port, BRIDGE_OWNER)
-
-            if stopping:
-                break
-
-            if scan_succeeded:
-                # Reset transient-failure backoff only after a complete scan.
-                retry_delay = 2
-                elapsed = time.monotonic() - started
-                sleep_for = max(1, args.interval - int(elapsed))
-                log.info("Next challenge scan in %ss", sleep_for)
+            # Resolve VPS membership before any programme challenge processing.
+            vps_ip = args.vps_ip or detect_vps_ip()
+            if not vps_ip:
+                log.error("No VPS IP detected. Set HARVHUB_VPS_IP or pass --vps-ip; refusing to scan all programmes.")
+                totals = {"vps_programmes": 0, "checked": 0, "passed": 0, "failed": 0, "ongoing": 0, "skipped": 0}
             else:
-                sleep_for = retry_delay
-                retry_delay = min(max_retry_delay, max(2, retry_delay * 2))
-                log.warning("Signals Provision retry scheduled in %ss; process remains running.", sleep_for)
-
-            _interruptible_sleep(sleep_for, lambda: stopping)
-
+                # Scope first, then apply additive challenge schema checks.
+                scoped = discover_vps_programmes(db, vps_ip, args.programme_id)
+                if not scoped:
+                    totals = {"vps_programmes": 0, "checked": 0, "passed": 0, "failed": 0, "ongoing": 0, "skipped": 0}
+                elif not ensure_monitor_schema(db):
+                    totals = {"vps_programmes": len(scoped), "checked": 0, "passed": 0, "failed": 0, "ongoing": 0, "skipped": len(scoped)}
+                else:
+                    # run_scan reuses VPS resolution to keep the same safe
+                    # programme set at the point processing starts.
+                    totals = run_scan(db, vps_ip, args.programme_id)
+            log.info(
+                "SCAN COMPLETE | VPS programmes=%s | checked=%s | ongoing=%s | passed=%s | failed=%s | skipped=%s",
+                totals["vps_programmes"], totals["checked"], totals["ongoing"],
+                totals["passed"], totals["failed"], totals["skipped"],
+            )
+            if not run_as_loop:
+                log.info("One-shot challenge scan finished; exiting")
+                break
+            elapsed = time.monotonic() - started
+            sleep_for = max(1, args.interval - int(elapsed))
+            log.info("Next challenge scan in %ss", sleep_for)
+            for _ in range(sleep_for):
+                if stopping:
+                    break
+                time.sleep(1)
+    except BridgeError as exc:
+        log.error("Database bridge unavailable: %s", exc)
+        return 2
     finally:
-        # Do not wait on a release-channel reply during shutdown. Closing the
-        # local socket is sufficient and cannot block on an unavailable bridge.
-        _discard_bridge_client(db)
-
+        db.close()
     return 0
 
 

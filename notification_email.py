@@ -1,46 +1,49 @@
 # notification_email.py
-"""HarvHub Python notification email adapter.
+"""HarvHub SQL-queued PHP/Brevo notification-email adapter.
 
-Uses the same credential source as notification_email.php:
-    server_account.id = 1
-    server_account.mailer_email    -> verified Brevo sender
-    server_account.mailer_password -> Brevo API key
+Flow:
+    1. Insert the notification into MySQL through the existing SQL adapter.
+    2. This module opens the signed PHP relay URL itself in headless Chrome.
+    3. The PHP endpoint calls the existing notification_email.php mailer.
+    4. This function returns True only when PHP confirms Brevo accepted it.
 
-This module deliberately does NOT read server_mailer_settings. The PHP and
-Python notification pipelines must use the same server_account row.
+mysqlremote.py is not modified and does not know that email relay exists.
+No Python requests/urllib API call is made to the PHP relay.
 """
 from __future__ import annotations
 
+import atexit
+import hashlib
+import hmac
 import json
+import os
 import re
-import urllib.error
-import urllib.request
+import tempfile
+import threading
+import time
+import uuid
 from typing import Any
+from urllib.parse import urlencode
 
-_BREVO_URL = "https://api.brevo.com/v3/smtp/email"
-_CREDENTIALS_SQL = (
-    "SELECT mailer_email, mailer_password "
-    "FROM server_account WHERE id = 1 LIMIT 1"
-)
+# Only this email module uses the new hosting domain.
+_RELAY_URL = "https://harvhub.42web.io/notification_email_relay.php"
+_RELAY_HMAC_SECRET = "b89f959383065f272cf891766307a2998801ba7a1016a9da0729d5b8f36344c5"
+_RELAY_RESULT_MARKER = "HARVHUB_EMAIL_RELAY_RESULT:"
+_RELAY_TIMEOUT_SECONDS = 30
+_RELAY_MAX_NAVIGATIONS = 2
 
+_QUEUE_TABLE = "notification_email_queue"
+_EMAIL_RE = re.compile(r"[^\s@]+@[^\s@]+\.[^\s@]+")
+_CHROME_PATH = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+_CHROMEDRIVER_PATH = os.path.expanduser(r"~\.chromedriver_cache\chromedriver.exe")
 
-def _row_get(row: Any, key: str, default: Any = None) -> Any:
-    if not isinstance(row, dict):
-        return default
-    wanted = key.strip().lower()
-    for name, value in row.items():
-        if isinstance(name, str) and name.strip().lower() == wanted:
-            return value
-    return default
+_DATABASE_NAME_LOGGED = False
+_BROWSER_LOCK = threading.RLock()
+_RELAY_DRIVER = None
+_RELAY_PROFILE_DIR = None
 
 
 def _query_result(pdo: Any, sql: str) -> dict:
-    """Run a read-only query through the notification PDO/bridge adapter.
-
-    The adapters in the programme workers accept query(sql, params), while
-    some compatible adapters expose query(sql). Support both without changing
-    the database bridge or sending credentials through IPC.
-    """
     query = getattr(pdo, "query", None)
     if not callable(query):
         raise TypeError("The supplied notification database adapter has no query() method")
@@ -49,71 +52,230 @@ def _query_result(pdo: Any, sql: str) -> dict:
     except TypeError:
         result = query(sql, None)
     if not isinstance(result, dict):
-        raise TypeError(f"Database adapter returned {type(result).__name__}, expected a result dictionary")
+        raise TypeError(
+            f"Database adapter returned {type(result).__name__}, expected a result dictionary"
+        )
     if result.get("status") != "success":
         message = str(result.get("message") or "database query failed")
-        raise RuntimeError(message[:1200])
+        raise RuntimeError(message[:1500])
     return result
 
 
-def _fetch_mailer_credentials(pdo: Any) -> tuple[str, str]:
-    """Fetch (sender email, API key) from server_account; never log values."""
-    try:
-        result = _query_result(pdo, _CREDENTIALS_SQL)
-    except Exception as exc:
-        print(
-            "[HarvHub Notification Email] Could not read server_account mailer credentials "
-            f"through the Python database bridge: {type(exc).__name__}: {exc}",
-            flush=True,
-        )
-        return "", ""
+def _sql_string(value: str) -> str:
+    raw = str(value).encode("utf-8")
+    return "CONVERT(X'" + raw.hex() + "' USING utf8mb4)"
 
+
+def _sql_nullable_string(value: str | None) -> str:
+    if value is None or str(value) == "":
+        return "NULL"
+    return _sql_string(str(value))
+
+
+def _row_value(row: Any, wanted_key: str) -> Any:
+    if not isinstance(row, dict):
+        return None
+    wanted = wanted_key.strip().lower()
+    for key, value in row.items():
+        if isinstance(key, str) and key.strip().lower() == wanted:
+            return value
+    return None
+
+
+def _get_database_name(pdo: Any) -> str:
+    result = _query_result(pdo, "SELECT DATABASE() AS database_name")
     rows = result.get("results") or []
     if not rows:
-        print(
-            "[HarvHub Notification Email] server_account row id=1 was not returned "
-            "by the Python database bridge.",
-            flush=True,
-        )
-        return "", ""
-
-    sender = str(_row_get(rows[0], "mailer_email") or "").strip()
-    api_key = str(_row_get(rows[0], "mailer_password") or "").strip()
-    if not sender:
-        print("[HarvHub Notification Email] server_account.mailer_email is empty.", flush=True)
-    if not api_key:
-        print("[HarvHub Notification Email] server_account.mailer_password is empty.", flush=True)
-    return sender, api_key
+        raise RuntimeError("SELECT DATABASE() did not return a database name")
+    database_name = str(_row_value(rows[0], "database_name") or "").strip()
+    if not database_name:
+        raise RuntimeError("The SQL bridge did not identify its active database")
+    return database_name
 
 
-def _html_escape(value: str) -> str:
-    return (
-        value.replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-        .replace('"', "&quot;")
-        .replace("'", "&#39;")
+def _log_database_name_once(database_name: str) -> None:
+    global _DATABASE_NAME_LOGGED
+    if _DATABASE_NAME_LOGGED:
+        return
+    print(
+        "[HarvHub Notification Email] SQL bridge database: " + database_name,
+        flush=True,
     )
+    _DATABASE_NAME_LOGGED = True
 
 
-def _build_html(title: str, message: str) -> str:
-    safe_title = _html_escape(title)
-    safe_message = _html_escape(message).replace("\n", "<br>")
-    return (
-        "<!DOCTYPE html><html lang='en'><head><meta charset='UTF-8'>"
-        "<meta name='viewport' content='width=device-width, initial-scale=1.0'>"
-        f"<title>{safe_title}</title></head>"
-        "<body style=\"margin:0;padding:0;background-color:#f4f5f7;"
-        "font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-serif;"
-        "color:#111827;\">"
-        "<table role='presentation' width='100%' cellspacing='0' cellpadding='0' border='0' "
-        "style='background-color:#f4f5f7;padding:40px 16px;'><tr><td align='center'>"
-        "<table role='presentation' width='100%' cellspacing='0' cellpadding='0' border='0' "
-        "style='max-width:620px;background-color:#fff;border-radius:14px;overflow:hidden;'>"
-        "<tr><td style='padding:32px 28px 28px;'>"
-        f"<p style='font-size:15px;line-height:1.7;margin:0;color:#4b5563;'>{safe_message}</p>"
-        "</td></tr></table></td></tr></table></body></html>"
+def _build_signed_relay_url(database_name: str, relay_ref: str) -> str:
+    timestamp = str(int(time.time()))
+    signed_value = f"{timestamp}|{database_name}|{relay_ref}"
+    signature = hmac.new(
+        _RELAY_HMAC_SECRET.encode("utf-8"),
+        signed_value.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    query = urlencode({
+        "ts": timestamp,
+        "db": database_name,
+        "ref": relay_ref,
+        "sig": signature,
+    })
+    return f"{_RELAY_URL}?{query}"
+
+
+def _create_relay_browser():
+    """Create this module's own headless browser; mysqlremote is not involved."""
+    global _RELAY_PROFILE_DIR
+
+    try:
+        from selenium import webdriver
+        from selenium.webdriver.chrome.options import Options
+        from selenium.webdriver.chrome.service import Service
+    except Exception as exc:
+        raise RuntimeError(
+            "Selenium is unavailable in the Python environment: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+
+    options = Options()
+    if os.path.isfile(_CHROME_PATH):
+        options.binary_location = _CHROME_PATH
+
+    options.add_argument("--headless=new")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--window-size=1280,900")
+    options.add_argument("--log-level=3")
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_argument("--no-proxy-server")
+    options.add_argument("--disable-background-timer-throttling")
+    options.add_argument("--disable-renderer-backgrounding")
+    options.add_experimental_option("excludeSwitches", ["enable-logging"])
+    options.add_experimental_option("useAutomationExtension", False)
+
+    _RELAY_PROFILE_DIR = tempfile.mkdtemp(prefix="harvhub_email_relay_")
+    options.add_argument(f"--user-data-dir={_RELAY_PROFILE_DIR}")
+
+    # Reuse the ChromeDriver cache already populated by the SQL bridge when
+    # available. Selenium Manager resolves the driver otherwise.
+    if os.path.isfile(_CHROMEDRIVER_PATH):
+        service = Service(executable_path=_CHROMEDRIVER_PATH)
+        driver = webdriver.Chrome(service=service, options=options)
+    else:
+        driver = webdriver.Chrome(options=options)
+
+    driver.set_page_load_timeout(_RELAY_TIMEOUT_SECONDS)
+    return driver
+
+
+def _get_relay_browser():
+    global _RELAY_DRIVER
+    if _RELAY_DRIVER is not None:
+        try:
+            _ = _RELAY_DRIVER.current_url
+            return _RELAY_DRIVER
+        except Exception:
+            try:
+                _RELAY_DRIVER.quit()
+            except Exception:
+                pass
+            _RELAY_DRIVER = None
+
+    _RELAY_DRIVER = _create_relay_browser()
+    print(
+        "[HarvHub Notification Email] Own headless Chrome relay browser started.",
+        flush=True,
     )
+    return _RELAY_DRIVER
+
+
+def _read_relay_result(driver) -> tuple[dict | None, str]:
+    try:
+        body_text = driver.find_element("tag name", "body").text or ""
+    except Exception:
+        body_text = ""
+
+    marker_position = body_text.find(_RELAY_RESULT_MARKER)
+    if marker_position < 0:
+        return None, body_text[:1200]
+
+    encoded = body_text[marker_position + len(_RELAY_RESULT_MARKER):].strip()
+    try:
+        payload = json.loads(encoded)
+    except json.JSONDecodeError as exc:
+        return None, f"PHP relay returned an unreadable result: {exc}; body={body_text[:1200]}"
+
+    if not isinstance(payload, dict):
+        return None, "PHP relay result was not a JSON object"
+    return payload, body_text[:1200]
+
+
+def _load_php_relay(database_name: str, relay_ref: str) -> dict:
+    """Navigate to the signed PHP relay URL in this module's browser."""
+    with _BROWSER_LOCK:
+        driver = _get_relay_browser()
+        relay_url = _build_signed_relay_url(database_name, relay_ref)
+        last_detail = "PHP relay did not return its completion marker."
+
+        for attempt in range(1, _RELAY_MAX_NAVIGATIONS + 1):
+            try:
+                driver.get(relay_url)
+            except Exception as navigation_error:
+                # A page-load timeout can occur after PHP has already emitted
+                # its result. Inspect the page before treating it as a failure.
+                last_detail = (
+                    f"{type(navigation_error).__name__}: {navigation_error}"
+                )
+
+            try:
+                from selenium.webdriver.support.ui import WebDriverWait
+                WebDriverWait(driver, 8).until(
+                    lambda current: _RELAY_RESULT_MARKER in (
+                        current.find_element("tag name", "body").text or ""
+                    )
+                )
+            except Exception:
+                pass
+
+            payload, body_detail = _read_relay_result(driver)
+            if payload is not None:
+                payload["browser_url"] = str(getattr(driver, "current_url", "") or "")
+                return payload
+
+            current_url = str(getattr(driver, "current_url", "") or "")
+            title = str(getattr(driver, "title", "") or "")
+            last_detail = (
+                f"No relay completion marker. url={current_url!r}; "
+                f"title={title!r}; body={body_detail[:700]}"
+            )
+
+            # Retry one browser navigation in case the hosting provider first
+            # returned its JavaScript/browser verification interstitial.
+            if attempt < _RELAY_MAX_NAVIGATIONS:
+                time.sleep(1.0)
+
+        raise RuntimeError(last_detail[:1800])
+
+
+def close_notification_email_browser() -> None:
+    """Close the dedicated relay browser cleanly when the worker exits."""
+    global _RELAY_DRIVER, _RELAY_PROFILE_DIR
+    with _BROWSER_LOCK:
+        driver, _RELAY_DRIVER = _RELAY_DRIVER, None
+        profile_dir, _RELAY_PROFILE_DIR = _RELAY_PROFILE_DIR, None
+        if driver is not None:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+        if profile_dir:
+            try:
+                import shutil
+                shutil.rmtree(profile_dir, ignore_errors=True)
+            except Exception:
+                pass
+
+
+atexit.register(close_notification_email_browser)
 
 
 def send_notification_email(
@@ -122,124 +284,114 @@ def send_notification_email(
     message: str,
     meta: dict | None = None,
 ) -> bool:
-    meta = meta or {}
+    """Queue through SQL, then load the PHP relay directly from this module."""
+    meta = meta if isinstance(meta, dict) else {}
     recipient = str(recipient or "").strip().lower()
-    if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", recipient):
-        print("[HarvHub Notification Email] Invalid or missing recipient email.", flush=True)
+    title = str(title or "").strip() or "Notification"
+    message = str(message or "").strip()
+
+    if not _EMAIL_RE.fullmatch(recipient):
+        print(
+            "[HarvHub Notification Email] Invalid or missing recipient email; not queued.",
+            flush=True,
+        )
+        return False
+    if not message:
+        print("[HarvHub Notification Email] Empty message; not queued.", flush=True)
         return False
 
     pdo = meta.get("pdo")
     if pdo is None:
-        print("[HarvHub Notification Email] Missing database adapter in email metadata.", flush=True)
+        print(
+            "[HarvHub Notification Email] Missing SQL bridge adapter in email metadata.",
+            flush=True,
+        )
         return False
 
-    # Useful when a long-running worker imported a different module copy.
-    print(f"[HarvHub Notification Email] Using sender module: {__file__}", flush=True)
+    try:
+        notification_id = max(0, int(meta.get("notification_id") or 0))
+    except (TypeError, ValueError, OverflowError):
+        notification_id = 0
 
-    mailer_email, api_key = _fetch_mailer_credentials(pdo)
-    if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", mailer_email):
-        print("[HarvHub Notification Email] Brevo sender address is missing or invalid.", flush=True)
-        return False
-    if not api_key:
-        print("[HarvHub Notification Email] Brevo API key is missing from server_account.", flush=True)
-        return False
-
-    safe_title = str(title or "").strip() or "Notification"
-    safe_message = str(message or "").strip()
-    if not safe_message:
-        print("[HarvHub Notification Email] Empty message; email was not sent.", flush=True)
-        return False
-
-    notification_id = int(meta.get("notification_id") or 0)
+    source = str(meta.get("source") or "python_notification_service").strip()
+    relay_ref = uuid.uuid4().hex
+    source_tag = f"{source[:82]}|relay:{relay_ref}"
     recipient_name = str(meta.get("recipient_name") or "").strip()
-    if not recipient_name:
-        try:
-            name_result = _query_result(
-                pdo,
-                "SELECT fullname, first_name FROM harvhub "
-                "WHERE LOWER(email) = " + _sql_string(recipient) + " "
-                "ORDER BY id ASC LIMIT 1",
-            )
-            name_rows = name_result.get("results") or []
-            if name_rows:
-                recipient_name = (
-                    str(_row_get(name_rows[0], "first_name") or "").strip()
-                    or str(_row_get(name_rows[0], "fullname") or "").strip()
-                )
-        except Exception as exc:
-            print(
-                "[HarvHub Notification Email] Recipient-name lookup failed: "
-                f"{type(exc).__name__}: {exc}",
-                flush=True,
-            )
 
-    to_entry = {"email": recipient}
-    if recipient_name:
-        to_entry["name"] = recipient_name
+    try:
+        database_name = _get_database_name(pdo)
+        _log_database_name_once(database_name)
+    except Exception as exc:
+        print(
+            "[HarvHub Notification Email] Could not identify SQL database: "
+            f"{type(exc).__name__}: {exc}",
+            flush=True,
+        )
+        return False
 
-    payload = {
-        "sender": {"name": "HarvHub", "email": mailer_email},
-        "to": [to_entry],
-        "subject": safe_title,
-        "htmlContent": _build_html(safe_title, safe_message),
-        "textContent": safe_message,
-    }
-    encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    request = urllib.request.Request(
-        _BREVO_URL,
-        data=encoded,
-        method="POST",
-        headers={
-            "accept": "application/json",
-            "api-key": api_key,
-            "content-type": "application/json",
-        },
+    sql = (
+        f"INSERT INTO `{_QUEUE_TABLE}` "
+        "(`recipient`, `recipient_name`, `title`, `message`, `notification_id`, `source`, "
+        "`status`, `attempts`, `max_attempts`, `next_attempt_at`, `created_at`, `updated_at`) "
+        "VALUES ("
+        f"{_sql_string(recipient)}, "
+        f"{_sql_nullable_string(recipient_name)}, "
+        f"{_sql_string(title)}, "
+        f"{_sql_string(message)}, "
+        f"{notification_id}, "
+        f"{_sql_string(source_tag)}, "
+        "'pending', 0, 3, NOW(), NOW(), NOW()"
+        ")"
     )
 
     try:
-        with urllib.request.urlopen(request, timeout=25) as response:
-            status = int(response.getcode())
-            response_body = response.read().decode("utf-8", errors="replace")
-    except urllib.error.HTTPError as exc:
-        try:
-            response_body = exc.read().decode("utf-8", errors="replace")
-        except Exception:
-            response_body = ""
-        print(
-            "[HarvHub Notification Email] BREVO FAILURE"
-            f" | notification_id={notification_id} | recipient={recipient}"
-            f" | http_code={exc.code} | response={response_body[:2000]}",
-            flush=True,
-        )
-        return False
+        insert_result = _query_result(pdo, sql)
     except Exception as exc:
         print(
-            "[HarvHub Notification Email] BREVO CONNECTION FAILURE"
-            f" | notification_id={notification_id} | recipient={recipient}"
-            f" | {type(exc).__name__}: {exc}",
-            flush=True,
-        )
-        return False
-
-    if not 200 <= status < 300:
-        print(
-            "[HarvHub Notification Email] BREVO FAILURE"
-            f" | notification_id={notification_id} | recipient={recipient}"
-            f" | http_code={status} | response={response_body[:2000]}",
+            "[HarvHub Notification Email] SQL QUEUE INSERT FAILED "
+            f"| notification_id={notification_id} | recipient={recipient} "
+            f"| {type(exc).__name__}: {exc}",
             flush=True,
         )
         return False
 
     print(
-        "[HarvHub Notification Email] BREVO ACCEPTED EMAIL"
-        f" | notification_id={notification_id} | recipient={recipient}"
-        f" | http_code={status} | response={response_body[:500]}",
+        "[HarvHub Notification Email] SQL INSERT CONFIRMED "
+        f"| notification_id={notification_id} | recipient={recipient} "
+        f"| relay_ref={relay_ref} | opening {_RELAY_URL} directly",
         flush=True,
     )
-    return True
 
+    try:
+        relay = _load_php_relay(database_name, relay_ref)
+    except Exception as exc:
+        print(
+            "[HarvHub Notification Email] PHP RELAY PAGE LOAD FAILED "
+            f"| relay_ref={relay_ref} | {type(exc).__name__}: {exc}",
+            flush=True,
+        )
+        return False
 
-def _sql_string(value: str) -> str:
-    """Quote a value for the SQL-only browser bridge (not a DB-API driver)."""
-    raw = value.encode("utf-8")
-    return "CONVERT(X'" + raw.hex() + "' USING utf8mb4)"
+    target_status = str(relay.get("target_status") or "").lower()
+    if target_status == "sent" and relay.get("success"):
+        print(
+            "[HarvHub Notification Email] PHP RELAY SENT EMAIL "
+            f"| queue_id={relay.get('target_queue_id')} "
+            f"| notification_id={notification_id} | recipient={recipient} "
+            "| BREVO ACCEPTED EMAIL",
+            flush=True,
+        )
+        return True
+
+    reason = relay.get("message") or (
+        f"PHP relay target status={target_status or 'unknown'}"
+    )
+    print(
+        "[HarvHub Notification Email] PHP RELAY DID NOT SEND EMAIL "
+        f"| queue_id={relay.get('target_queue_id')} "
+        f"| notification_id={notification_id} | recipient={recipient} "
+        f"| target_status={target_status or 'unknown'} "
+        f"| {str(reason)[:1500]}",
+        flush=True,
+    )
+    return False

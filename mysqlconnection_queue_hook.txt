@@ -1,0 +1,28 @@
+ADD THIS HOOK TO THE EXISTING mysqlconnection.php
+=================================================
+
+Inside getAvailablePdoConnection(), find this exact existing line:
+
+    $GLOBALS['ACTIVE_DATABASE_SERVER'] = $server['name'];
+
+Immediately AFTER it, and BEFORE `return $pdo;`, insert:
+
+    // Drain one queued notification email during an ordinary PHP page load.
+    // This is deliberately not an HTTP call or a background/cron request.
+    try {
+        require_once __DIR__ . '/notification_email_relay.php';
+        if (function_exists('harvhubProcessNotificationEmailQueue')) {
+            harvhubProcessNotificationEmailQueue($pdo, 1);
+        }
+    } catch (Throwable $relayError) {
+        // Email queue problems must not break the website's database connection.
+        error_log(
+            '[HarvHub Email Relay] Bootstrap hook error: ' .
+            $relayError->getMessage()
+        );
+    }
+
+Leave the original `return $pdo;` immediately after this hook.
+Do not replace the DB host, database names, usernames, or passwords in your
+existing mysqlconnection.php. This is only a small insertion into the
+existing connection function.
