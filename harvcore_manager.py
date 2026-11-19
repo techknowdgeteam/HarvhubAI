@@ -498,6 +498,7 @@ class HarvCoreManager:
         self.mysql_metric_labels: dict[str, tk.Label] = {}
         self.mysql_channel_tree = None
         self.mysql_poll_started = False
+        self.mysql_auto_start_requested = False
         self.mysql_poll_stop = threading.Event()
         self.control_server_stop = threading.Event()
         self.control_server_socket = None
@@ -557,6 +558,14 @@ class HarvCoreManager:
         window_height = min(840, max(520, screen_height - 100))
         self.root.geometry(f"{window_width}x{window_height}")
         self.root.minsize(360, 520)
+        # HarvHub AI is deliberately the foreground, always-on-top desktop
+        # window. The app opens maximized instead of taking focus through a
+        # temporary command window.
+        try:
+            self.root.attributes("-topmost", True)
+            self.root.state("zoomed")
+        except tk.TclError:
+            pass
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.configure(bg=self.colors["bg"])
         self._configure_styles()
@@ -565,6 +574,7 @@ class HarvCoreManager:
         threading.Thread(target=self._control_server_loop, name="harvhub-manager-ipc", daemon=True).start()
         self.root.bind("<Configure>", self._on_root_configure, add="+")
         self.root.after(120, self._poll_events)
+        self.root.after(160, self._activate_main_window)
 
         if not is_windows():
             self._show_platform_error()
@@ -580,6 +590,19 @@ class HarvCoreManager:
         else:
             self._show_setup()
             self.auto_setup_after_id = self.root.after(700, self._auto_start_setup)
+
+    def _activate_main_window(self) -> None:
+        """Bring the maximized HarvHub window forward after Tk has mapped it."""
+        try:
+            if not self.root.winfo_exists():
+                return
+            self.root.deiconify()
+            self.root.state("zoomed")
+            self.root.attributes("-topmost", True)
+            self.root.lift()
+            self.root.focus_force()
+        except tk.TclError:
+            pass
 
     # ---------------------------- State and paths ----------------------------
     def _load_execution_config(self) -> dict:
@@ -971,17 +994,29 @@ class HarvCoreManager:
 
         report_panel = tk.Frame(right, bg=self.colors["surface2"], padx=18, pady=18)
         report_panel.pack(fill="both", expand=True)
-        tk.Label(report_panel, text="INSTALLATION REPORT", bg=self.colors["surface2"], fg=self.colors["muted"], font=("Segoe UI", 8, "bold")).pack(anchor="w")
+        tk.Label(report_panel, text="SETUP CONSOLE", bg=self.colors["surface2"], fg=self.colors["muted"], font=("Segoe UI", 8, "bold")).pack(anchor="w")
         self.setup_status_label = tk.Label(
             report_panel,
-            text="Detailed output is hidden by default.\nUse Copy Setup Report to copy the original diagnostic details when support is needed.",
-            bg=self.colors["surface2"], fg=self.colors["text"], font=("Segoe UI", 11),
+            text="Live installation output is recorded below. Any setup error and its traceback will appear here.",
+            bg=self.colors["surface2"], fg=self.colors["text"], font=("Segoe UI", 10),
             justify="left", wraplength=650,
         )
-        self.setup_status_label.pack(anchor="w", pady=(12, 0))
+        self.setup_status_label.pack(anchor="w", pady=(8, 0))
+        self.setup_console_widget = ScrolledText(
+            report_panel, height=12, wrap="word", state="disabled",
+            bg=self.colors["console_bg"], fg=self.colors["console_fg"],
+            insertbackground=self.colors["console_fg"], selectbackground=self.colors["gold"],
+            font=("Consolas", 8), relief="flat", padx=10, pady=8,
+        )
+        self.setup_console_widget.pack(fill="both", expand=True, pady=(10, 0))
+        for setup_line in self.setup_raw_lines[-4000:]:
+            self.setup_console_widget.configure(state="normal")
+            self.setup_console_widget.insert("end", str(setup_line) + "\n")
+            self.setup_console_widget.configure(state="disabled")
+        self.setup_console_widget.see("end")
         report_controls = tk.Frame(report_panel, bg=self.colors["surface2"])
-        report_controls.pack(anchor="w", pady=(18, 0))
-        self.setup_copy_button = self._button(report_controls, "COPY SETUP REPORT", self.copy_setup_report, kind="quiet")
+        report_controls.pack(anchor="w", pady=(12, 0))
+        self.setup_copy_button = self._button(report_controls, "COPY SETUP CONSOLE", self.copy_setup_report, kind="quiet")
         self.setup_copy_button.pack(side="left")
 
         footer = tk.Frame(self.content, bg=self.colors["bg"])
@@ -1027,6 +1062,14 @@ class HarvCoreManager:
         self.setup_cancel_event.clear()
         self.setup_started = True
         self.setup_raw_lines = []
+        setup_console = getattr(self, "setup_console_widget", None)
+        if setup_console is not None:
+            try:
+                setup_console.configure(state="normal")
+                setup_console.delete("1.0", "end")
+                setup_console.configure(state="disabled")
+            except tk.TclError:
+                pass
         try:
             (LOG_DIR / "setup.hclog").unlink(missing_ok=True)
         except OSError:
@@ -1140,7 +1183,11 @@ class HarvCoreManager:
             self._write_manager_log("SETUP CANCELLED by user. Already completed components remain installed and can be repaired later.")
             self._setup_emit("setup_cancelled")
         except Exception as exc:
-            self._write_manager_log(f"SETUP ERROR: {exc}")
+            diagnostic = traceback.format_exc().strip()
+            self._write_manager_log(f"SETUP ERROR: {diagnostic}")
+            self._setup_emit("setup_log", f"SETUP ERROR: {type(exc).__name__}: {exc}")
+            for diagnostic_line in diagnostic.splitlines():
+                self._setup_emit("setup_log", diagnostic_line)
             self._setup_emit("setup_error", str(exc))
 
     def _setup_step(self, key: str, status: str, detail: str = "") -> None:
@@ -1621,6 +1668,90 @@ class HarvCoreManager:
         self._show_page("home")
         self._update_summary()
         self.root.after(350, self._refresh_all_statuses)
+        self._schedule_mysql_remote_autostart()
+
+    def _schedule_mysql_remote_autostart(self) -> None:
+        """Start only MySQL Remote once the main application workspace is ready."""
+        if self.mysql_auto_start_requested or self.closing:
+            return
+        self.mysql_auto_start_requested = True
+        # Let Tk finish mapping the workspace before the background service
+        # starts. A fresh installation reaches this point immediately after
+        # setup has deployed and verified the runtime/service files.
+        self.root.after(150, self._launch_mysql_remote_on_app_start)
+
+    def _launch_mysql_remote_on_app_start(self) -> None:
+        """Automatically start the shared database bridge without Run All."""
+        if self.closing or not self.workspace_built:
+            return
+
+        def worker() -> None:
+            if self.closing:
+                return
+
+            self._ui_log(
+                "mysqlremote",
+                "[MANAGER] HarvHub AI has launched. Automatically starting the MySQL Remote connection service.\n",
+                "dim",
+            )
+
+            # Do not start a second listener when a valid HarvHub bridge is
+            # already active from an earlier manager instance.
+            status = self._request_bridge_status()
+            if isinstance(status, dict) and status.get("status") == "success":
+                self.events.put(("program_status", ("mysqlremote", "RUNNING")))
+                self._ui_log(
+                    "mysqlremote",
+                    "[MANAGER] MySQL Remote is already listening and responding. No duplicate process was started.\n",
+                    "success",
+                )
+                return
+
+            # A port occupied by an unrelated/unresponsive process must not be
+            # killed or shadowed. Report the conflict in the MySQL Remote console.
+            if self._port_open():
+                self.events.put(("program_status", ("mysqlremote", "ERROR")))
+                self._ui_log(
+                    "mysqlremote",
+                    f"[MANAGER][ERROR] {BRIDGE_HOST}:{BRIDGE_PORT} is occupied, but it did not return a valid HarvHub MySQL Remote status. The existing process was left untouched.\n",
+                    "error",
+                )
+                return
+
+            if not self.python_exe:
+                self.python_exe = locate_python()
+            if not self.python_exe:
+                self.events.put(("program_status", ("mysqlremote", "ERROR")))
+                self._ui_log(
+                    "mysqlremote",
+                    "[MANAGER][ERROR] MySQL Remote could not start because the Python runtime is unavailable. Run Setup / Repair.\n",
+                    "error",
+                )
+                return
+
+            started = self._launch_process("mysqlremote", execution_type="loop")
+            if not started:
+                return
+
+            if self._wait_for_bridge(timeout=150):
+                self._ui_log(
+                    "mysqlremote",
+                    "[MANAGER] MySQL Remote connection is ready. Other HarvHub services can now connect to the database bridge.\n",
+                    "success",
+                )
+            else:
+                self.events.put(("program_status", ("mysqlremote", "ERROR")))
+                self._ui_log(
+                    "mysqlremote",
+                    "[MANAGER][ERROR] MySQL Remote was launched automatically, but its connection listener did not become ready within 150 seconds. See the service console for details.\n",
+                    "error",
+                )
+
+        threading.Thread(
+            target=worker,
+            daemon=True,
+            name="harvhub-auto-start-mysqlremote",
+        ).start()
 
     def _build_navigation(self) -> None:
         nav = self.nav_panel
@@ -3419,9 +3550,9 @@ Write-Output $count
                         if hasattr(self, "setup_title"):
                             self.setup_title.configure(text="Setup needs attention")
                         if hasattr(self, "setup_subtitle"):
-                            self.setup_subtitle.configure(text="A component could not be prepared. Copy the setup report for the full diagnostic.")
+                            self.setup_subtitle.configure(text="A component could not be prepared. The full error is available in the setup console.")
                         if hasattr(self, "setup_status_label"):
-                            self.setup_status_label.configure(text="Setup stopped before completion.\nDetailed error information is hidden. Click Copy Setup Report to copy the original result.")
+                            self.setup_status_label.configure(text="Setup stopped. The error and full traceback are shown in the console below. Use Copy Setup Console to copy them.")
                         if hasattr(self, "setup_action"):
                             self.setup_action.configure(state="normal", text="Retry setup")
                         self.setup_started = False
@@ -3544,6 +3675,18 @@ Write-Output $count
         self.setup_raw_lines.append(text)
         if len(self.setup_raw_lines) > 50000:
             self.setup_raw_lines = self.setup_raw_lines[-50000:]
+        widget = getattr(self, "setup_console_widget", None)
+        if widget is not None:
+            try:
+                widget.configure(state="normal")
+                widget.insert("end", text + "\n")
+                line_count = int(widget.index("end-1c").split(".")[0])
+                if line_count > 4000:
+                    widget.delete("1.0", f"{line_count - 4000}.0")
+                widget.see("end")
+                widget.configure(state="disabled")
+            except tk.TclError:
+                pass
         try:
             with self.log_lock:
                 append_protected_log(LOG_DIR / "setup.hclog", f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {text}")
@@ -3663,6 +3806,86 @@ Write-Output $count
         self.root.destroy()
 
 
+def _show_startup_error_window(error_text: str) -> bool:
+    """Present unexpected startup failures in a copyable, topmost Tk console."""
+    error_root = None
+    try:
+        error_root = tk.Tk()
+        error_root.title(f"{APP_TITLE} — Startup Error")
+        error_root.geometry("1000x680")
+        error_root.minsize(680, 460)
+        error_root.configure(bg=LIGHT["bg"])
+        error_root.attributes("-topmost", True)
+        error_root.state("zoomed")
+        panel = tk.Frame(error_root, bg=LIGHT["surface"], padx=22, pady=20)
+        panel.pack(fill="both", expand=True, padx=18, pady=18)
+        tk.Label(panel, text="HarvHub AI could not start", bg=LIGHT["surface"],
+                 fg=LIGHT["text"], font=("Segoe UI", 18, "bold")).pack(anchor="w")
+        tk.Label(panel, text="The complete startup error is recorded below. Copy this console when requesting support.",
+                 bg=LIGHT["surface"], fg=LIGHT["muted"], font=("Segoe UI", 9),
+                 wraplength=900, justify="left").pack(anchor="w", pady=(7, 12))
+        console = ScrolledText(panel, wrap="word", state="normal", height=20,
+                               bg=LIGHT["console_bg"], fg=LIGHT["console_fg"],
+                               font=("Consolas", 9), relief="flat", padx=12, pady=10)
+        console.insert("end", error_text)
+        console.configure(state="disabled")
+        console.pack(fill="both", expand=True)
+        controls = tk.Frame(panel, bg=LIGHT["surface"])
+        controls.pack(fill="x", pady=(12, 0))
+        def copy_error() -> None:
+            try:
+                error_root.clipboard_clear()
+                error_root.clipboard_append(error_text)
+                error_root.update_idletasks()
+                copy_button.configure(text="COPIED")
+            except tk.TclError:
+                copy_button.configure(text="COPY FAILED")
+        copy_button = tk.Button(controls, text="COPY ERROR CONSOLE", command=copy_error,
+                                bg=LIGHT["gold"], fg="#ffffff", relief="flat",
+                                padx=16, pady=9, font=("Segoe UI", 9, "bold"))
+        copy_button.pack(side="left")
+        error_root.after(120, lambda: (error_root.lift(), error_root.focus_force()))
+        error_root.mainloop()
+        return True
+    except Exception:
+        try:
+            if error_root is not None:
+                error_root.destroy()
+        except Exception:
+            pass
+        return False
+
+
+def _launch_last_resort_error_console(error_text: str) -> None:
+    """Create a CMD window only when the app cannot display its own error UI."""
+    try:
+        import tempfile
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        report_path = Path(tempfile.gettempdir()) / f"HarvHubAI-startup-error-{stamp}.txt"
+        report_path.write_text(error_text, encoding="utf-8", errors="replace")
+        command_file = report_path.with_suffix(".cmd")
+        command_file.write_text(
+            "@echo off\r\n"
+            "title HarvHub AI - Last Resort Startup Error\r\n"
+            f'type "{report_path}"\r\n'
+            "echo.\r\n"
+            "echo HarvHub AI could not display its own error console.\r\n"
+            "pause\r\n",
+            encoding="utf-8",
+        )
+        cmd_exe = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "System32", "cmd.exe")
+        subprocess.Popen([cmd_exe, "/k", str(command_file)],
+                         creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0))
+    except Exception as fallback_error:
+        try:
+            ctypes.windll.user32.MessageBoxW(
+                None, error_text + "\n\nLast-resort error display also failed: " + str(fallback_error),
+                APP_TITLE, 0x10,
+            )
+        except Exception:
+            pass
+
+
 def main() -> None:
     # When this source file is launched directly, force the GitHub-first VBS
     # bootstrap. The frozen installed EXE and builder-launched source are exempt.
@@ -3700,10 +3923,21 @@ def main() -> None:
                 pass
             return
         return
-    root = tk.Tk()
-    force_setup = any(str(arg).strip().lower() in {"--repair", "/repair"} for arg in sys.argv[1:])
-    HarvCoreManager(root, force_setup=force_setup)
-    root.mainloop()
+    root = None
+    try:
+        root = tk.Tk()
+        force_setup = any(str(arg).strip().lower() in {"--repair", "/repair"} for arg in sys.argv[1:])
+        HarvCoreManager(root, force_setup=force_setup)
+        root.mainloop()
+    except Exception:
+        diagnostic = traceback.format_exc()
+        try:
+            if root is not None:
+                root.destroy()
+        except Exception:
+            pass
+        if not _show_startup_error_window(diagnostic):
+            _launch_last_resort_error_console(diagnostic)
 
 
 if __name__ == "__main__":
