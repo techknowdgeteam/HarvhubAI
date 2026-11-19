@@ -516,6 +516,7 @@ class HarvCoreManager:
         self.setup_step_states: dict[str, str] = {}
         self.active_setup_stage: Optional[str] = None
         self.log_lock = threading.RLock()
+        self.raw_logs_lock = threading.RLock()
         if int(self.execution_config.get("schema_version", 1) or 1) < 2:
             # Save the one-time migration so a later explicit Once selection
             # is respected instead of being reset on every launch.
@@ -2095,17 +2096,17 @@ class HarvCoreManager:
 
     def _build_program_page(self, page: tk.Frame, item: dict) -> None:
         if item["key"] == "brokerdetails":
-            # Broker Details needs room for both the manual-login attention list
-            # and its live console. Its content is taller than the fixed workspace
-            # viewport, so make this one program page vertically scrollable.
-            scroll_shell = tk.Frame(page, bg=self.colors["bg"])
-            scroll_shell.pack(fill="both", expand=True)
+            # Keep the program header (including HIDE CONSOLE and navigation
+            # controls) fixed. Only the dashboard/console body is scrollable.
+            header_parent = page
+            body_shell = tk.Frame(page, bg=self.colors["bg"])
+            body_shell.pack(side="bottom", fill="both", expand=True)
             page_canvas = tk.Canvas(
-                scroll_shell, bg=self.colors["bg"], highlightthickness=0,
+                body_shell, bg=self.colors["bg"], highlightthickness=0,
                 borderwidth=0, yscrollincrement=24,
             )
             page_scrollbar = ttk.Scrollbar(
-                scroll_shell, orient="vertical", command=page_canvas.yview,
+                body_shell, orient="vertical", command=page_canvas.yview,
             )
             page_canvas.configure(yscrollcommand=page_scrollbar.set)
             page_canvas.pack(side="left", fill="both", expand=True)
@@ -2125,8 +2126,9 @@ class HarvCoreManager:
         else:
             wrapper = tk.Frame(page, bg=self.colors["bg"])
             wrapper.pack(fill="both", expand=True)
-        header = self._card(wrapper, 18)
-        header.pack(fill="x", pady=(0, 12))
+            header_parent = wrapper
+        header = self._card(header_parent, 18)
+        header.pack(fill="x", padx=0, pady=(0, 12))
 
         title_row = tk.Frame(header, bg=self.colors["surface"])
         title_row.pack(fill="x")
@@ -2220,9 +2222,11 @@ class HarvCoreManager:
         self.console_visible[item["key"]] = False
         # Do not seed a fake "Ready." result. The console stays empty until
         # the manager or the actual child process produces a real log line.
-        if item.get("warning") and not self.raw_logs.get(item["key"]):
-            self.raw_logs[item["key"]] = ["NOTICE: " + item["warning"]]
-        for line in self.raw_logs[item["key"]][-4000:]:
+        with self.raw_logs_lock:
+            if item.get("warning") and not self.raw_logs.get(item["key"]):
+                self.raw_logs[item["key"]] = ["NOTICE: " + item["warning"]]
+            initial_console_lines = list(self.raw_logs[item["key"]][-4000:])
+        for line in initial_console_lines:
             tag = "error" if line.startswith("NOTICE:") or "Traceback" in line or "ERROR" in line else "dim" if line.startswith("[") else ""
             console.configure(state="normal")
             console.insert("end", line + "\n", tag)
@@ -2462,37 +2466,31 @@ class HarvCoreManager:
             self.refresh_computer_ip()
 
     def toggle_console(self, key: str) -> None:
-        """Show the console while keeping the Broker Details dashboard accessible.
-
-        Broker Details is vertically scrollable so its manual-login list remains
-        mounted while Show Console scrolls down to the live output. Other program
-        pages swap their hidden placeholder for the console.
-        """
+        """Swap the dashboard placeholder and console while preserving controls."""
         card = self.console_cards.get(key)
         button = self.console_toggle_buttons.get(key)
         placeholder = getattr(self, "console_placeholders", {}).get(key)
         if not card or not button:
             return
         visible = self.console_visible.get(key, False)
-        keep_dashboard_visible = key == "brokerdetails"
         if visible:
             card.pack_forget()
-            if placeholder and placeholder.winfo_exists() and not keep_dashboard_visible:
+            if placeholder and placeholder.winfo_exists():
                 placeholder.pack(fill="both", expand=True, pady=(0, 10))
             self.console_visible[key] = False
             button.configure(text="SHOW CONSOLE")
-            if keep_dashboard_visible:
-                canvas = self.program_page_canvases.get(key)
-                if canvas is not None:
-                    canvas.yview_moveto(0.0)
+            canvas = self.program_page_canvases.get(key)
+            if canvas is not None:
+                canvas.yview_moveto(0.0)
         else:
-            if placeholder and placeholder.winfo_exists() and not keep_dashboard_visible:
+            if placeholder and placeholder.winfo_exists():
                 placeholder.pack_forget()
             card.pack(fill="both", expand=True, pady=(0, 8))
             self.console_visible[key] = True
             button.configure(text="HIDE CONSOLE")
             self._sync_console_widget(key)
-            if keep_dashboard_visible:
+            canvas = self.program_page_canvases.get(key)
+            if canvas is not None:
                 self.root.after_idle(lambda selected=key: self._scroll_program_console_into_view(selected))
 
     def _scroll_program_console_into_view(self, key: str) -> None:
@@ -2518,7 +2516,8 @@ class HarvCoreManager:
         if not widget:
             return
         try:
-            lines = self.raw_logs.get(key, [])[-4000:]
+            with self.raw_logs_lock:
+                lines = list(self.raw_logs.get(key, [])[-4000:])
             widget.configure(state="normal")
             widget.delete("1.0", "end")
             # Group adjacent lines with the same style so a long console opens
@@ -2550,18 +2549,35 @@ class HarvCoreManager:
     def _copy_text(self, value: str, button: Optional[tk.Button] = None) -> None:
         try:
             self.root.clipboard_clear()
-            self.root.clipboard_append(value)
+            self.root.clipboard_append(str(value))
+            # Tk owns the clipboard selection until it services its event loop.
+            # update() flushes that ownership immediately on Windows.
             self.root.update_idletasks()
+            self.root.update()
             if button:
                 original = button.cget("text")
-                button.configure(text="Copied")
+                button.configure(text="COPIED")
                 self.root.after(1600, lambda b=button, t=original: b.configure(text=t) if b.winfo_exists() else None)
-        except tk.TclError:
-            if button:
-                button.configure(text="Copy failed")
+        except (tk.TclError, RuntimeError) as exc:
+            if button and button.winfo_exists():
+                button.configure(text="COPY FAILED")
+            self._write_manager_log(f"Clipboard copy failed: {type(exc).__name__}: {exc}")
 
     def copy_console_result(self, key: str) -> None:
-        lines = self.raw_logs.get(key, [])
+        with self.raw_logs_lock:
+            lines = list(self.raw_logs.get(key, []))
+        if not lines:
+            # Recover retained output in case the UI event queue has not yet
+            # painted it, or this console was not opened during this session.
+            lines = read_protected_log(LOG_DIR / f"{key}.hclog")
+        if not lines:
+            widget = self.console_widgets.get(key)
+            if widget is not None:
+                try:
+                    widget_lines = widget.get("1.0", "end-1c").splitlines()
+                    lines = [line for line in widget_lines if line.strip()]
+                except tk.TclError:
+                    pass
         if not lines:
             lines = [f"No console output has been recorded for {key} yet."]
         self._copy_text("\n".join(lines), self.console_copy_buttons.get(key))
@@ -2928,15 +2944,15 @@ class HarvCoreManager:
         received_output = False
         try:
             if process.stdout is None:
-                self.events.put(("console_line", (key, "[MANAGER] No stdout pipe was created for this process.", "error")))
+                self._queue_console_line(key, "[MANAGER] No stdout pipe was created for this process.", "error")
             else:
-                self.events.put(("console_line", (key, "[MANAGER] Live output reader attached; waiting for service output.", "dim")))
+                self._queue_console_line(key, "[MANAGER] Live output reader attached; waiting for service output.", "dim")
                 for line in iter(process.stdout.readline, ""):
                     received_output = True
                     self.service_output_at[key] = time.monotonic()
-                    self.events.put(("console_line", (key, line.rstrip("\r\n"))))
+                    self._queue_console_line(key, line)
         except Exception as exc:
-            self.events.put(("console_line", (key, f"[MANAGER] Console reader error: {type(exc).__name__}: {exc}", "error")))
+            self._queue_console_line(key, f"[MANAGER] Console reader error: {type(exc).__name__}: {exc}", "error")
         finally:
             try:
                 if process.stdout:
@@ -2948,10 +2964,11 @@ class HarvCoreManager:
         except Exception:
             return_code = process.poll()
         if not received_output and return_code is not None:
-            self.events.put((
-                "console_line",
-                (key, f"[MANAGER] The service exited without writing any stdout/stderr. Exit code: {return_code}. Check that the deployed script is the updated source and that it does not redirect output.", "error" if return_code else "dim"),
-            ))
+            self._queue_console_line(
+                key,
+                f"[MANAGER] The service exited without writing any stdout/stderr. Exit code: {return_code}. Check that the deployed script is the updated source and that it does not redirect output.",
+                "error" if return_code else "dim",
+            )
         watchdog_stop = self.output_watchdog_stops.get(key)
         if watchdog_stop:
             watchdog_stop.set()
@@ -2972,10 +2989,11 @@ class HarvCoreManager:
             idle_seconds = now - last_output
             if idle_seconds >= next_report:
                 uptime = int(now - started_at)
-                self.events.put((
-                    "console_line",
-                    (key, f"[MANAGER][HEALTH] Process PID {process.pid} is still running; no service output for {int(idle_seconds)}s (uptime {uptime}s). This is a process-health notice, not a work result.", "dim"),
-                ))
+                self._queue_console_line(
+                    key,
+                    f"[MANAGER][HEALTH] Process PID {process.pid} is still running; no service output for {int(idle_seconds)}s (uptime {uptime}s). This is a process-health notice, not a work result.",
+                    "dim",
+                )
                 next_report = idle_seconds + 30.0
         stop_event.set()
 
@@ -3302,7 +3320,8 @@ Write-Output $count
         return None
 
     def clear_console(self, key: str) -> None:
-        self.raw_logs[key] = []
+        with self.raw_logs_lock:
+            self.raw_logs[key] = []
         widget = self.console_widgets.get(key)
         if widget:
             widget.configure(state="normal")
@@ -3313,29 +3332,45 @@ Write-Output $count
         except OSError:
             pass
 
-    def _append_console(self, key: str, line: str, tag: Optional[str] = None) -> None:
-        text = str(line)
-        # Strip the legacy fake Ready line if an older protected log contains it.
+    def _record_console_line(self, key: str, line: str) -> None:
+        """Store output immediately so Copy Console never races the Tk event pump."""
+        text = str(line).rstrip("\r\n")
         item = self._program(key)
         ready_placeholder = f"[{item['label']}] Ready." if item else None
-        current_lines = self.raw_logs.setdefault(key, [])
-        if ready_placeholder and ready_placeholder in current_lines:
-            self.raw_logs[key] = [entry for entry in current_lines if entry != ready_placeholder]
-        self.raw_logs.setdefault(key, []).append(text)
-        if len(self.raw_logs[key]) > 30000:
-            self.raw_logs[key] = self.raw_logs[key][-30000:]
+        with self.raw_logs_lock:
+            current_lines = self.raw_logs.setdefault(key, [])
+            if ready_placeholder and ready_placeholder in current_lines:
+                current_lines[:] = [entry for entry in current_lines if entry != ready_placeholder]
+            current_lines.append(text)
+            if len(current_lines) > 30000:
+                del current_lines[:-30000]
         try:
             with self.log_lock:
-                append_protected_log(LOG_DIR / f"{key}.hclog", f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {text}")
+                append_protected_log(
+                    LOG_DIR / f"{key}.hclog",
+                    f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {text}",
+                )
         except Exception:
             # Never fall back to a plaintext diagnostic file.
             pass
+
+    def _queue_console_line(self, key: str, line: str, tag: Optional[str] = None) -> None:
+        text = str(line).rstrip("\r\n")
+        self._record_console_line(key, text)
+        self.events.put(("console_line", (key, text, tag, True)))
+
+    def _append_console(
+        self, key: str, line: str, tag: Optional[str] = None, *, record: bool = True,
+    ) -> None:
+        text = str(line).rstrip("\r\n")
+        if record:
+            self._record_console_line(key, text)
         widget = self.console_widgets.get(key)
         if not widget:
             return
         try:
             widget.configure(state="normal")
-            widget.insert("end", text + ("" if text.endswith("\n") else "\n"), tag or "")
+            widget.insert("end", text + "\n", tag or "")
             line_count = int(widget.index("end-1c").split(".")[0])
             if line_count > 4000:
                 widget.delete("1.0", f"{line_count - 4000}.0")
@@ -3345,7 +3380,7 @@ Write-Output $count
             pass
 
     def _ui_log(self, key: str, line: str, tag: Optional[str] = None) -> None:
-        self.events.put(("console_line", (key, line.rstrip("\n"), tag)))
+        self._queue_console_line(key, line, tag)
         self._write_manager_log(f"{key}: {line.rstrip()}")
 
     # ------------------------------ UI events --------------------------------
@@ -3392,7 +3427,9 @@ Write-Output $count
                         self.setup_started = False
                     elif event == "console_line":
                         key, line, *rest = data
-                        self._append_console(key, str(line), rest[0] if rest else None)
+                        tag = rest[0] if rest else None
+                        already_recorded = bool(rest[1]) if len(rest) > 1 else False
+                        self._append_console(key, str(line), tag, record=not already_recorded)
                     elif event == "mysql_metrics":
                         # _mysql_status_poll_loop queues the dict directly. Older
                         # manager builds (and any compatibility producer) may

@@ -62,6 +62,7 @@ for more details." Deduplicated per sub-account.
 """
 
 import atexit
+import ctypes
 import os
 import re
 import sys
@@ -759,53 +760,166 @@ def delete_mt5_folder(folder_abs, tag='SA'):
 # ==============================================================================
 #  Terminal launcher
 # ==============================================================================
-_LAUNCHED_FOLDERS = set()
-_LAUNCH_LOCK      = threading.Lock()
+# Keep a short startup reservation rather than a permanent "launched" flag.
+# This prevents concurrent scans from opening the same terminal while Windows
+# is still creating its process, but still permits a manually closed terminal
+# to be reopened on a later scan.
+_LAUNCHED_FOLDERS = {}
+_LAUNCH_LOCK = threading.Lock()
+_TERMINAL_STARTUP_GRACE = 15.0
+
+
+def _normalise_windows_path(value):
+    value = os.path.normcase(os.path.normpath(os.path.abspath(str(value or ''))))
+    if value.startswith('\\\\?\\'):
+        value = value[4:]
+    return value
 
 
 def _terminal_running_for_folder(folder_abs):
+    """Check the actual process image path, not whether the EXE can be opened.
+
+    Opening terminal64.exe in append mode is not a process check: Windows often
+    permits opening the executable while it is running. Enumerate Windows
+    processes and compare QueryFullProcessImageNameW with this portable folder.
+    """
     target_exe = os.path.join(folder_abs, "terminal64.exe")
-    if not os.path.exists(target_exe):
+    if not os.path.isfile(target_exe):
         return False
+
+    if os.name != 'nt':
+        # The production collector runs on Windows. Avoid treating an unrelated
+        # terminal64.exe elsewhere on the system as this portable terminal.
+        return False
+
     try:
-        with open(target_exe, 'a'):
-            pass
-    except Exception:
-        return True
-    return False
+        from ctypes import wintypes
+
+        class PROCESSENTRY32W(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", wintypes.DWORD),
+                ("cntUsage", wintypes.DWORD),
+                ("th32ProcessID", wintypes.DWORD),
+                ("th32DefaultHeapID", ctypes.c_size_t),
+                ("th32ModuleID", wintypes.DWORD),
+                ("cntThreads", wintypes.DWORD),
+                ("th32ParentProcessID", wintypes.DWORD),
+                ("pcPriClassBase", ctypes.c_long),
+                ("dwFlags", wintypes.DWORD),
+                ("szExeFile", wintypes.WCHAR * 260),
+            ]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+        kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+        kernel32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+        kernel32.Process32FirstW.restype = wintypes.BOOL
+        kernel32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+        kernel32.Process32NextW.restype = wintypes.BOOL
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.QueryFullProcessImageNameW.argtypes = [
+            wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+
+        snapshot = kernel32.CreateToolhelp32Snapshot(0x00000002, 0)
+        invalid_handle = ctypes.c_void_p(-1).value
+        # A HANDLE restype is converted to a Python int by ctypes on Windows;
+        # do not cast that integer as though it were already a pointer object.
+        snapshot_value = snapshot.value if isinstance(snapshot, ctypes.c_void_p) else snapshot
+        if snapshot_value in (None, 0, invalid_handle):
+            raise OSError(ctypes.get_last_error(), "CreateToolhelp32Snapshot failed")
+
+        target = _normalise_windows_path(target_exe)
+        entry = PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+        found = False
+        try:
+            more = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
+            while more:
+                if entry.szExeFile.lower() == "terminal64.exe":
+                    process_handle = kernel32.OpenProcess(
+                        0x1000, False, int(entry.th32ProcessID)
+                    )
+                    if process_handle:
+                        try:
+                            buffer = ctypes.create_unicode_buffer(32768)
+                            size = wintypes.DWORD(len(buffer))
+                            if kernel32.QueryFullProcessImageNameW(
+                                process_handle, 0, buffer, ctypes.byref(size)
+                            ):
+                                if _normalise_windows_path(buffer.value) == target:
+                                    found = True
+                                    break
+                        finally:
+                            kernel32.CloseHandle(process_handle)
+                more = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
+        finally:
+            kernel32.CloseHandle(snapshot)
+        return found
+    except Exception as e:
+        print(f"      [LAUNCH][PROCESS-CHECK] Could not inspect Windows process paths: {e}")
+        return False
 
 
 def launch_terminal(terminal_exe, folder_abs):
-    folder_key = os.path.normcase(os.path.abspath(folder_abs))
+    folder_key = _normalise_windows_path(folder_abs)
 
+    # One lock covers process detection and Popen. Retain the Popen handle so
+    # later scans can tell whether the exact process started by this service is
+    # still alive, even if a Windows process-path query is temporarily denied.
     with _LAUNCH_LOCK:
-        if folder_key in _LAUNCHED_FOLDERS:
-            print(f"      [LAUNCH] already launched this session: {terminal_exe}")
+        now = time.monotonic()
+        reservation = _LAUNCHED_FOLDERS.get(folder_key)
+        launched_at = None
+        if isinstance(reservation, dict):
+            launched_at = reservation.get('started_at')
+            process = reservation.get('process')
+            if process is not None:
+                try:
+                    if process.poll() is None:
+                        print(f"      [LAUNCH] this service already owns the running terminal: {terminal_exe}")
+                        return False, True
+                except Exception:
+                    pass
+        elif reservation is not None:
+            # Compatibility with an in-memory reservation created by an older
+            # version during a hot reload.
+            launched_at = reservation
+
+        if _terminal_running_for_folder(folder_abs):
+            _LAUNCHED_FOLDERS[folder_key] = {'started_at': now, 'process': None}
+            print(f"      [LAUNCH] exact portable terminal already running: {terminal_exe}")
             return False, True
 
-    if _terminal_running_for_folder(folder_abs):
-        with _LAUNCH_LOCK:
-            _LAUNCHED_FOLDERS.add(folder_key)
-        print(f"      [LAUNCH] terminal already running: {terminal_exe}")
-        return False, True
+        if launched_at is not None and (now - float(launched_at)) < _TERMINAL_STARTUP_GRACE:
+            print(f"      [LAUNCH] startup already requested; suppressing duplicate: {terminal_exe}")
+            return False, True
 
-    try:
-        DETACHED_PROCESS = 0x00000008
-        CREATE_NEW_PROCESS_GROUP = 0x00000200
-        subprocess.Popen(
-            [terminal_exe, "/portable"],
-            cwd=folder_abs,
-            creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
-            close_fds=True,
-        )
-    except Exception as e:
-        print(f"      [LAUNCH] failed: {e}")
-        return False, False
+        # Stale reservations are discarded so a terminal closed by its user
+        # can be started again on a later scan.
+        _LAUNCHED_FOLDERS.pop(folder_key, None)
 
-    with _LAUNCH_LOCK:
-        _LAUNCHED_FOLDERS.add(folder_key)
-    print(f"      [LAUNCH] started: {terminal_exe}")
-    return True, True
+        try:
+            DETACHED_PROCESS = 0x00000008
+            CREATE_NEW_PROCESS_GROUP = 0x00000200
+            process = subprocess.Popen(
+                [terminal_exe, "/portable"],
+                cwd=folder_abs,
+                creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+                close_fds=True,
+            )
+        except Exception as e:
+            print(f"      [LAUNCH] failed: {e}")
+            return False, False
+
+        _LAUNCHED_FOLDERS[folder_key] = {'started_at': now, 'process': process}
+        print(f"      [LAUNCH] started once: {terminal_exe} (PID={getattr(process, 'pid', 'unknown')})")
+        return True, True
 
 
 def bring_terminal_to_front(terminal_exe):
@@ -912,7 +1026,7 @@ def kill_terminal_for_folder(folder_abs):
     if not procs:
         print(f"      [KILL-TERMINAL] no MT5 process running")
         with _LAUNCH_LOCK:
-            _LAUNCHED_FOLDERS.discard(os.path.normcase(os.path.abspath(folder_abs)))
+            _LAUNCHED_FOLDERS.pop(_normalise_windows_path(folder_abs), None)
         return 0
 
     print(f"      [KILL-TERMINAL] found running MT5 processes: {procs}")
@@ -920,7 +1034,7 @@ def kill_terminal_for_folder(folder_abs):
     kill_pids(pids)
 
     with _LAUNCH_LOCK:
-        _LAUNCHED_FOLDERS.discard(os.path.normcase(os.path.abspath(folder_abs)))
+        _LAUNCHED_FOLDERS.pop(_normalise_windows_path(folder_abs), None)
 
     return len(pids)
 
@@ -1399,38 +1513,33 @@ def _get_broker_login_status(user_id):
     return None
 
 
-def _fetch_row_for_notify(user_id, sub_account_id):
-    sql = (
-        "SELECT id, sub_account_id, main_account_id, email, "
-        "broker, server, login, broker_password, "
-        "broker_login_status, broker_login_attempt_used, "
-        "broker_total_login_attempt, demo_account, "
-        "disconnect_broker_request "
-        "FROM harvhub WHERE id = %s LIMIT 1"
+def _fetch_row_for_notify(row_id, sub_account_id):
+    columns = (
+        "id, sub_account_id, main_account_id, email, broker, server, login, "
+        "broker_password, broker_login_status, broker_login_attempt_used, "
+        "broker_total_login_attempt, demo_account, disconnect_broker_request"
     )
-    res = db_query(sql, [user_id], timeout=15.0, quiet=True)
-    if res.get('status') == 'success' and res.get('results'):
-        return _normalize_row(res['results'][0])
-
-    if sub_account_id is not None and sub_account_id != user_id:
-        sql2 = (
-            "SELECT id, sub_account_id, main_account_id, email, "
-            "broker, server, login, broker_password, "
-            "broker_login_status, broker_login_attempt_used, "
-            "broker_total_login_attempt, demo_account, "
-            "disconnect_broker_request "
-            "FROM harvhub WHERE sub_account_id = %s LIMIT 1"
+    if row_id is not None:
+        res = db_query(
+            f"SELECT {columns} FROM harvhub WHERE id = %s LIMIT 1",
+            [row_id], timeout=15.0, quiet=True,
         )
-        res2 = db_query(sql2, [sub_account_id], timeout=15.0, quiet=True)
-        if res2.get('status') == 'success' and res2.get('results'):
-            return _normalize_row(res2['results'][0])
+        if res.get('status') == 'success' and res.get('results'):
+            return _normalize_row(res['results'][0])
 
+    if sub_account_id is not None:
+        res = db_query(
+            f"SELECT {columns} FROM harvhub WHERE sub_account_id = %s ORDER BY id DESC LIMIT 1",
+            [sub_account_id], timeout=15.0, quiet=True,
+        )
+        if res.get('status') == 'success' and res.get('results'):
+            return _normalize_row(res['results'][0])
     return None
 
 
-def _set_broker_login_status(user_id, status):
+def _set_broker_login_status(row_id, status):
     sql = "UPDATE harvhub SET broker_login_status = %s WHERE id = %s"
-    res = db_query(sql, [status, user_id], timeout=10.0, quiet=True)
+    res = db_query(sql, [status, row_id], timeout=10.0, quiet=True)
     return res.get('status') == 'success'
 
 
@@ -1453,19 +1562,18 @@ def _increment_broker_login_attempt(user_id):
     return None
 
 
-def _reset_broker_login_attempt(user_id):
+def _reset_broker_login_attempt(row_id):
     sql = "UPDATE harvhub SET broker_login_attempt_used = NULL WHERE id = %s"
-    res = db_query(sql, [user_id], timeout=10.0, quiet=True)
+    res = db_query(sql, [row_id], timeout=10.0, quiet=True)
     return res.get('status') == 'success'
 
 
-def _notify_broker_failure(user_id, sub_account_id, new_status):
+def _notify_broker_failure(row_id, sub_account_id, new_status):
     if new_status not in TERMINAL_NEGATIVE_STATUSES:
         return None
 
-    # Batched: clear fields, increment attempt counter, set status — all
-    # in one bridge request.
-    uid = _sql_int(user_id)
+    # Batched: mutate only the selected sub-account row, not its owner row.
+    uid = _sql_int(row_id)
     st  = _sql_quote(new_status)
 
     clear_stmt = (
@@ -1499,23 +1607,22 @@ def _notify_broker_failure(user_id, sub_account_id, new_status):
             new_used = _coerce_int(v)
             break
 
-    row = _fetch_row_for_notify(user_id, sub_account_id)
-    print(f"      [SA][NOTIFY-DEBUG] fetched row before dispatch = {row!r}")
+    row = _fetch_row_for_notify(row_id, sub_account_id)
     if row is None:
-        print(f"      [SA][NOTIFY] could not re-fetch row for user={user_id}")
+        print(f"      [SA][NOTIFY] could not re-fetch target HarvHub row id={row_id}")
         return new_used
 
     try:
         notif_id = notifier.record_broker_login_status_notification(_PDO, row)
         if notif_id:
             print(
-                f"      [SA][NOTIFY] user={user_id} status={new_status} "
+                f"      [SA][NOTIFY] row={row_id} status={new_status} "
                 f"-> notification_id={notif_id} "
                 f"(attempts used = {new_used})"
             )
         else:
             print(
-                f"      [SA][NOTIFY] user={user_id} status={new_status} "
+                f"      [SA][NOTIFY] row={row_id} status={new_status} "
                 f"-> no notification created (dedup or ineligible state)"
             )
     except Exception as e:
@@ -1525,22 +1632,22 @@ def _notify_broker_failure(user_id, sub_account_id, new_status):
     return new_used
 
 
-def _notify_broker_success(user_id, sub_account_id):
-    row = _fetch_row_for_notify(user_id, sub_account_id)
+def _notify_broker_success(row_id, sub_account_id):
+    row = _fetch_row_for_notify(row_id, sub_account_id)
     if row is None:
-        print(f"      [SA][NOTIFY-SUCCESS] could not re-fetch row for user={user_id}")
+        print(f"      [SA][NOTIFY-SUCCESS] could not re-fetch target row id={row_id}")
         return None
 
     try:
         notif_id = notifier.record_broker_login_success_notification(_PDO, row)
         if notif_id:
             print(
-                f"      [SA][NOTIFY-SUCCESS] user={user_id} "
+                f"      [SA][NOTIFY-SUCCESS] row={row_id} "
                 f"-> notification_id={notif_id}"
             )
         else:
             print(
-                f"      [SA][NOTIFY-SUCCESS] user={user_id} "
+                f"      [SA][NOTIFY-SUCCESS] row={row_id} "
                 f"-> no notification created"
             )
         return notif_id
@@ -1550,22 +1657,22 @@ def _notify_broker_success(user_id, sub_account_id):
         return None
 
 
-def _notify_broker_reconnected(user_id, sub_account_id):
-    row = _fetch_row_for_notify(user_id, sub_account_id)
+def _notify_broker_reconnected(row_id, sub_account_id):
+    row = _fetch_row_for_notify(row_id, sub_account_id)
     if row is None:
-        print(f"      [SA][NOTIFY-RECONNECTED] could not re-fetch row for user={user_id}")
+        print(f"      [SA][NOTIFY-RECONNECTED] could not re-fetch target row id={row_id}")
         return None
 
     try:
         notif_id = notifier.record_broker_login_reconnected_notification(_PDO, row)
         if notif_id:
             print(
-                f"      [SA][NOTIFY-RECONNECTED] user={user_id} "
+                f"      [SA][NOTIFY-RECONNECTED] row={row_id} "
                 f"-> notification_id={notif_id}"
             )
         else:
             print(
-                f"      [SA][NOTIFY-RECONNECTED] user={user_id} "
+                f"      [SA][NOTIFY-RECONNECTED] row={row_id} "
                 f"-> no notification created"
             )
         return notif_id
@@ -2088,25 +2195,57 @@ _MANUAL_WINDOW = _ManualLoginWindow()
 #  [SA] / [PRG] row fetchers
 # ==============================================================================
 def _fetch_broker_row(user_id, sub_account_id):
+    """Fetch the exact HarvHub row for this SA target.
+
+    VPS bindings carry both the owner/user id and the selected sub-account id.
+    The selected sub-account must be resolved first; querying id=user_id first
+    silently returned the owner's credentials for every child sub-account.
+    """
     select_cols = _broker_select_sql()
+    uid = _coerce_int(user_id)
+    sid = _coerce_int(sub_account_id)
 
-    if user_id is not None:
+    if sid is not None and uid is not None and sid != uid:
+        # Preferred relationship: the child's sub_account_id plus its owner.
+        sql = (
+            f"SELECT {select_cols} FROM harvhub "
+            "WHERE sub_account_id = %s AND main_account_id = %s "
+            "ORDER BY id DESC LIMIT 1"
+        )
+        res = db_query(sql, [sid, uid], timeout=15.0, quiet=True)
+        if res.get('status') == 'success' and res.get('results'):
+            row = _normalize_row(res['results'][0])
+            print(f"      [SA][ROW] resolved exact child by sub_account_id={sid}, owner={uid}, row_id={row.get('id')}")
+            return row
+
+        # Some installations do not populate main_account_id consistently.
+        sql = f"SELECT {select_cols} FROM harvhub WHERE sub_account_id = %s ORDER BY id DESC LIMIT 1"
+        res = db_query(sql, [sid], timeout=15.0, quiet=True)
+        if res.get('status') == 'success' and res.get('results'):
+            row = _normalize_row(res['results'][0])
+            row_owner = _coerce_int(_pick_first_key(row, 'main_account_id'))
+            if row_owner in (None, uid):
+                print(f"      [SA][ROW] resolved child by sub_account_id={sid}, row_id={row.get('id')}")
+                return row
+            print(f"      [SA][ROW] rejected sub_account_id={sid} because row owner={row_owner}, expected owner={uid}")
+
+        # Compatibility with VPS rows which store the HarvHub child primary key.
         sql = f"SELECT {select_cols} FROM harvhub WHERE id = %s LIMIT 1"
-        res = db_query(sql, [user_id], timeout=15.0, quiet=True)
+        res = db_query(sql, [sid], timeout=15.0, quiet=True)
         if res.get('status') == 'success' and res.get('results'):
-            return _normalize_row(res['results'][0])
+            row = _normalize_row(res['results'][0])
+            row_owner = _coerce_int(_pick_first_key(row, 'main_account_id'))
+            is_main = _coerce_int(_pick_first_key(row, 'is_main_account'))
+            if row_owner in (None, uid) and is_main != 1:
+                print(f"      [SA][ROW] resolved child by primary key={sid}, owner={uid}")
+                return row
 
-    if sub_account_id is not None and sub_account_id != user_id:
-        sql = f"SELECT {select_cols} FROM harvhub WHERE sub_account_id = %s LIMIT 1"
-        res = db_query(sql, [sub_account_id], timeout=15.0, quiet=True)
-        if res.get('status') == 'success' and res.get('results'):
-            return _normalize_row(res['results'][0])
+        print(f"      [SA][ROW ERROR] no exact HarvHub sub-account row found for owner={uid}, sub={sid}; refusing to use the owner's row")
+        return None
 
-    if sub_account_id is not None:
-        sql = (f"SELECT {select_cols} FROM harvhub "
-               f"WHERE main_account_id = %s "
-               f"ORDER BY is_main_account ASC, id ASC LIMIT 1")
-        res = db_query(sql, [sub_account_id], timeout=15.0, quiet=True)
+    if uid is not None:
+        sql = f"SELECT {select_cols} FROM harvhub WHERE id = %s LIMIT 1"
+        res = db_query(sql, [uid], timeout=15.0, quiet=True)
         if res.get('status') == 'success' and res.get('results'):
             return _normalize_row(res['results'][0])
 
@@ -2150,6 +2289,7 @@ def _process_target(row, role, user_id, sub_account_id):
         'ok':             False,
     }
 
+    account_row_id = _coerce_int(_pick_first_key(row, 'id')) or user_id
     login         = _pick_first_key(row, 'login')
     server        = _pick_first_key(row, 'server') or ''
     broker        = _pick_first_key(row, 'broker') or ''
@@ -2181,18 +2321,26 @@ def _process_target(row, role, user_id, sub_account_id):
         result['reason'] = f'folder: {msg_folder}'
         return result
 
-    was_running_before = _terminal_running_for_folder(folder_abs)
-    launched_now, ok_launch = launch_terminal(terminal_exe, folder_abs)
-    if not ok_launch:
-        result['reason'] = 'launch failed'
-        return result
-
+    # Consume the user's decision BEFORE any launch attempt. The terminal is
+    # already open for manual login; launching first on the decision cycle can
+    # create the very duplicate window the Valid button is meant to finish.
     queued = _MANUAL_WINDOW.take_decision('SA', user_id, sub_account_id)
     if queued == 'valid':
-        print(f"      [SA][UI-DECISION] sub={sub_account_id} -> valid (queued)")
-        _reset_broker_login_attempt(user_id)
-        _set_broker_login_status(user_id, VALID_STATUS)
-        _notify_broker_success(user_id, sub_account_id)
+        print(f"      [SA][UI-DECISION] sub={sub_account_id} -> valid (queued); no terminal launch will be attempted")
+        reset_ok = _reset_broker_login_attempt(account_row_id)
+        status_ok = _set_broker_login_status(account_row_id, VALID_STATUS)
+        if not status_ok:
+            print(f"      [SA][UI-DECISION][DB ERROR] could not persist valid_credentials for HarvHub row id={account_row_id}; keeping the manual-login item available for retry")
+            _MANUAL_WINDOW.add_item(
+                kind='SA', owner_id=user_id, account_id=sub_account_id,
+                broker=broker, server=server, login=login_int,
+                password=password, terminal_exe=terminal_exe,
+            )
+            result['reason'] = 'valid_status_write_failed'
+            return result
+        if not reset_ok:
+            print(f"      [SA][UI-DECISION][WARN] could not reset login-attempt counter for row id={account_row_id}")
+        _notify_broker_success(account_row_id, sub_account_id)
         _mark_terminal_live('SA', user_id, sub_account_id)
         _MANUAL_WINDOW.remove_item('SA', user_id, sub_account_id)
         result['ok'] = True
@@ -2206,7 +2354,7 @@ def _process_target(row, role, user_id, sub_account_id):
     elif queued == 'invalid':
         print(f"      [SA][UI-DECISION] sub={sub_account_id} -> invalid (queued)")
         _notify_broker_failure(
-            user_id=user_id,
+            row_id=account_row_id,
             sub_account_id=sub_account_id,
             new_status='invalid_credentials',
         )
@@ -2217,6 +2365,12 @@ def _process_target(row, role, user_id, sub_account_id):
         result['broker'] = broker
         result['folder'] = folder_abs
         result['terminal_exe'] = terminal_exe
+        return result
+
+    was_running_before = _terminal_running_for_folder(folder_abs)
+    launched_now, ok_launch = launch_terminal(terminal_exe, folder_abs)
+    if not ok_launch:
+        result['reason'] = 'launch failed'
         return result
 
     time.sleep(TERMINAL_BOOT_WAIT)
@@ -2235,7 +2389,7 @@ def _process_target(row, role, user_id, sub_account_id):
                           f"({term_name}) — treating as invalid_account")
 
                     new_used = _notify_broker_failure(
-                        user_id=user_id,
+                        row_id=account_row_id,
                         sub_account_id=sub_account_id,
                         new_status='invalid_account',
                     )
@@ -2263,7 +2417,7 @@ def _process_target(row, role, user_id, sub_account_id):
                               f"launched_now={launched_now}) — "
                               f"firing reconnect email")
 
-                        _notify_broker_reconnected(user_id, sub_account_id)
+                        _notify_broker_reconnected(account_row_id, sub_account_id)
 
                         _mark_terminal_live('SA', user_id, sub_account_id)
                         _MANUAL_WINDOW.remove_item('SA', user_id, sub_account_id)
@@ -2325,9 +2479,9 @@ def _process_target(row, role, user_id, sub_account_id):
                       f"matches '{expected_name}' | demo_account={demo_int} "
                       f"— firing success email")
 
-                _reset_broker_login_attempt(user_id)
-                _set_broker_login_status(user_id, VALID_STATUS)
-                _notify_broker_success(user_id, sub_account_id)
+                _reset_broker_login_attempt(account_row_id)
+                _set_broker_login_status(account_row_id, VALID_STATUS)
+                _notify_broker_success(account_row_id, sub_account_id)
                 _mark_terminal_live('SA', user_id, sub_account_id)
 
                 result['ok'] = True
@@ -2345,7 +2499,7 @@ def _process_target(row, role, user_id, sub_account_id):
                   f"name='{term_name}' != expected '{expected_name}'")
 
             new_used = _notify_broker_failure(
-                user_id=user_id,
+                row_id=account_row_id,
                 sub_account_id=sub_account_id,
                 new_status='fullname_mismatch',
             )
@@ -2681,6 +2835,8 @@ def _fetch_programmes_for_owner(user_id):
 def _collect_sa_candidates_for_ip(local_ip):
     owners    = []
     followers = []
+    seen_owner_targets = set()
+    seen_follower_targets = set()
 
     vps_sql = (
         "SELECT id, user_id, sub_account_id, programme_id, vps_ip_address "
@@ -2707,6 +2863,11 @@ def _collect_sa_candidates_for_ip(local_ip):
             continue
 
         sub_norm = sub if (sub is not None and sub > 0) else uid
+        identity = (uid, sub_norm)
+        if identity in seen_owner_targets:
+            print(f"   [SA][OWNER][DEDUP] duplicate VPS binding ignored: user={uid} sub={sub_norm}")
+            continue
+        seen_owner_targets.add(identity)
         owners.append({
             'vps_row_id':     vpsid,
             'user_id':        uid,
@@ -2740,11 +2901,17 @@ def _collect_sa_candidates_for_ip(local_ip):
                     row, 'follower_sub_account_id', 'followersubaccountid'))
                 if fid is None:
                     continue
+                fsub_norm = fsub if fsub is not None else fid
+                identity = (fid, fsub_norm)
+                if identity in seen_follower_targets:
+                    print(f"   [SA][FOLLOWER][DEDUP] duplicate follower binding ignored: user={fid} sub={fsub_norm}")
+                    continue
+                seen_follower_targets.add(identity)
                 followers.append({
                     'owner_id':                _coerce_int(_pick_first_key(row, 'owner_id')),
                     'owner_sub_account_id':    _coerce_int(_pick_first_key(row, 'sub_account_id')),
                     'follower_id':             fid,
-                    'follower_sub_account_id': fsub if fsub is not None else fid,
+                    'follower_sub_account_id': fsub_norm,
                 })
 
     print(f"   [SA][FOLLOWER] Detected: {len(followers)}")
@@ -2910,9 +3077,16 @@ def check_if_broker_is_logged_in(inv_id=None):
         report['followers'] = sa_followers
 
         print(f"\n   --- [SA] OWNERS ---")
+        processed_sa_candidates = set()
+        processed_sa_row_ids = set()
         for owner in report['owners']:
             uid = owner['user_id']
             sub = owner['sub_account_id']
+            candidate_key = (uid, sub)
+            if candidate_key in processed_sa_candidates:
+                print(f"      [SA][DEDUP] already handled user={uid} sub={sub}; skipping duplicate owner binding")
+                continue
+            processed_sa_candidates.add(candidate_key)
             print(f"\n   [SA][OWNER] user={uid} sub={sub}")
             row = _fetch_broker_row(user_id=uid, sub_account_id=sub)
             if not row:
@@ -2923,6 +3097,12 @@ def check_if_broker_is_logged_in(inv_id=None):
                     'ok': False, 'reason': 'no harvhub row',
                 })
                 continue
+            canonical_row_id = _coerce_int(_pick_first_key(row, 'id'))
+            if canonical_row_id is not None and canonical_row_id in processed_sa_row_ids:
+                print(f"      [SA][DEDUP] HarvHub row id={canonical_row_id} already processed; skipping duplicate owner target")
+                continue
+            if canonical_row_id is not None:
+                processed_sa_row_ids.add(canonical_row_id)
             res = _process_target(row, role='owner', user_id=uid, sub_account_id=sub)
             report['owner_results'].append(res)
 
@@ -2932,6 +3112,11 @@ def check_if_broker_is_logged_in(inv_id=None):
         for fol in report['followers']:
             uid = fol['follower_id']
             sub = fol['follower_sub_account_id']
+            candidate_key = (uid, sub)
+            if candidate_key in processed_sa_candidates:
+                print(f"      [SA][DEDUP] already handled user={uid} sub={sub}; skipping duplicate follower binding")
+                continue
+            processed_sa_candidates.add(candidate_key)
             print(f"\n   [SA][FOLLOWER] user={uid} sub={sub}")
             row = _fetch_broker_row(user_id=uid, sub_account_id=sub)
             if not row:
@@ -2942,6 +3127,12 @@ def check_if_broker_is_logged_in(inv_id=None):
                     'ok': False, 'reason': 'no harvhub row',
                 })
                 continue
+            canonical_row_id = _coerce_int(_pick_first_key(row, 'id'))
+            if canonical_row_id is not None and canonical_row_id in processed_sa_row_ids:
+                print(f"      [SA][DEDUP] HarvHub row id={canonical_row_id} already processed; skipping duplicate follower target")
+                continue
+            if canonical_row_id is not None:
+                processed_sa_row_ids.add(canonical_row_id)
             res = _process_target(row, role='follower', user_id=uid, sub_account_id=sub)
             report['follower_results'].append(res)
 

@@ -124,7 +124,11 @@ class _BridgeClient:
     def __init__(self, host=BRIDGE_HOST, port=BRIDGE_PORT, owner=BRIDGE_OWNER):
         self.host = host
         self.port = port
-        self.owner = owner
+        # mysqlremote reuses an idle channel when the owner string matches.
+        # The collector's parent process and pool workers must never share one
+        # owner/channel: a worker releases its channel when its job finishes,
+        # which otherwise invalidates the parent's next candidate query.
+        self.owner = f"{owner}:{os.getpid()}"
         self.channel_id = None
         self._channel_lock = threading.Lock()
         self._sock = None
@@ -210,9 +214,37 @@ class _BridgeClient:
                     self._close_sock_locked()
     def put(self, request, timeout=None):
         req = dict(request)
-        if 'sql' in req and 'channel_id' not in req:
-            req['channel_id'] = self.acquire_channel()
-        return self._send_request(req)
+        if 'sql' not in req or 'channel_id' in req:
+            return self._send_request(req)
+
+        # A stale server-side channel must not turn a database failure into an
+        # apparent empty programme list. Reacquire once when mysqlremote says
+        # the channel was released, then repeat the same SQL request.
+        for attempt in range(2):
+            channel_id = self.acquire_channel()
+            req['channel_id'] = channel_id
+            response = self._send_request(req)
+            message = str((response or {}).get('message') or '').lower()
+            stale_channel = (
+                (response or {}).get('status') == 'error'
+                and 'unknown channel_id' in message
+            )
+            if not stale_channel:
+                return response
+
+            print(
+                f"[bridge] {self.owner}: server no longer has channel "
+                f"{channel_id}; reacquiring and retrying SQL"
+            )
+            with self._channel_lock:
+                if self.channel_id == channel_id:
+                    self.channel_id = None
+            req.pop('channel_id', None)
+
+            if attempt == 1:
+                return response
+
+        return response
 # ==============================================================================
 #  MODULE-SCOPE HELPERS
 # ==============================================================================
@@ -754,7 +786,18 @@ def _fetch_candidate_programmes():
            AND broker_password IS NOT NULL AND broker_password <> ''
          ORDER BY id ASC
     """
-    return db_fetch_all(sql, None, timeout=20.0, quiet=True)
+    response = db_query(sql, None, timeout=20.0, quiet=True)
+    if not _is_ok(response):
+        print(
+            "[CHARTS][CANDIDATE QUERY ERROR] Could not read programme "
+            f"candidates: {(response or {}).get('message', 'unknown bridge/database error')}"
+        , flush=True)
+        return None
+    return [
+        _normalize_row(row)
+        for row in (response.get('results') or [])
+        if _normalize_row(row) is not None
+    ]
 def _resolve_owner_email(userid):
     uid = _coerce_int(userid)
     if uid is None or uid <= 0:
@@ -1599,7 +1642,7 @@ def main_loop():
     print("=" * 60)
     print(f"  Loop Mode: {'ENABLED' if run_as_loop else 'DISABLED'}")
     if run_as_loop:
-        print(f"  Interval: {loop_interval}s")
+        print("  Inter-loop delay: 0s (next loop starts immediately)")
         print(f"  Max Loops: {max_loops if max_loops else 'Infinite'}")
     print(f"  Rotation targets: {ROUND_TARGETS}  cap={MAX_BARS_PER_TF}")
     print("=" * 60 + "\n")
@@ -1610,6 +1653,10 @@ def main_loop():
     pool = mp.Pool(processes=pool_size)
     print(f"✅ Persistent pool ready ({pool_size} workers).\n")
     loop_count = 0
+    # Retain every programme discovered as eligible during this service run.
+    # A transient bridge/channel failure must never make a previously found
+    # programme disappear from later collection cycles.
+    known_programmes = {}
     try:
         while True:
             loop_count += 1
@@ -1619,14 +1666,37 @@ def main_loop():
                 print("=" * 60)
             try:
                 print(f"[CHARTS] Loop #{loop_count}: querying programme candidates...", flush=True)
-                programmes = _fetch_candidate_programmes()
-                print(f"[CHARTS] Loop #{loop_count}: found {len(programmes)} candidate programme(s).", flush=True)
+                fetched_programmes = _fetch_candidate_programmes()
+                if fetched_programmes is None:
+                    print(
+                        f"[CHARTS] Loop #{loop_count}: candidate query failed; "
+                        "retaining the previously discovered programme set.",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"[CHARTS] Loop #{loop_count}: database returned "
+                        f"{len(fetched_programmes)} candidate programme(s).",
+                        flush=True,
+                    )
+                    for candidate in fetched_programmes:
+                        candidate_id = _coerce_int(_raw_first_key(candidate, 'id'))
+                        if candidate_id is not None and candidate_id > 0:
+                            known_programmes[candidate_id] = candidate
+
+                programmes = list(known_programmes.values())
+                print(
+                    f"[CHARTS] Loop #{loop_count}: processing "
+                    f"{len(programmes)} known programme(s) "
+                    "(including programmes discovered on earlier loops).",
+                    flush=True,
+                )
                 if not programmes:
-                    print(" └─ 🔘 No candidate programmes found.")
+                    print(" └─ 🔘 No candidate programmes discovered yet.", flush=True)
                     if not run_as_loop:
                         print("Single execution completed. Exiting...")
                         break
-                    time.sleep(loop_interval)
+                    # Immediate next scan: no one-second or configured interval sleep.
                     continue
                 print(f"📊 Submitting {len(programmes)} programme job(s)", flush=True)
                 t0 = time.time()
@@ -1653,15 +1723,14 @@ def main_loop():
             except Exception as e:
                 print(f"Critical error in loop: {e}")
                 traceback.print_exc()
-                time.sleep(5)
             if not run_as_loop:
                 print("Single execution completed. Exiting...")
                 break
             if max_loops and loop_count >= max_loops:
                 print(f"Maximum loops ({max_loops}) reached. Exiting...")
                 break
-            if run_as_loop and loop_interval > 0:
-                time.sleep(loop_interval)
+            # Do not sleep between collection cycles. The next scan starts
+            # as soon as the previous programme jobs have completed.
     except KeyboardInterrupt:
         print("\n[main] interrupted — shutting down")
     finally:
