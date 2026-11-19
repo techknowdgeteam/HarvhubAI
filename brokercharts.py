@@ -1,10 +1,9 @@
 # brokercharts.py
 """
 Programme-scoped OHLC collector — DB-only, no JSON, no local files.
-This version keeps a strict maximum of 5,000 candles for each programme,
-symbol, and timeframe. It stores the newest candles first, backfills older
-candles only until the 5,000-row limit is reached, and removes the oldest
-rows whenever new candles would exceed that limit.
+The 5,000-candle setting is the initial historical backfill target for each
+programme, symbol, and timeframe. Existing rows are never purged to enforce
+that target; new live candles may grow the stored history beyond 5,000 rows.
 REPLACES update_developers() + import os.py (fetch_charts_all_brokers).
 ARCHITECTURE
 ------------
@@ -50,20 +49,27 @@ MT5 BEHAVIOUR
 CANDLE SYNCHRONIZATION — PAGINATED ROTATIONS
 -------------------------------------------
 For every selected (symbol, timeframe) pair:
-  1. Fetch the newest 1,500 MT5 bars from position 0; only fully closed,
-     OHLC-valid, gap-free candles may be inserted.
-  2. Fetch the next older page using copy_rates_from_pos(..., start_pos, count).
-  3. Advance start_pos by the exact number of source bars fetched. Never reset
-     historical backfill to position 0, because that would re-fetch the newest
-     bars and create overlap.
-  4. Reject candles whose open is outside the immediately preceding
-     consecutive candle range; refresh existing candles from MT5 and repeat.
-  5. Stop when repeated empty responses confirm no more history is available
+  1. Fetch the newest 1,500 MT5 bars from position 0, including the currently
+     forming candle so its OHLC snapshot can be checked on every cycle.
+  2. Compare every valid MT5 OHLCV snapshot with the row already stored at the
+     same candle_time. If values match, leave that database record untouched.
+  3. If a stored OHLCV snapshot is inaccurate, delete only that incorrect row
+     and insert the complete corrected MT5 candle. Insert genuinely new
+     timestamps normally. A latest-candle refresh is never a routine delete.
+  4. Re-fetch the newest stored timestamp directly from MT5 where possible so
+     the current forming candle is compared against the freshest source values.
+  5. Preserve valid source candles even when their open is outside the previous
+     candle range; such a move may be a genuine market/broker gap, not bad OHLC.
+  6. Fetch the next older page using copy_rates_from_pos(..., start_pos, count).
+     Advance start_pos by actual new source bars, not by corrected row inserts.
+  7. Stop when repeated empty responses confirm no more history is available
      or the pair reaches 5,000 stored candles. Failed API requests retry at the
      same position with smaller requests; a persistent one-bar error never
      advances the cursor or silently skips the candle.
-Rows are scoped by programme, symbol, and timeframe. If the pair already
-contains more than 5,000 rows, the oldest rows are deleted first.
+Rows are scoped by programme, symbol, and timeframe. The 5,000-row setting is
+a historical backfill target, not a deletion limit. Existing valid rows are
+never purged to enforce it; newly arriving live candles may grow the table
+beyond that target.
 BATCHING
 --------
 candle_records is populated via multi-row INSERT statements. Batch
@@ -88,7 +94,7 @@ import threading
 import traceback
 import multiprocessing as mp
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timezone as dt_timezone
 try:
     import pytz
     from zoneinfo import ZoneInfo
@@ -400,12 +406,16 @@ TIMEFRAME_SECONDS = {
 # ---- Rotation milestones -----------------------------------------------------
 # Progress milestones for a single programme/symbol/timeframe pair.
 ROUND_TARGETS = (2000, 5000)
-# Strict retention ceiling for each programme/symbol/timeframe pair.
+# Historical backfill target for each programme/symbol/timeframe pair.
 MAX_BARS_PER_TF = 5000
 # A worker reconciles its existing stored history against MT5 once per pair
 # after startup, repairing valid-looking partial OHLC snapshots left by older
 # collector versions without repeatedly scanning all 5,000 bars every cycle.
 _REPAIRED_PAIRS_THIS_PROCESS = set()
+# Last MT5 source candle time seen by _latest_pass for each pair. Used only
+# to advance historical pagination when genuinely newer MT5 bars appear;
+# correcting an existing row must not advance the MT5 cursor.
+_LATEST_SOURCE_TIMES_THIS_PROCESS = {}
 # First rotation: capture the newest 1,500 candles in one pass.
 # Historical rotations then request the next older page using an increasing
 # MT5 start_pos, so the newest page is never fetched again as backfill.
@@ -663,6 +673,24 @@ def mt5_copy_rates_from_pos(symbol, timeframe_const, start_pos, count):
         except Exception:
             return None
 
+
+def mt5_copy_rate_at_epoch(symbol, timeframe_const, timestamp_seconds):
+    """Fetch exactly the MT5 candle whose open time is this Unix timestamp."""
+    with _MT5_IPC_LOCK:
+        if not mt5_available():
+            return None
+        try:
+            date_from = datetime.fromtimestamp(
+                int(timestamp_seconds), tz=dt_timezone.utc
+            )
+            return mt5.copy_rates_from(symbol, timeframe_const, date_from, 1)
+        except Exception as exc:
+            print(
+                f"      [CHARTS][LATEST CHECK] exact-time MT5 fetch failed "
+                f"for {symbol} at {timestamp_seconds}: {exc}"
+            )
+            return None
+
 # A request is retried at the same MT5 position before its size is reduced.
 # A persistent API error at a one-candle request is retried without advancing
 # the position, so a failed page cannot be mistaken for completed history.
@@ -891,72 +919,23 @@ def _count_stored_rows(programme_id, userid, symbol, timeframe):
     return _coerce_int(v) or 0
 def _trim_oldest_rows(programme_id, userid, symbol, timeframe,
                       keep_limit=MAX_BARS_PER_TF):
-    """Keep only the newest keep_limit rows for this exact programme pair.
-    Returns the number of deleted rows, or None if cleanup failed.
     """
-    keep_limit = max(0, int(keep_limit))
+    Non-destructive retention check.
+
+    MAX_BARS_PER_TF remains the historical backfill target, but the collector
+    must not purge already-recorded candles to enforce it. The stored history
+    is allowed to grow as new live candles arrive. Returns zero because no
+    existing rows are deleted here.
+    """
     current_count = _count_stored_rows(programme_id, userid, symbol, timeframe)
-    if current_count <= keep_limit:
-        return 0
-    scope_params = [programme_id, userid, symbol, timeframe]
-    if keep_limit == 0:
-        ok, affected, message = db_execute(
-            """DELETE FROM candle_records
-               WHERE programmeid = %s AND userid = %s
-                 AND symbol = %s AND timeframe = %s""",
-            scope_params, timeout=90.0, quiet=True,
+    if current_count > int(keep_limit):
+        print(
+            f"      [CHARTS][RETENTION] {symbol} {timeframe}: "
+            f"{current_count} rows stored (backfill target {int(keep_limit)}); "
+            "all existing rows preserved"
         )
-        if not ok:
-            print(f"      [CHARTS][RETENTION FAIL] {symbol} {timeframe}: {message}")
-            return None
-        return _count_stored_rows(programme_id, userid, symbol, timeframe)
-    boundary_row = db_fetch_one(
-        f"""SELECT candle_time
-              FROM candle_records
-             WHERE programmeid = %s AND userid = %s
-               AND symbol = %s AND timeframe = %s
-             ORDER BY candle_time DESC
-             LIMIT 1 OFFSET {keep_limit - 1}""",
-        scope_params, timeout=30.0, quiet=True,
-    )
-    boundary = _raw_first_key(boundary_row, 'candle_time') if boundary_row else None
-    if _is_nullish(boundary):
-        print(f"      [CHARTS][RETENTION FAIL] {symbol} {timeframe}: "
-              "could not determine the retention boundary")
-        return None
-    delete_sql = """DELETE FROM candle_records
-                     WHERE programmeid = %s AND userid = %s
-                       AND symbol = %s AND timeframe = %s
-                       AND candle_time < %s"""
-    ok, affected, message = db_execute(
-        delete_sql, scope_params + [boundary], timeout=90.0, quiet=True,
-    )
-    if not ok:
-        print(f"      [CHARTS][RETENTION FAIL] {symbol} {timeframe}: {message}")
-        return None
-    remaining = _count_stored_rows(programme_id, userid, symbol, timeframe)
-    if remaining > keep_limit:
-        # Several rows can share the boundary timestamp. Delete that timestamp
-        # too rather than allowing duplicate-time rows to break the hard cap.
-        delete_sql = """DELETE FROM candle_records
-                         WHERE programmeid = %s AND userid = %s
-                           AND symbol = %s AND timeframe = %s
-                           AND candle_time <= %s"""
-        ok, affected, message = db_execute(
-            delete_sql, scope_params + [boundary], timeout=90.0, quiet=True,
-        )
-        if not ok:
-            print(f"      [CHARTS][RETENTION FAIL] {symbol} {timeframe}: {message}")
-            return None
-        remaining = _count_stored_rows(programme_id, userid, symbol, timeframe)
-        if remaining > keep_limit:
-            print(f"      [CHARTS][RETENTION FAIL] {symbol} {timeframe}: "
-                  f"rows remain above cap ({remaining}/{keep_limit})")
-            return None
-    deleted = max(0, current_count - remaining)
-    print(f"      [CHARTS][RETENTION] {symbol} {timeframe}: "
-          f"deleted {deleted} oldest row(s); retained {remaining}/{keep_limit}")
-    return deleted
+    return 0
+
 def _existing_times_in_window(programme_id, userid, symbol, timeframe,
                               start_dt, end_dt):
     """
@@ -1041,164 +1020,245 @@ def _insert_candle_rows_batched(rows):
     return inserted_total, failed
 
 
-def _update_existing_candle_rows_batched(programme_id, userid, symbol,
-                                         timeframe, rows):
+def _fetch_existing_candle_rows_in_window(programme_id, userid, symbol,
+                                         timeframe, start_dt, end_dt):
+    """Fetch stored OHLCV values for exact source-vs-database comparison."""
+    return db_fetch_all(
+        """SELECT id, candle_time, open, high, low, close, volume
+             FROM candle_records
+            WHERE programmeid = %s AND userid = %s
+              AND symbol = %s AND timeframe = %s
+              AND candle_time BETWEEN %s AND %s
+            ORDER BY candle_time ASC, id ASC""",
+        [programme_id, userid, symbol, timeframe,
+         start_dt.strftime('%Y-%m-%d %H:%M:%S'),
+         end_dt.strftime('%Y-%m-%d %H:%M:%S')],
+        timeout=90.0, quiet=True,
+    )
+
+
+def _stored_ohlcv_matches_source(stored, source_row):
+    """Compare stored OHLCV with the rounded values supplied by MT5."""
+    for field in ('open', 'high', 'low', 'close', 'volume'):
+        try:
+            actual = float(_raw_first_key(stored, field))
+            expected = float(source_row[field])
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if not math.isfinite(actual) or not math.isfinite(expected):
+            return False
+        # candle_records is written at eight decimal places. Compare at that
+        # same precision to avoid needless replacements caused by DB formatting.
+        if round(actual, 8) != round(expected, 8):
+            return False
+    return True
+
+
+def _reconcile_candle_rows_batched(programme_id, userid, symbol, timeframe,
+                                   rows, insert_missing=True):
     """
-    Refresh existing rows from authoritative MT5 rates.
+    Preserve accurate candle records and replace only incorrect snapshots.
 
-    MT5 position zero is a live, still-forming candle. The collector used to
-    INSERT it once and then permanently ignore later snapshots because its
-    candle_time already existed. Updating every matching row in the latest MT5
-    page also repairs previously stored partial snapshots when those candles
-    have since closed.
+    For every valid MT5 source row:
+      - if a stored OHLCV row matches, leave it untouched;
+      - if stored rows exist but their OHLCV differs, delete only those
+        incorrect row IDs and insert the complete MT5 replacement;
+      - if the timestamp is not stored, insert it when insert_missing=True.
 
-    Uses bounded CASE updates instead of requiring a new unique database index.
-    Returns (number of rows reported changed, failure).
+    A correct duplicate at a timestamp is preserved. Incorrect duplicate rows
+    at that same timestamp may be removed because a correct source-matching row
+    already exists. Returns (rows_inserted, failed, timestamps_replaced,
+    timestamps_already_correct, timestamps_new).
     """
     if not rows:
-        return 0, False
+        return 0, False, 0, 0, 0
 
-    update_columns = [
-        'open_time', 'close_time', 'timezone', 'last_recorded_candle_time',
-        'open', 'high', 'low', 'close', 'candle_center', 'body_center',
-        'high_wick_center', 'low_wick_center', 'candle_width_center', 'volume',
-    ]
-    updated_total = 0
-    failed = False
+    unique_rows = {}
+    for row in rows:
+        candle_time = _parse_db_datetime(row.get('candle_time'))
+        if candle_time is not None:
+            unique_rows[candle_time] = row
+    if not unique_rows:
+        return 0, False, 0, 0, 0
 
-    for i in range(0, len(rows), INSERT_BATCH_SIZE):
-        chunk = rows[i:i + INSERT_BATCH_SIZE]
-        timestamps = [r['candle_time'] for r in chunk]
-        assignments = []
+    ordered_rows = [unique_rows[key] for key in sorted(unique_rows)]
+    window_start = ordered_rows[0]['candle_time']
+    window_end = ordered_rows[-1]['candle_time']
+    stored_rows = _fetch_existing_candle_rows_in_window(
+        programme_id, userid, symbol, timeframe, window_start, window_end,
+    )
 
-        for column in update_columns:
-            cases = []
-            for row in chunk:
-                when_value = _sql_dt(row.get('candle_time'))
-                if column in ('open_time', 'close_time', 'last_recorded_candle_time'):
-                    then_value = _sql_dt(row.get(column))
-                else:
-                    then_value = _sql_quote(row.get(column))
-                cases.append(f"WHEN {when_value} THEN {then_value}")
-            assignments.append(
-                f"`{column}` = CASE `candle_time` {' '.join(cases)} ELSE `{column}` END"
-            )
+    stored_by_time = {}
+    for stored in stored_rows:
+        candle_time = _parse_db_datetime(_raw_first_key(stored, 'candle_time'))
+        if candle_time is not None:
+            stored_by_time.setdefault(candle_time, []).append(stored)
 
-        times_sql = ', '.join(_sql_dt(value) for value in timestamps)
-        sql = (
-            "UPDATE candle_records SET " + ', '.join(assignments) +
-            " WHERE programmeid = " + _sql_int(programme_id) +
-            " AND userid = " + _sql_int(userid) +
-            " AND symbol = " + _sql_quote(symbol) +
-            " AND timeframe = " + _sql_quote(timeframe) +
-            f" AND candle_time IN ({times_sql})"
-        )
-        ok, affected, message = db_execute(sql, None, timeout=90.0, quiet=True)
-        if ok:
-            updated_total += max(0, int(affected or 0))
+    delete_ids = []
+    delete_id_to_time = {}
+    rows_to_insert = {}
+    replaced_count = 0
+    correct_count = 0
+    new_count = 0
+
+    for source_row in ordered_rows:
+        candle_time = source_row['candle_time']
+        existing_at_time = stored_by_time.get(candle_time, [])
+        if not existing_at_time:
+            if insert_missing:
+                rows_to_insert[candle_time] = source_row
+                new_count += 1
+            continue
+
+        matching_rows = [
+            stored for stored in existing_at_time
+            if _stored_ohlcv_matches_source(stored, source_row)
+        ]
+        mismatching_rows = [
+            stored for stored in existing_at_time
+            if not _stored_ohlcv_matches_source(stored, source_row)
+        ]
+
+        if matching_rows:
+            # Preserve the good record. If bad duplicates exist at the same
+            # timestamp, remove only those inaccurate rows; no replacement is
+            # needed because an accurate copy already remains stored.
+            correct_count += 1
+            for stored in mismatching_rows:
+                row_id = _coerce_int(_raw_first_key(stored, 'id'))
+                if row_id is not None and row_id > 0:
+                    delete_ids.append(row_id)
+                    delete_id_to_time[row_id] = candle_time
+            continue
+
+        # No stored version matches MT5: replace all records for this timestamp.
+        timestamp_ids = []
+        for stored in existing_at_time:
+            row_id = _coerce_int(_raw_first_key(stored, 'id'))
+            if row_id is not None and row_id > 0:
+                timestamp_ids.append(row_id)
+                delete_ids.append(row_id)
+                delete_id_to_time[row_id] = candle_time
+        if timestamp_ids:
+            rows_to_insert[candle_time] = source_row
+            replaced_count += 1
         else:
-            failed = True
+            # Without a database row ID we cannot safely delete the stale row.
             print(
-                f"      [CHARTS][UPDATE FAIL] {symbol} {timeframe}: {message}"
+                f"      [CHARTS][REPAIR FAIL] {symbol} {timeframe}: "
+                f"stored candle {candle_time} differs from MT5 but has no usable id"
             )
 
-    return updated_total, failed
+    failed = False
+    failed_delete_times = set()
+    if delete_ids:
+        for offset in range(0, len(delete_ids), 400):
+            batch_ids = delete_ids[offset:offset + 400]
+            placeholders = ', '.join(['%s'] * len(batch_ids))
+            sql = (
+                "DELETE FROM candle_records WHERE programmeid = %s AND userid = %s "
+                "AND symbol = %s AND timeframe = %s AND id IN (" + placeholders + ")"
+            )
+            ok, affected, message = db_execute(
+                sql, [programme_id, userid, symbol, timeframe] + batch_ids,
+                timeout=90.0, quiet=True,
+            )
+            if not ok:
+                failed = True
+                failed_delete_times.update(
+                    delete_id_to_time[row_id]
+                    for row_id in batch_ids
+                    if row_id in delete_id_to_time
+                )
+                print(
+                    f"      [CHARTS][REPAIR DELETE FAIL] {symbol} {timeframe}: "
+                    f"could not remove incorrect OHLC row(s): {message}"
+                )
+
+    # Never insert a replacement if its old inaccurate row could not be deleted.
+    for candle_time in failed_delete_times:
+        rows_to_insert.pop(candle_time, None)
+
+    # Confirm replacement timestamps are actually absent before inserting.
+    replacement_times = [
+        candle_time for candle_time in rows_to_insert
+        if candle_time in stored_by_time
+    ]
+    if replacement_times:
+        check_rows = db_fetch_all(
+            """SELECT candle_time FROM candle_records
+                WHERE programmeid = %s AND userid = %s
+                  AND symbol = %s AND timeframe = %s
+                  AND candle_time BETWEEN %s AND %s""",
+            [programme_id, userid, symbol, timeframe,
+             min(replacement_times).strftime('%Y-%m-%d %H:%M:%S'),
+             max(replacement_times).strftime('%Y-%m-%d %H:%M:%S')],
+            timeout=90.0, quiet=True,
+        )
+        still_present = {
+            _parse_db_datetime(_raw_first_key(item, 'candle_time'))
+            for item in check_rows
+        }
+        for candle_time in replacement_times:
+            if candle_time in still_present:
+                rows_to_insert.pop(candle_time, None)
+                failed = True
+                print(
+                    f"      [CHARTS][REPAIR FAIL] {symbol} {timeframe}: "
+                    f"incorrect stored candle {candle_time} remains; "
+                    "replacement was not inserted to avoid a duplicate"
+                )
+
+    insert_rows = [rows_to_insert[key] for key in sorted(rows_to_insert)]
+    inserted = 0
+    if insert_rows:
+        inserted, insert_failed = _insert_candle_rows_batched(insert_rows)
+        failed = failed or insert_failed
+
+        # Verify inserts/replacements and retry only timestamps still absent.
+        verify_times = [row['candle_time'] for row in insert_rows]
+        verify_existing = _existing_times_in_window(
+            programme_id, userid, symbol, timeframe,
+            min(verify_times), max(verify_times),
+        )
+        missing = [row for row in insert_rows
+                   if row['candle_time'] not in verify_existing]
+        if missing:
+            retry_inserted, retry_failed = _insert_candle_rows_batched(missing)
+            inserted += retry_inserted
+            failed = failed or retry_failed
+            final_existing = _existing_times_in_window(
+                programme_id, userid, symbol, timeframe,
+                min(row['candle_time'] for row in missing),
+                max(row['candle_time'] for row in missing),
+            )
+            still_missing = [row for row in missing
+                             if row['candle_time'] not in final_existing]
+            if still_missing:
+                failed = True
+                print(
+                    f"      [CHARTS][REPAIR FAIL] {symbol} {timeframe}: "
+                    f"{len(still_missing)} corrected/new candle row(s) remain absent"
+                )
+
+    return inserted, failed, replaced_count, correct_count, new_count
 
 
 def _cleanup_broken_candle_rows(programme_id, userid, symbol, timeframe, tz_name=None):
     """
-    Delete malformed, duplicate, unfinished and opening-gap candles for one
-    exact programme/user/symbol/timeframe.
+    Non-destructively audit stored candle rows.
 
-    Strict continuity policy requested for Programme Training:
-      - the first retained candle establishes the accepted price range;
-      - each next source/database candle must open inside the last accepted
-        candle's [low, high] range;
-      - if a candle is rejected, it does NOT become the next comparison anchor;
-        this prevents a chain of broken candles from surviving after the first
-        bad candle is removed;
-      - this rule intentionally applies across timestamps as well, so a row
-        cannot remain as a visible price jump merely because an earlier bad row
-        was deleted.
+    Older versions deleted malformed rows, duplicates, or candles whose open
+    was outside the previous candle range. This routine no longer deletes
+    stored candles. The MT5 reconciliation pass below replaces an existing row
+    only after it can compare that timestamp with a valid authoritative source
+    OHLCV record. Genuine market gaps are preserved.
 
-    This is deliberately strict. Genuine broker/market opening gaps are also
-    removed; use this only when the chart is required to be continuous.
+    Returns zero because this audit never removes candle records.
     """
-    scope = (
-        " WHERE programmeid = " + _sql_int(programme_id) +
-        " AND userid = " + _sql_int(userid) +
-        " AND symbol = " + _sql_quote(symbol) +
-        " AND timeframe = " + _sql_quote(timeframe)
-    )
-
-    invalid_sql = (
-        "DELETE FROM candle_records" + scope + " AND ("
-        "`open` IS NULL OR `high` IS NULL OR `low` IS NULL OR `close` IS NULL OR "
-        "`volume` IS NULL OR CAST(`high` AS DECIMAL(30,12)) < "
-        "GREATEST(CAST(`open` AS DECIMAL(30,12)), CAST(`close` AS DECIMAL(30,12))) OR "
-        "CAST(`low` AS DECIMAL(30,12)) > "
-        "LEAST(CAST(`open` AS DECIMAL(30,12)), CAST(`close` AS DECIMAL(30,12))) OR "
-        "CAST(`high` AS DECIMAL(30,12)) < CAST(`low` AS DECIMAL(30,12)) OR "
-        "CAST(`volume` AS DECIMAL(30,8)) < 0)"
-    )
-    ok, invalid_deleted, message = db_execute(
-        invalid_sql, None, timeout=90.0, quiet=True
-    )
-    if not ok:
-        print(
-            f"      [CHARTS][CLEANUP FAIL] {symbol} {timeframe}: "
-            f"invalid-row cleanup failed: {message}"
-        )
-        return None
-
-    # Keep only the newest ID when duplicate timestamps exist.
-    duplicate_sql = (
-        "DELETE older FROM candle_records AS older "
-        "INNER JOIN candle_records AS newer ON "
-        "newer.programmeid = older.programmeid AND "
-        "newer.userid = older.userid AND "
-        "newer.symbol = older.symbol AND "
-        "newer.timeframe = older.timeframe AND "
-        "newer.candle_time = older.candle_time AND newer.id > older.id "
-        "WHERE older.programmeid = " + _sql_int(programme_id) +
-        " AND older.userid = " + _sql_int(userid) +
-        " AND older.symbol = " + _sql_quote(symbol) +
-        " AND older.timeframe = " + _sql_quote(timeframe)
-    )
-    ok, duplicate_deleted, message = db_execute(
-        duplicate_sql, None, timeout=90.0, quiet=True
-    )
-    if not ok:
-        print(
-            f"      [CHARTS][CLEANUP FAIL] {symbol} {timeframe}: "
-            f"duplicate-row cleanup failed: {message}"
-        )
-        return None
-
-    # A not-yet-closed candle is an incomplete snapshot, never chart history.
-    incomplete_deleted = 0
-    programme_tz = _resolve_timezone(tz_name) if tz_name else None
-    if programme_tz is not None:
-        now_wall = datetime.now(programme_tz).replace(tzinfo=None).strftime('%Y-%m-%d %H:%M:%S')
-        incomplete_sql = (
-            "DELETE FROM candle_records" + scope +
-            " AND close_time IS NOT NULL AND close_time > " + _sql_dt(now_wall)
-        )
-        ok, incomplete_deleted, message = db_execute(
-            incomplete_sql, None, timeout=90.0, quiet=True
-        )
-        if not ok:
-            print(
-                f"      [CHARTS][CLEANUP FAIL] {symbol} {timeframe}: "
-                f"unfinished-candle cleanup failed: {message}"
-            )
-            return None
-
-    # Scan the remaining ordered series in Python. The accepted anchor is not
-    # advanced when a gap candle is removed, so a sequence of bad opens cannot
-    # evade cleanup by following another rejected candle.
     rows = db_fetch_all(
-        """SELECT id, candle_time, open_time, close_time, open, high, low, close, volume
+        """SELECT id, candle_time, open_time, close_time,
+                  open, high, low, close, volume
              FROM candle_records
             WHERE programmeid = %s AND userid = %s
               AND symbol = %s AND timeframe = %s
@@ -1206,105 +1266,42 @@ def _cleanup_broken_candle_rows(programme_id, userid, symbol, timeframe, tz_name
         [programme_id, userid, symbol, timeframe],
         timeout=90.0, quiet=True,
     )
-
-    gap_ids = []
-    invalid_after_scan_ids = []
-    accepted_anchor = None
+    invalid_count = 0
     for stored in rows:
-        row_id = _coerce_int(_raw_first_key(stored, 'id'))
-        if row_id is None or row_id <= 0:
-            continue
-        candle_time = _parse_db_datetime(_raw_first_key(stored, 'candle_time'))
-        open_time = _parse_db_datetime(_raw_first_key(stored, 'open_time'))
-        close_time = _parse_db_datetime(_raw_first_key(stored, 'close_time'))
         try:
-            o = float(_raw_first_key(stored, 'open'))
-            h = float(_raw_first_key(stored, 'high'))
-            l = float(_raw_first_key(stored, 'low'))
-            c = float(_raw_first_key(stored, 'close'))
-            v = float(_raw_first_key(stored, 'volume'))
+            candle_time = _parse_db_datetime(_raw_first_key(stored, 'candle_time'))
+            open_time = _parse_db_datetime(_raw_first_key(stored, 'open_time'))
+            close_time = _parse_db_datetime(_raw_first_key(stored, 'close_time'))
+            values = [
+                float(_raw_first_key(stored, field))
+                for field in ('open', 'high', 'low', 'close', 'volume')
+            ]
+            o, h, l, c, volume = values
+            valid = (
+                candle_time is not None and open_time is not None and
+                close_time is not None and
+                abs((open_time - candle_time).total_seconds()) <= 1 and
+                close_time > open_time and
+                all(math.isfinite(value) for value in values) and
+                h >= max(o, c) and l <= min(o, c) and h >= l and volume >= 0
+            )
         except (TypeError, ValueError, OverflowError):
-            invalid_after_scan_ids.append(row_id)
-            continue
+            valid = False
+        if not valid:
+            invalid_count += 1
 
-        if (candle_time is None or open_time is None or close_time is None or
-                abs((open_time - candle_time).total_seconds()) > 1 or
-                close_time <= open_time or
-                not all(math.isfinite(value) for value in (o, h, l, c, v)) or
-                h < max(o, c) or l > min(o, c) or h < l or v < 0):
-            invalid_after_scan_ids.append(row_id)
-            continue
-
-        if accepted_anchor is not None:
-            epsilon = max(
-                1.0e-8,
-                abs(accepted_anchor['high']) * 1.0e-10,
-                abs(accepted_anchor['low']) * 1.0e-10,
-                abs(o) * 1.0e-10,
-            )
-            if (o > accepted_anchor['high'] + epsilon or
-                    o < accepted_anchor['low'] - epsilon):
-                gap_ids.append(row_id)
-                print(
-                    f"      [CHARTS][GAP DELETE] {symbol} {timeframe}: "
-                    f"id={row_id} time={candle_time} open={o:.8f} "
-                    f"outside last accepted range "
-                    f"[{accepted_anchor['low']:.8f}, {accepted_anchor['high']:.8f}]"
-                )
-                # Keep the prior accepted anchor. The next row must also be
-                # continuous with the last candle that remains in the table.
-                continue
-
-        accepted_anchor = {
-            'candle_time': candle_time,
-            'high': h,
-            'low': l,
-        }
-
-    def _delete_ids(ids, label):
-        if not ids:
-            return 0, True
-        deleted_total = 0
-        for offset in range(0, len(ids), 400):
-            batch = ids[offset:offset + 400]
-            placeholders = ', '.join(['%s'] * len(batch))
-            sql = (
-                "DELETE FROM candle_records WHERE programmeid = %s AND userid = %s "
-                "AND symbol = %s AND timeframe = %s AND id IN (" + placeholders + ")"
-            )
-            ok, affected, msg = db_execute(
-                sql, [programme_id, userid, symbol, timeframe] + batch,
-                timeout=90.0, quiet=True,
-            )
-            if not ok:
-                print(
-                    f"      [CHARTS][CLEANUP FAIL] {symbol} {timeframe}: "
-                    f"{label} deletion failed: {msg}"
-                )
-                return deleted_total, False
-            deleted_total += int(affected or 0)
-        return deleted_total, True
-
-    invalid_scan_deleted, scan_ok = _delete_ids(invalid_after_scan_ids, 'non-finite/malformed')
-    if not scan_ok:
-        return None
-    gap_deleted, gap_ok = _delete_ids(gap_ids, 'opening-gap')
-    if not gap_ok:
-        return None
-
-    total_deleted = (
-        int(invalid_deleted or 0) + int(duplicate_deleted or 0) +
-        int(incomplete_deleted or 0) + invalid_scan_deleted + gap_deleted
-    )
-    if total_deleted:
+    if invalid_count:
         print(
-            f"      [CHARTS][CLEANUP] {symbol} {timeframe}: removed "
-            f"{int(invalid_deleted or 0) + invalid_scan_deleted} invalid, "
-            f"{int(duplicate_deleted or 0)} duplicate, "
-            f"{gap_deleted} opening-gap and "
-            f"{int(incomplete_deleted or 0)} unfinished candle row(s)"
+            f"      [CHARTS][AUDIT] {symbol} {timeframe}: found "
+            f"{invalid_count} malformed stored candle row(s); preserving them "
+            "until a valid MT5 source row is available for correction"
         )
-    return total_deleted
+    else:
+        print(
+            f"      [CHARTS][AUDIT] {symbol} {timeframe}: "
+            f"checked {len(rows)} stored row(s); no malformed OHLC rows found"
+        )
+    return 0
 
 # ==============================================================================
 #  CANDLE BUILD (MT5 rates -> candle_records rows)
@@ -1376,12 +1373,9 @@ def _rates_to_rows(programme_id, userid, symbol, timeframe_key,
             open_dt = open_local_aware.replace(tzinfo=None)
             close_dt = close_local_aware.replace(tzinfo=None)
 
-            # Never insert an unfinished MT5 bar. Its OHLC values are snapshots
-            # that can change until the timeframe closes; the completed bar will
-            # be collected on the next pass. This also removes the old partial-
-            # candle snapshot problem at its source.
-            if close_local_aware > datetime.now(tz_obj):
-                continue
+            # Keep the currently forming candle in the source rows. _latest_pass
+            # re-fetches the newest stored timestamp and replaces it only when
+            # its stored OHLCV does not match the latest MT5 snapshot.
         except Exception as exc:
             # Never silently fall back to UTC and label it as another zone.
             print(
@@ -1457,123 +1451,14 @@ def _rates_to_rows(programme_id, userid, symbol, timeframe_key,
 
 def _reject_interbar_gap_rows(rows, timeframe_key, label):
     """
-    Enforce continuous price ranges on MT5 source bars before UPDATE/INSERT.
+    Preserve authoritative MT5 candles even when a candle opens outside the
+    preceding candle's range. Such a move may be a genuine broker/market gap,
+    not corrupt OHLC. Incorrect stored values are repaired by comparing the
+    full OHLCV tuple with MT5 in _reconcile_candle_rows_batched().
 
-    Every candidate open must be inside the last accepted candle's full
-    [low, high] range. A rejected bar does not become the next comparison
-    anchor; this rejects a chain of bad source bars rather than only the first.
-    Rejected timestamps are also deleted from candle_records so a stale old
-    snapshot cannot survive simply because its corrected MT5 source was rejected.
-
-    This is intentionally strict and also rejects genuine broker/market gaps.
+    The function name remains for compatibility with existing call sites.
     """
-    if not rows:
-        return []
-
-    ordered = sorted(rows, key=lambda item: item['candle_time'])
-    first_time = ordered[0]['candle_time']
-    first_text = (
-        first_time.strftime('%Y-%m-%d %H:%M:%S')
-        if isinstance(first_time, datetime) else str(first_time)
-    )
-    first = ordered[0]
-    previous_row = db_fetch_one(
-        """SELECT candle_time, high, low
-             FROM candle_records
-            WHERE programmeid = %s AND userid = %s
-              AND symbol = %s AND timeframe = %s
-              AND candle_time < %s
-            ORDER BY candle_time DESC, id DESC
-            LIMIT 1""",
-        [first.get('programmeid'), first.get('userid'),
-         first.get('symbol'), first.get('timeframe'), first_text],
-        timeout=15.0, quiet=True,
-    )
-
-    accepted_anchor = None
-    if previous_row:
-        previous_time = _parse_db_datetime(_raw_first_key(previous_row, 'candle_time'))
-        try:
-            previous_high = float(_raw_first_key(previous_row, 'high'))
-            previous_low = float(_raw_first_key(previous_row, 'low'))
-            if (previous_time is not None and math.isfinite(previous_high) and
-                    math.isfinite(previous_low) and previous_high >= previous_low):
-                accepted_anchor = {
-                    'candle_time': previous_time,
-                    'high': previous_high,
-                    'low': previous_low,
-                }
-        except (TypeError, ValueError, OverflowError):
-            accepted_anchor = None
-
-    accepted = []
-    rejected_times = []
-    rejected = 0
-    for row in ordered:
-        current_time = row['candle_time']
-        current_open = float(row['open'])
-        if accepted_anchor is not None:
-            epsilon = max(
-                1.0e-8,
-                abs(accepted_anchor['high']) * 1.0e-10,
-                abs(accepted_anchor['low']) * 1.0e-10,
-                abs(current_open) * 1.0e-10,
-            )
-            outside_previous_range = (
-                current_open > accepted_anchor['high'] + epsilon or
-                current_open < accepted_anchor['low'] - epsilon
-            )
-            if outside_previous_range:
-                rejected += 1
-                rejected_times.append(current_time)
-                print(
-                    f"      [CHARTS][GAP REJECT] {label}: "
-                    f"time={current_time} open={current_open:.8f} "
-                    f"outside last accepted range "
-                    f"[{accepted_anchor['low']:.8f}, {accepted_anchor['high']:.8f}]; "
-                    "existing row will be deleted and source bar will not be written"
-                )
-                continue
-
-        accepted.append(row)
-        accepted_anchor = {
-            'candle_time': current_time,
-            'high': float(row['high']),
-            'low': float(row['low']),
-        }
-
-    # Delete matching stale rows in batches. The DELETE is programme/user/
-    # symbol/timeframe scoped and safe when the rejected timestamp is not stored.
-    if rejected_times:
-        programme_id = first.get('programmeid')
-        userid = first.get('userid')
-        symbol = first.get('symbol')
-        timeframe = first.get('timeframe')
-        for offset in range(0, len(rejected_times), 400):
-            batch = rejected_times[offset:offset + 400]
-            placeholders = ', '.join(['%s'] * len(batch))
-            sql = (
-                "DELETE FROM candle_records WHERE programmeid = %s AND userid = %s "
-                "AND symbol = %s AND timeframe = %s AND candle_time IN (" + placeholders + ")"
-            )
-            ok, affected, message = db_execute(
-                sql, [programme_id, userid, symbol, timeframe] + batch,
-                timeout=90.0, quiet=True,
-            )
-            if not ok:
-                print(
-                    f"      [CHARTS][GAP DELETE FAIL] {label}: "
-                    f"could not delete rejected existing rows: {message}"
-                )
-                # Rejected source bars remain excluded regardless; a later
-                # cleanup pass will retry removal of their stored snapshots.
-
-    if rejected:
-        print(
-            f"      [CHARTS][GAP REJECT] {label}: "
-            f"rejected {rejected} opening-gap source candle(s)"
-        )
-    return accepted
+    return sorted(rows or [], key=lambda item: item['candle_time'])
 
 # ==============================================================================
 #  ROTATION-ROUND HELPERS
@@ -1639,20 +1524,22 @@ def _repair_existing_history_once(programme_id, userid, symbol, timeframe_key,
         )
         return False
 
-    updated, update_failed = _update_existing_candle_rows_batched(
+    inserted, repair_failed, replaced, correct, _new = _reconcile_candle_rows_batched(
         programme_id, userid, symbol, timeframe_key, rows,
+        insert_missing=False,
     )
-    if update_failed:
+    if repair_failed:
         print(
-            f"      [CHARTS][REPAIR] {symbol} {timeframe_key}: database update "
-            "failed; repair will retry on a later cycle"
+            f"      [CHARTS][REPAIR] {symbol} {timeframe_key}: database "
+            "reconciliation failed; repair will retry on a later cycle"
         )
         return False
 
     _REPAIRED_PAIRS_THIS_PROCESS.add(pair_key)
     print(
-        f"      [CHARTS][REPAIR] {symbol} {timeframe_key}: reconciled "
-        f"{len(rows)} MT5 source bars; existing rows updated={updated}; "
+        f"      [CHARTS][REPAIR] {symbol} {timeframe_key}: checked "
+        f"{len(rows)} MT5 source bars; corrected={replaced}, "
+        f"already_correct={correct}, replacement_rows_inserted={inserted}; "
         f"history_exhausted={history_exhausted}"
     )
     return True
@@ -1661,71 +1548,152 @@ def _repair_existing_history_once(programme_id, userid, symbol, timeframe_key,
 def _latest_pass(programme_id, userid, symbol, timeframe_key,
                  tf_const, tz_obj, tz_name, computer_tz=None):
     """
-    Capture the newest MT5 page and insert any bars not already stored.
-    Returns (source_bars_fetched, rows_inserted, insert_failed).
-    source_bars_fetched is important: the next historical start_pos is a
-    position in the MT5 series, not the number of rows newly inserted.
+    Synchronize the newest MT5 page without routinely deleting stored candles.
+
+    Existing OHLCV is compared with MT5 at the same candle_time. Matching rows
+    are left untouched. Only a mismatching stored row is deleted and replaced
+    with the complete valid MT5 source row. Missing timestamps are inserted.
+
+    Returns (source_bars_fetched, rows_inserted_or_replaced, failed,
+             newly_appeared_source_bars).
     """
     rates, fetch_failed, history_exhausted = _mt5_fetch_complete_page(
         symbol, tf_const, 0, LATEST_PROBE_BARS,
         f"{symbol} {timeframe_key} latest",
     )
     if fetch_failed:
-        return 0, 0, True
+        return 0, 0, True, 0
     if not rates:
         print(f"      [CHARTS][LATEST] {symbol} {timeframe_key}: "
               "MT5 returned no latest bars after retries")
-        return 0, 0, False
+        return 0, 0, False, 0
+
     fetched = len(rates)
+    pair_key = (
+        int(programme_id), int(userid), str(symbol).upper(),
+        str(timeframe_key).lower(),
+    )
+
+    # Record real source-position movement independently of database changes.
+    source_epoch_by_time = {}
+    for rate in rates:
+        try:
+            epoch = int(rate['time'])
+            source_time = _mt5_epoch_to_programme_time(
+                epoch, tz_obj, computer_tz
+            ).replace(tzinfo=None)
+            source_epoch_by_time[source_time] = epoch
+        except Exception:
+            continue
+
+    source_times = sorted(source_epoch_by_time)
+    previous_latest_source_time = _LATEST_SOURCE_TIMES_THIS_PROCESS.get(pair_key)
+    newly_appeared_source_bars = 0
+    if previous_latest_source_time is not None:
+        newly_appeared_source_bars = sum(
+            1 for source_time in source_times
+            if source_time > previous_latest_source_time
+        )
+    if source_times:
+        newest_source_time = source_times[-1]
+        if (previous_latest_source_time is None or
+                newest_source_time > previous_latest_source_time):
+            _LATEST_SOURCE_TIMES_THIS_PROCESS[pair_key] = newest_source_time
+
+    latest_stored_row = db_fetch_one(
+        """SELECT id, candle_time
+             FROM candle_records
+            WHERE programmeid = %s AND userid = %s
+              AND symbol = %s AND timeframe = %s
+            ORDER BY candle_time DESC, id DESC
+            LIMIT 1""",
+        [programme_id, userid, symbol, timeframe_key],
+        timeout=20.0, quiet=True,
+    )
+    latest_stored_time = _parse_db_datetime(
+        _raw_first_key(latest_stored_row, 'candle_time')
+    ) if latest_stored_row else None
+
     rows = _rates_to_rows(
         programme_id, userid, symbol, timeframe_key, tz_obj, tz_name, rates,
         computer_tz=computer_tz,
     )
-    rows = _reject_interbar_gap_rows(
-        rows, timeframe_key, f"{symbol} {timeframe_key} latest"
-    )
+
+    # Re-fetch the exact newest stored timestamp to get the freshest forming-
+    # candle snapshot. This does not delete anything; reconciliation below
+    # decides whether the stored OHLCV actually differs from this source row.
+    if latest_stored_time is not None and latest_stored_time in source_epoch_by_time:
+        exact_epoch = source_epoch_by_time[latest_stored_time]
+        exact_rates = None
+        for attempt in range(1, MT5_FETCH_RETRIES_PER_SIZE + 1):
+            candidate_rates = mt5_copy_rate_at_epoch(
+                symbol, tf_const, exact_epoch
+            )
+            if candidate_rates is not None:
+                try:
+                    if (len(candidate_rates) == 1 and
+                            int(candidate_rates[0]['time']) == exact_epoch):
+                        exact_rates = candidate_rates
+                        break
+                except Exception:
+                    pass
+            if attempt < MT5_FETCH_RETRIES_PER_SIZE:
+                time.sleep(MT5_FETCH_RETRY_DELAY)
+
+        if exact_rates is not None:
+            exact_rows = _rates_to_rows(
+                programme_id, userid, symbol, timeframe_key, tz_obj, tz_name,
+                exact_rates, computer_tz=computer_tz,
+            )
+            if exact_rows and exact_rows[0]['candle_time'] == latest_stored_time:
+                rows = [row for row in rows
+                        if row['candle_time'] != latest_stored_time]
+                rows.append(exact_rows[0])
+                print(
+                    f"      [CHARTS][LATEST CHECK] {symbol} {timeframe_key}: "
+                    f"fetched exact stored candle {latest_stored_time}; "
+                    "stored row will be replaced only if OHLCV differs"
+                )
+            else:
+                print(
+                    f"      [CHARTS][LATEST CHECK] {symbol} {timeframe_key}: "
+                    f"exact MT5 candle {latest_stored_time} was malformed; "
+                    "existing database row will be preserved"
+                )
+        else:
+            print(
+                f"      [CHARTS][LATEST CHECK] {symbol} {timeframe_key}: "
+                f"exact MT5 re-fetch for {latest_stored_time} failed; "
+                "using the latest page snapshot without deleting stored data"
+            )
+    elif latest_stored_time is not None:
+        print(
+            f"      [CHARTS][LATEST CHECK] {symbol} {timeframe_key}: stored "
+            f"latest candle {latest_stored_time} is outside this MT5 probe; "
+            "it will be left untouched"
+        )
+
+    rows.sort(key=lambda item: item['candle_time'])
     if not rows:
-        return fetched, 0, False
-    rows.sort(key=lambda x: x['candle_time'])
-    window_start = rows[0]['candle_time']
-    window_end = rows[-1]['candle_time']
-    existing = _existing_times_in_window(
-        programme_id, userid, symbol, timeframe_key,
-        window_start, window_end,
+        return fetched, 0, False, newly_appeared_source_bars
+
+    inserted, failed, replaced, correct, new_count = _reconcile_candle_rows_batched(
+        programme_id, userid, symbol, timeframe_key, rows,
+        insert_missing=True,
     )
 
-    # Refresh all records that overlap this MT5 page, including the still-open
-    # bar and any historical candles previously stored before they closed.
-    updated, update_failed = _update_existing_candle_rows_batched(
-        programme_id, userid, symbol, timeframe_key, rows,
-    )
-    fresh = [r for r in rows if r['candle_time'] not in existing]
-    if not fresh:
-        print(
-            f"      [CHARTS] {symbol} {timeframe_key}: latest MT5 page refreshed "
-            f"existing candles={updated}; no new timestamps"
-        )
-        return fetched, 0, update_failed
-    current_count = _count_stored_rows(programme_id, userid, symbol, timeframe_key)
-    projected_count = current_count + len(fresh)
-    if projected_count > MAX_BARS_PER_TF:
-        # Make room before writing, so the table does not temporarily grow
-        # beyond the retention ceiling while the newest page is inserted.
-        keep_before_insert = max(0, MAX_BARS_PER_TF - len(fresh))
-        trimmed = _trim_oldest_rows(
-            programme_id, userid, symbol, timeframe_key,
-            keep_limit=keep_before_insert,
-        )
-        if trimmed is None:
-            return fetched, 0, True
-    inserted, failed = _insert_candle_rows_batched(fresh)
-    failed = failed or update_failed
     trimmed = _trim_oldest_rows(programme_id, userid, symbol, timeframe_key)
     if trimmed is None:
         failed = True
-    print(f"      [CHARTS] {symbol} {timeframe_key}: latest page "
-          f"fetched={fetched} updated_existing={updated} new={len(fresh)} inserted={inserted}")
-    return fetched, inserted, failed
+
+    print(
+        f"      [CHARTS] {symbol} {timeframe_key}: latest page fetched={fetched} "
+        f"checked={len(rows)} already_correct={correct} corrected={replaced} "
+        f"new_timestamps={new_count} inserted_or_replaced={inserted}; "
+        f"new_MT5_positions={newly_appeared_source_bars}"
+    )
+    return fetched, inserted, failed, newly_appeared_source_bars
+
 def _backfill_pass(programme_id, userid, symbol, timeframe_key,
                    tf_const, tz_obj, tz_name, start_pos, requested,
                    computer_tz=None):
@@ -1762,37 +1730,24 @@ def _backfill_pass(programme_id, userid, symbol, timeframe_key,
         print(f"      [CHARTS][BACKFILL] {symbol} {timeframe_key}: "
               f"fetched={fetched} at start_pos={start_pos}, but no valid rows")
         return fetched, 0, False
-    # MT5 data is normally chronological, but sort explicitly before using
-    # the datetime window for duplicate detection and SQL insertion.
+
     rows.sort(key=lambda x: x['candle_time'])
-    window_start = rows[0]['candle_time']
-    window_end = rows[-1]['candle_time']
-    existing = _existing_times_in_window(
-        programme_id, userid, symbol, timeframe_key,
-        window_start, window_end,
-    )
-    updated, update_failed = _update_existing_candle_rows_batched(
+    inserted, failed, replaced, correct, new_count = _reconcile_candle_rows_batched(
         programme_id, userid, symbol, timeframe_key, rows,
+        insert_missing=True,
     )
-    fresh = [r for r in rows if r['candle_time'] not in existing]
-    if not fresh:
-        print(f"      [CHARTS][BACKFILL] {symbol} {timeframe_key}: "
-              f"rotation at MT5 positions {start_pos}-"
-              f"{start_pos + fetched - 1}: fetched={fetched}, updated_existing={updated}, all already stored")
-        return fetched, 0, update_failed
-    inserted, failed = _insert_candle_rows_batched(fresh)
-    failed = failed or update_failed
     trimmed = _trim_oldest_rows(programme_id, userid, symbol, timeframe_key)
     if trimmed is None:
         failed = True
     print(f"      [CHARTS][BACKFILL] {symbol} {timeframe_key}: "
           f"rotation at MT5 positions {start_pos}-"
           f"{start_pos + fetched - 1}: fetched={fetched}, "
-          f"new={len(fresh)}, inserted={inserted}")
-    if failed or inserted < len(fresh):
+          f"already_correct={correct}, corrected={replaced}, "
+          f"new={new_count}, inserted_or_replaced={inserted}")
+    if failed:
         print(f"      [CHARTS][BACKFILL] {symbol} {timeframe_key}: "
-              "database insert was incomplete; stopping this pair so the "
-              "failed page is not silently skipped")
+              "database reconciliation was incomplete; stopping this pair "
+              "so the failed page is not silently skipped")
         return fetched, inserted, True
     return fetched, inserted, False
 #  SYNC ONE (programme, symbol, timeframe) — ONE ROUND
@@ -1800,23 +1755,24 @@ def _backfill_pass(programme_id, userid, symbol, timeframe_key,
 def _sync_one_symbol_timeframe(programme_id, userid, symbol, timeframe_key,
                                tf_const, tz_obj, tz_name, computer_tz=None):
     """
-    Synchronize one programme/symbol/timeframe pair while retaining no more
-    than MAX_BARS_PER_TF candles. Existing excess rows are pruned first;
-    new latest candles replace the oldest rows when the pair is full.
+    Synchronize one programme/symbol/timeframe pair. MAX_BARS_PER_TF is the
+    historical backfill target, not a reason to delete existing candles.
+    Existing valid OHLC rows are preserved, inaccurate rows are replaced from
+    MT5, and newly arriving candles are appended without purging older rows.
     Historical backfill stops as soon as the pair reaches the 5,000-row cap.
     """
     if not mt5_symbol_select(symbol, True):
         print(f"      [CHARTS] {symbol} {timeframe_key}: symbol_select failed")
         return {'inserted': 0, 'skipped': True}
-    # Remove malformed and price-discontinuous stored rows first. The MT5
-    # reconciliation must never use a known-bad database row as its predecessor.
+    # Audit stored data without deleting it. MT5 comparison below is the only
+    # authority allowed to replace an existing candle's OHLCV values.
     initial_cleanup = _cleanup_broken_candle_rows(
         programme_id, userid, symbol, timeframe_key, tz_name=tz_name,
     )
     if initial_cleanup is None:
         return {'inserted': 0, 'skipped': True, 'reason': 'candle_cleanup_failed'}
-    # Reconcile the remaining retained history against broker OHLC. Any source
-    # gap bar is rejected and its stale database snapshot is deleted as well.
+    # Compare retained history against broker OHLCV. Only incorrect records
+    # are replaced; correct candles and legitimate opening gaps are preserved.
     _repair_existing_history_once(
         programme_id, userid, symbol, timeframe_key, tf_const,
         tz_obj, tz_name, computer_tz=computer_tz,
@@ -1836,7 +1792,7 @@ def _sync_one_symbol_timeframe(programme_id, userid, symbol, timeframe_key,
     insert_failed = False
     latest_page_fetched = 0
     # ---- Rotation 1: newest bars ---------------------------------------
-    latest_page_fetched, n_latest, latest_failed = _latest_pass(
+    latest_page_fetched, n_latest, latest_failed, _latest_source_advance = _latest_pass(
         programme_id, userid, symbol, timeframe_key, tf_const, tz_obj, tz_name,
         computer_tz=computer_tz,
     )
@@ -1905,12 +1861,15 @@ def _sync_one_symbol_timeframe(programme_id, userid, symbol, timeframe_key,
             # Revisit the newest page after each older page. If a new candle
             # closed while backfill was running, it is inserted now and shifts
             # all older MT5 position indexes by the number of new bars.
-            latest_fetched_again, latest_new, latest_failed_again = _latest_pass(
+            latest_fetched_again, latest_new, latest_failed_again, latest_source_advance = _latest_pass(
                 programme_id, userid, symbol, timeframe_key,
                 tf_const, tz_obj, tz_name, computer_tz=computer_tz,
             )
             latest_inserted += latest_new
-            next_start_pos += latest_new
+            # Advance only when MT5 has genuinely exposed newer source bars.
+            # OHLCV replacements do not count as new MT5 positions and must
+            # never skip historical bars.
+            next_start_pos += latest_source_advance
             if latest_failed_again:
                 insert_failed = True
                 print(f"      [CHARTS] {symbol} {timeframe_key}: latest refresh "
@@ -2059,7 +2018,7 @@ def _process_programme(programme, tf_map):
         print(f"[CHARTS] MT5 Max bars in chart = {terminal_maxbars}")
         if terminal_maxbars < MAX_BARS_PER_TF:
             print("[CHARTS][NOTE] MT5 terminal Max bars in chart is below the "
-                  f"collector cap ({MAX_BARS_PER_TF}). The collector can only "
+                  f"backfill target ({MAX_BARS_PER_TF}). The collector can only "
                   "download bars that the terminal makes available. Increase "
                   "Tools > Options > Charts > Max bars in chart and restart MT5 "
                   "to expose a deeper history.")
@@ -2201,7 +2160,7 @@ def main_loop():
     if run_as_loop:
         print("  Inter-loop delay: 0s (next loop starts immediately)")
         print(f"  Max Loops: {max_loops if max_loops else 'Infinite'}")
-    print(f"  Rotation targets: {ROUND_TARGETS}  cap={MAX_BARS_PER_TF}")
+    print(f"  Rotation targets: {ROUND_TARGETS}  backfill_target={MAX_BARS_PER_TF}")
     print("=" * 60 + "\n")
     _worker_init()
     cpu_cores = os.cpu_count() or 1
