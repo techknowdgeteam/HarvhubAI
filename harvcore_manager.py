@@ -101,7 +101,7 @@ PROGRAMS = [
         "args": [],
         "role": "service",
         "runnable": True,
-        "interval": 10,
+        "interval": 5,
         "bridge": False,
         "note": "Manual MT5 login requests are shown directly in this HarvHub window.",
     },
@@ -114,7 +114,7 @@ PROGRAMS = [
         "args": [],
         "role": "service",
         "runnable": True,
-        "interval": 60,
+        "interval": 10,
         "bridge": False,
     },
     {
@@ -126,7 +126,7 @@ PROGRAMS = [
         "args": [],
         "role": "service",
         "runnable": True,
-        "interval": 60,
+        "interval": 10,
         "bridge": False,
     },
     {
@@ -151,7 +151,7 @@ PROGRAMS = [
         "args": [],
         "role": "service",
         "runnable": True,
-        "interval": 30,
+        "interval": 10,
         "bridge": False,
         "warning": "This program can change programme challenge status, advertisement and server approval fields.",
     },
@@ -3007,7 +3007,8 @@ class HarvCoreManager:
                 key, self.global_execution_type
             )
             selected_execution = "loop" if str(selected_execution).lower() == "loop" else "once"
-            interval = max(1, int(item.get("interval", DEFAULT_LOOP_INTERVAL)))
+            # Keep every runnable worker inside the requested 5–10 second loop window.
+            interval = min(10, max(5, int(item.get("interval", DEFAULT_LOOP_INTERVAL))))
             command = build_service_command(
                 python_exe=self.python_exe,
                 script=script,
@@ -3020,7 +3021,7 @@ class HarvCoreManager:
             env["PYTHONUNBUFFERED"] = "1"
             env["PYTHONUTF8"] = "1"
             env["HARVHUB_EXECUTION_TYPE"] = selected_execution
-            env["HARVHUB_LOOP_INTERVAL"] = str(DEFAULT_LOOP_INTERVAL)
+            env["HARVHUB_LOOP_INTERVAL"] = str(interval)
             env["HARVHUB_CONTROL_HOST"] = CONTROL_HOST
             env["HARVHUB_CONTROL_PORT"] = str(CONTROL_PORT)
             env["HARVHUB_MANAGER_DIR"] = str(MANAGER_DIR)

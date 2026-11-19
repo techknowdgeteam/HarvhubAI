@@ -43,7 +43,6 @@ BRIDGE_OWNER = "programme_training"
 MAX_FRAME = 64 * 1024 * 1024
 HEADER = struct.Struct(">I")
 MAX_ROOT_MATCH_STATES = 2500
-CANDLE_PAGE_SIZE = 2000
 
 logging.basicConfig(
     level=logging.INFO,
@@ -2100,53 +2099,29 @@ ANALYTICS_COLUMNS = [
 
 
 def load_candles(db: BridgeClient, programme_id: int, user_id: int,
-                 symbol: str, timeframe: str) -> List[Dict[str, Any]]:
-    """Fetch every stored candle for one exact pair, in PHP chart order.
+                 symbol: str, timeframe: str, total_limit: int) -> List[Dict[str, Any]]:
+    """Fetch only the newest configured number of candles for one exact pair.
 
-    programme_training.php fetches newest-first pages of at most 2,000 rows,
-    reverses each page, and prepends older pages. This performs the same
-    programme/user/symbol/timeframe scoping and pagination. The completed list
-    is chronological, oldest candle first, exactly as PT_CANDLES is for matching.
+    Rows are requested newest-first from candle_records, then reversed so the
+    completed list is chronological, oldest candle first, matching PT_CANDLES.
+    The total is supplied by server_account.chart_total_candles; there is no
+    local default or hardcoded processing cap.
     """
-    pages_desc: List[List[Dict[str, Any]]] = []
-    before: Optional[str] = None
-    page_number = 0
-    while True:
-        page_number += 1
-        where_before = " AND `candle_time` < %s" if before else ""
-        params: List[Any] = [programme_id, user_id, symbol, timeframe]
-        if before:
-            params.append(before)
-        sql = (
-            "SELECT id,candle_time,open_time,close_time,open,high,low,`close`, "
-            "candle_center,body_center,high_wick_center,low_wick_center, "
-            "candle_width_center,volume "
-            "FROM `candle_records` WHERE `programmeid`=%s AND `userid`=%s "
-            "AND `symbol`=%s AND `timeframe`=%s" + where_before +
-            f" ORDER BY `candle_time` DESC LIMIT {CANDLE_PAGE_SIZE}"
-        )
-        rows = db.fetch_all(sql, params, timeout=120)
-        if not rows:
-            break
-        pages_desc.append(rows)
-        oldest = rows[-1].get("candle_time")
-        if oldest is None or str(oldest).strip() == "":
-            log.warning("    %s %s: pagination stopped because the oldest candle has no candle_time", symbol, timeframe.upper())
-            break
-        if len(rows) < CANDLE_PAGE_SIZE:
-            break
-        if before is not None and str(oldest) >= str(before):
-            log.warning("    %s %s: pagination made no progress at %s", symbol, timeframe.upper(), oldest)
-            break
-        before = str(oldest)
-
-    # Pages were collected newest-to-oldest and rows within each page are DESC.
-    chronological_rows: List[Dict[str, Any]] = []
-    for page in reversed(pages_desc):
-        chronological_rows.extend(reversed(page))
-
+    if total_limit <= 0:
+        return []
+    sql = (
+        "SELECT id,candle_time,open_time,close_time,open,high,low,`close`, "
+        "candle_center,body_center,high_wick_center,low_wick_center, "
+        "candle_width_center,volume "
+        "FROM `candle_records` WHERE `programmeid`=%s AND `userid`=%s "
+        "AND `symbol`=%s AND `timeframe`=%s "
+        f"ORDER BY `candle_time` DESC LIMIT {int(total_limit)}"
+    )
+    newest_first = db.fetch_all(
+        sql, [programme_id, user_id, symbol, timeframe], timeout=120
+    )
     candles: List[Dict[str, Any]] = []
-    for row in chronological_rows:
+    for row in reversed(newest_first):
         candles.append({
             "id": as_int(row.get("id")),
             "time": row.get("candle_time"),
@@ -2506,6 +2481,19 @@ def process_programme(db: BridgeClient, programme: Dict[str, Any]) -> Dict[str, 
     print(f"PROGRAMME: {programme_name} (ID {programme_id})")
     print("=" * 82)
     print(f"Owner user ID: {user_id}")
+    try:
+        chart_setting_rows = db.fetch_all(
+            "SELECT `chart_total_candles` FROM `server_account` WHERE `id`=1 LIMIT 1",
+            timeout=30,
+        )
+        chart_total_candles = as_int(chart_setting_rows[0].get("chart_total_candles")) if chart_setting_rows else None
+    except Exception as exc:
+        log.error("%s: could not read server_account.chart_total_candles; skipping programme: %s", programme_name, exc)
+        return {"pairs": 0, "families": 0, "trades": 0, "candles": 0}
+    if chart_total_candles is None or chart_total_candles < 1:
+        print(f"{programme_name}: server_account.chart_total_candles is empty or invalid. Skipping candle fetch and analytics; no fallback is applied.")
+        return {"pairs": 0, "families": 0, "trades": 0, "candles": 0}
+    print(f"Chart Total Candles: {chart_total_candles:,} (server_account.chart_total_candles)")
     begin_test_enabled = truthy(programme.get("begin_test_flag"), False)
     begin_status = str(programme.get("begin_test_status") or "not started").strip().lower()
     begin_started = programme.get("begin_test_started_at") or "not recorded"
@@ -2575,7 +2563,7 @@ def process_programme(db: BridgeClient, programme: Dict[str, Any]) -> Dict[str, 
     fetched_candles: Dict[str, Dict[str, List[Dict[str, Any]]]] = {symbol: {} for symbol in symbols}
     total_candles = 0
     for symbol, timeframe in required_pairs_ordered:
-        candles = load_candles(db, programme_id, user_id, symbol, timeframe)
+        candles = load_candles(db, programme_id, user_id, symbol, timeframe, chart_total_candles)
         fetched_candles.setdefault(symbol, {})[timeframe] = candles
         total_candles += len(candles)
         diag = candle_sequence_diagnostics(candles)
@@ -2601,6 +2589,7 @@ def process_programme(db: BridgeClient, programme: Dict[str, Any]) -> Dict[str, 
             "userid": user_id,
             "program_name": programme_name,
             "selected_symbols": programme.get("selected_symbols"),
+            "chart_total_candles": chart_total_candles,
             "begin_test_interest_id": programme.get("begin_test_interest_id"),
             "begin_test_flag": int(begin_test_enabled),
             "begin_test_status": programme.get("begin_test_status"),
@@ -2613,6 +2602,7 @@ def process_programme(db: BridgeClient, programme: Dict[str, Any]) -> Dict[str, 
             "user_id": user_id,
             "symbols": symbols,
             "required_timeframes": required_timeframes,
+            "chart_total_candles": chart_total_candles,
             "required_pairs": [{"symbol": symbol, "timeframe": tf} for symbol, tf in required_pairs_ordered],
             "programme_filter": "programme_vps IP match (direct owner or active follower)",
             "begin_test_policy": "only pending_entry trade records are live when Begin Test is enabled",
@@ -3042,7 +3032,7 @@ def main() -> int:
     )
     parser.add_argument("--execution-type", choices=("loop", "once"), default="loop", help="manager execution mode")
     parser.add_argument("--once", action="store_true", help="run one complete scan and exit (legacy alias)")
-    parser.add_argument("--interval", type=int, default=60, help="seconds between complete scans (default: 60)")
+    parser.add_argument("--interval", type=int, default=10, help="seconds between complete scans (clamped to 5–10; default: 10)")
     parser.add_argument(
         "--programme-id", type=int, default=None,
         help="optionally limit to one programme already assigned to this VPS IP",
@@ -3054,8 +3044,7 @@ def main() -> int:
     parser.add_argument("--bridge-host", default=BRIDGE_HOST)
     parser.add_argument("--bridge-port", type=int, default=BRIDGE_PORT)
     args = parser.parse_args()
-    if args.interval < 5:
-        parser.error("--interval must be at least 5 seconds")
+    args.interval = min(10, max(5, int(args.interval)))
     run_as_loop = args.execution_type == "loop" and not args.once
 
     print(f"Programme Training starting | mode={'LOOP' if run_as_loop else 'ONCE'} | interval={args.interval}s", flush=True)
@@ -3121,7 +3110,7 @@ def main() -> int:
                 print("Programme Training one-shot scan finished; exiting.", flush=True)
                 break
             elapsed = time.monotonic() - started
-            sleep_for = max(1, args.interval - int(elapsed))
+            sleep_for = min(10, max(5, args.interval))
             print(f"Next Programme Training scan in {sleep_for}s.", flush=True)
             for _ in range(sleep_for):
                 if stopping:

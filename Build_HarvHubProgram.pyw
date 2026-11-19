@@ -9,6 +9,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, messagebox
@@ -253,14 +254,36 @@ class Builder:
         self.log_lines: list[str] = []
         self.console_visible = False
         self.handed_off = False
+        self.log_lock = threading.RLock()
+        configured_log = os.environ.get("HARVHUB_BUILDER_LOG")
+        self.log_file_path = Path(configured_log) if configured_log else (APP_DIR / ".manager" / "builder_output.log")
+        try:
+            self.log_file_path.parent.mkdir(parents=True, exist_ok=True)
+            self.log_file_path.write_text("", encoding="utf-8")
+        except OSError:
+            pass
         self.root.title("HarvHub AI")
         self.root.geometry("900x650")
         self.root.minsize(520, 500)
+        try:
+            self.root.attributes("-topmost", True)
+        except tk.TclError:
+            pass
         self.root.configure(bg=PALETTE["bg"])
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self._build_ui()
         self.root.after(100, self._poll)
+        self.root.after(120, self._activate_builder_window)
         self.root.after(250, self.start)
+
+    def _activate_builder_window(self):
+        try:
+            if self.root.winfo_exists():
+                self.root.attributes("-topmost", True)
+                self.root.lift()
+                self.root.focus_force()
+        except tk.TclError:
+            pass
 
     def button(self, parent, text, command, primary=False):
         return tk.Button(
@@ -324,7 +347,14 @@ class Builder:
         footer.pack(fill="x", padx=22, pady=(0, 12))
 
     def log(self, message: str):
-        self.events.put(("log", message))
+        text = str(message)
+        try:
+            with self.log_lock:
+                with self.log_file_path.open("a", encoding="utf-8", errors="replace") as log_file:
+                    log_file.write(text + "\n")
+        except OSError:
+            pass
+        self.events.put(("log", text))
 
     def set_status(self, message: str):
         self.events.put(("status", message))
@@ -453,8 +483,10 @@ class Builder:
             self.log(f"BUILD OUTPUT: {OUTPUT_EXE}")
             self.events.put(("complete", str(installed_exe)))
         except Exception as exc:
+            diagnostic = traceback.format_exc().strip()
             self.log("BUILD FAILED: " + str(exc))
-            self.set_status("Build needs attention. Copy the build report for details.")
+            self.log(diagnostic)
+            self.set_status("Build needs attention. The error is shown in the console below.")
             self.events.put(("failed", str(exc)))
 
     def _poll(self):
@@ -492,9 +524,17 @@ class Builder:
                     self.progress.stop()
                     self.progress.configure(mode="determinate", value=0)
                     self.running = False
-                    self.status.configure(text="Setup needs attention. Copy the build report for details.")
-                    # Keep the diagnostic in this window; no success/failure
-                    # modal interrupts the customer's progress screen.
+                    self.status.configure(text="Setup needs attention. The error is shown in the console below.")
+                    # The builder reports its own error in its copyable console;
+                    # no CMD window or external terminal is opened.
+                    self.console_visible = True
+                    self.console.pack(fill="both", expand=True, pady=(14, 0))
+                    self.console.configure(state="normal")
+                    self.console.delete("1.0", "end")
+                    self.console.insert("end", "\n".join(self.log_lines))
+                    self.console.see("end")
+                    self.console.configure(state="disabled")
+                    self.console_button.configure(text="Hide Build Details")
         except queue.Empty:
             pass
         if not self.handed_off:
@@ -524,6 +564,7 @@ class Builder:
         except Exception as exc:
             self.handed_off = False
             self.log("Could not open HarvHub AI in the current window: " + str(exc))
+            self.log(traceback.format_exc().strip())
             # The builder widgets have already been removed. Recreate a compact
             # in-window recovery screen instead of displaying a modal dialog.
             for child in self.root.winfo_children():
@@ -872,5 +913,82 @@ def main():
     root.mainloop()
 
 
+def _show_builder_startup_error(error_text: str) -> bool:
+    """Show unexpected builder startup failures in a topmost copyable window."""
+    root = None
+    try:
+        root = tk.Tk()
+        root.title("HarvHub AI — Startup Error")
+        root.geometry("1000x680")
+        root.minsize(680, 460)
+        root.configure(bg=PALETTE["bg"])
+        root.attributes("-topmost", True)
+        panel = tk.Frame(root, bg=PALETTE["surface"], padx=22, pady=20)
+        panel.pack(fill="both", expand=True, padx=18, pady=18)
+        tk.Label(panel, text="HarvHub AI setup could not start", bg=PALETTE["surface"],
+                 fg=PALETTE["text"], font=("Segoe UI", 18, "bold")).pack(anchor="w")
+        tk.Label(panel, text="The complete diagnostic is shown below and can be copied.",
+                 bg=PALETTE["surface"], fg=PALETTE["muted"], font=("Segoe UI", 9)).pack(anchor="w", pady=(8, 12))
+        console = ScrolledText(panel, wrap="word", bg=PALETTE["console"],
+                               fg=PALETTE["console_text"], font=("Consolas", 9),
+                               relief="flat", padx=12, pady=10)
+        console.insert("end", error_text)
+        console.configure(state="disabled")
+        console.pack(fill="both", expand=True)
+        controls = tk.Frame(panel, bg=PALETTE["surface"])
+        controls.pack(fill="x", pady=(12, 0))
+        def copy_error():
+            try:
+                root.clipboard_clear()
+                root.clipboard_append(error_text)
+                root.update_idletasks()
+                copy_button.configure(text="COPIED")
+            except tk.TclError:
+                copy_button.configure(text="COPY FAILED")
+        copy_button = tk.Button(controls, text="COPY ERROR CONSOLE", command=copy_error,
+                                bg=PALETTE["gold"], fg="#fff", relief="flat",
+                                padx=16, pady=9, font=("Segoe UI", 9, "bold"))
+        copy_button.pack(side="left")
+        root.after(120, lambda: (root.lift(), root.focus_force()))
+        root.mainloop()
+        return True
+    except Exception:
+        try:
+            if root is not None:
+                root.destroy()
+        except Exception:
+            pass
+        return False
+
+
+def _launch_last_resort_builder_cmd(error_text: str) -> None:
+    """Open CMD only if Tk cannot display the builder's own error window."""
+    try:
+        import tempfile
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        report_path = Path(tempfile.gettempdir()) / f"HarvHubAI-builder-error-{stamp}.txt"
+        report_path.write_text(error_text, encoding="utf-8", errors="replace")
+        command_file = report_path.with_suffix(".cmd")
+        command_file.write_text(
+            "@echo off\r\n"
+            "title HarvHub AI - Last Resort Builder Error\r\n"
+            f'type "{report_path}"\r\n'
+            "echo.\r\n"
+            "echo HarvHub AI could not display its own error console.\r\n"
+            "pause\r\n",
+            encoding="utf-8",
+        )
+        cmd_exe = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "System32", "cmd.exe")
+        subprocess.Popen([cmd_exe, "/k", str(command_file)],
+                         creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0))
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        diagnostic = traceback.format_exc()
+        if not _show_builder_startup_error(diagnostic):
+            _launch_last_resort_builder_cmd(diagnostic)

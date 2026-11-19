@@ -63,7 +63,7 @@ else:
 BRIDGE_HOST = "127.0.0.1"
 BRIDGE_PORT = 5599
 BRIDGE_OWNER = "signals_provision_challenge"
-DEFAULT_INTERVAL = 30
+DEFAULT_INTERVAL = 10
 ANALYTICS_PAGE_SIZE = 500
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -1235,8 +1235,7 @@ def main() -> int:
     parser.add_argument("--bridge-host", default=BRIDGE_HOST)
     parser.add_argument("--bridge-port", type=int, default=BRIDGE_PORT)
     args = parser.parse_args()
-    if args.interval < 5:
-        parser.error("--interval must be at least 5 seconds")
+    args.interval = min(10, max(5, int(args.interval)))
     run_as_loop = args.execution_type == "loop" and not args.once
 
     if notifier is None:
@@ -1291,7 +1290,7 @@ def main() -> int:
                 log.info("One-shot challenge scan finished; exiting")
                 break
             elapsed = time.monotonic() - started
-            sleep_for = max(1, args.interval - int(elapsed))
+            sleep_for = min(10, max(5, args.interval))
             log.info("Next challenge scan in %ss", sleep_for)
             for _ in range(sleep_for):
                 if stopping:

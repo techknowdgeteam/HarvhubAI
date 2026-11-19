@@ -1,9 +1,9 @@
 # brokercharts.py
 """
 Programme-scoped OHLC collector — DB-only, no JSON, no local files.
-The 5,000-candle setting is the initial historical backfill target for each
-programme, symbol, and timeframe. Existing rows are never purged to enforce
-that target; new live candles may grow the stored history beyond 5,000 rows.
+The server_account.chart_total_candles setting is the historical backfill and
+repair target for each programme, symbol, and timeframe. Existing rows are
+never purged to enforce that target; live candles may grow stored history.
 REPLACES update_developers() + import os.py (fetch_charts_all_brokers).
 ARCHITECTURE
 ------------
@@ -63,10 +63,10 @@ For every selected (symbol, timeframe) pair:
   6. Fetch the next older page using copy_rates_from_pos(..., start_pos, count).
      Advance start_pos by actual new source bars, not by corrected row inserts.
   7. Stop when repeated empty responses confirm no more history is available
-     or the pair reaches 5,000 stored candles. Failed API requests retry at the
+     or the pair reaches the configured stored-candle target. Failed API requests retry at the
      same position with smaller requests; a persistent one-bar error never
      advances the cursor or silently skips the candle.
-Rows are scoped by programme, symbol, and timeframe. The 5,000-row setting is
+Rows are scoped by programme, symbol, and timeframe. The configured row count is
 a historical backfill target, not a deletion limit. Existing valid rows are
 never purged to enforce it; newly arriving live candles may grow the table
 beyond that target.
@@ -405,22 +405,21 @@ TIMEFRAME_SECONDS = {
 }
 # ---- Rotation milestones -----------------------------------------------------
 # Progress milestones for a single programme/symbol/timeframe pair.
-ROUND_TARGETS = (2000, 5000)
-# Historical backfill target for each programme/symbol/timeframe pair.
-MAX_BARS_PER_TF = 5000
+ROUND_TARGETS = ()
+# Set from server_account.chart_total_candles separately for each programme job.
+# Zero means unconfigured and prevents candle collection.
+MAX_BARS_PER_TF = 0
 # A worker reconciles its existing stored history against MT5 once per pair
 # after startup, repairing valid-looking partial OHLC snapshots left by older
-# collector versions without repeatedly scanning all 5,000 bars every cycle.
+# collector versions without repeatedly scanning the full configured target every cycle.
 _REPAIRED_PAIRS_THIS_PROCESS = set()
 # Last MT5 source candle time seen by _latest_pass for each pair. Used only
 # to advance historical pagination when genuinely newer MT5 bars appear;
 # correcting an existing row must not advance the MT5 cursor.
 _LATEST_SOURCE_TIMES_THIS_PROCESS = {}
-# First rotation: capture the newest 1,500 candles in one pass.
-# Historical rotations then request the next older page using an increasing
-# MT5 start_pos, so the newest page is never fetched again as backfill.
-LATEST_PROBE_BARS = 1500
-BACKFILL_BATCH_BARS = 1500
+# Per-job page sizes are assigned from the configured target before MT5 work.
+LATEST_PROBE_BARS = 0
+BACKFILL_BATCH_BARS = 0
 # Rows per batched INSERT statement.
 INSERT_BATCH_SIZE = 200
 # ==============================================================================
@@ -918,15 +917,17 @@ def _count_stored_rows(programme_id, userid, symbol, timeframe):
     v = _raw_first_key(row, 'c')
     return _coerce_int(v) or 0
 def _trim_oldest_rows(programme_id, userid, symbol, timeframe,
-                      keep_limit=MAX_BARS_PER_TF):
+                      keep_limit=None):
     """
-    Non-destructive retention check.
-
-    MAX_BARS_PER_TF remains the historical backfill target, but the collector
-    must not purge already-recorded candles to enforce it. The stored history
-    is allowed to grow as new live candles arrive. Returns zero because no
-    existing rows are deleted here.
+    Non-destructive retention check using the current server-configured target.
+    Existing candle rows are never purged to enforce the target. The stored
+    history may grow as new live candles arrive. Returns zero because no rows
+    are deleted here.
     """
+    if keep_limit is None:
+        keep_limit = MAX_BARS_PER_TF
+    if keep_limit is None or int(keep_limit) < 1:
+        return None
     current_count = _count_stored_rows(programme_id, userid, symbol, timeframe)
     if current_count > int(keep_limit):
         print(
@@ -1468,6 +1469,8 @@ def _round_target_from_filled(filled):
     Return the target bar count for the current round, based on how many
     rows are already stored. Self-healing across process restarts.
     """
+    if MAX_BARS_PER_TF < 1:
+        return 0
     for target in ROUND_TARGETS:
         if filled < target:
             return target
@@ -1477,7 +1480,7 @@ def _round_target_from_filled(filled):
 def _repair_existing_history_once(programme_id, userid, symbol, timeframe_key,
                                   tf_const, tz_obj, tz_name, computer_tz=None):
     """
-    Reconcile existing database rows against up to the newest 5,000 MT5 bars.
+    Reconcile existing database rows against the newest configured MT5 bars.
 
     Older collector versions permanently kept the first snapshot of a candle
     because an existing timestamp was treated as a completed row. A single
@@ -1487,7 +1490,7 @@ def _repair_existing_history_once(programme_id, userid, symbol, timeframe_key,
     """
     pair_key = (
         int(programme_id), int(userid), str(symbol).upper(),
-        str(timeframe_key).lower(),
+        str(timeframe_key).lower(), int(MAX_BARS_PER_TF),
     )
     if pair_key in _REPAIRED_PAIRS_THIS_PROCESS:
         return True
@@ -1759,7 +1762,7 @@ def _sync_one_symbol_timeframe(programme_id, userid, symbol, timeframe_key,
     historical backfill target, not a reason to delete existing candles.
     Existing valid OHLC rows are preserved, inaccurate rows are replaced from
     MT5, and newly arriving candles are appended without purging older rows.
-    Historical backfill stops as soon as the pair reaches the 5,000-row cap.
+    Historical backfill stops as soon as the pair reaches the configured row target.
     """
     if not mt5_symbol_select(symbol, True):
         print(f"      [CHARTS] {symbol} {timeframe_key}: symbol_select failed")
@@ -1926,6 +1929,26 @@ def _process_programme(programme, tf_map):
     if programme_id is None or userid is None or programme_id <= 0:
         print("[CHARTS] missing id/userid — skip")
         return {'inserted': 0, 'skipped': True}
+
+    global MAX_BARS_PER_TF, ROUND_TARGETS, LATEST_PROBE_BARS, BACKFILL_BATCH_BARS
+    try:
+        chart_setting = db_fetch_one(
+            "SELECT `chart_total_candles` FROM `server_account` WHERE `id` = 1 LIMIT 1",
+            [], timeout=15.0, quiet=False,
+        )
+    except Exception as exc:
+        print(f"[CHARTS] could not read server_account.chart_total_candles — skip programme {programme_id}: {exc}")
+        return {'inserted': 0, 'skipped': True, 'reason': 'chart_total_candles_unavailable'}
+    chart_total_candles = _coerce_int(_raw_first_key(chart_setting, 'chart_total_candles'))
+    if chart_total_candles is None or chart_total_candles < 1:
+        print("[CHARTS] server_account.chart_total_candles is empty or invalid — skipping before MT5; no fallback is applied")
+        return {'inserted': 0, 'skipped': True, 'reason': 'chart_total_candles_unconfigured'}
+
+    MAX_BARS_PER_TF = chart_total_candles
+    ROUND_TARGETS = tuple(sorted({max(1, chart_total_candles // 2), chart_total_candles}))
+    LATEST_PROBE_BARS = min(1500, chart_total_candles)
+    BACKFILL_BATCH_BARS = min(1500, chart_total_candles)
+    print(f"[CHARTS] Chart Total Candles = {MAX_BARS_PER_TF:,} (server_account.chart_total_candles)")
     owner_email = _resolve_owner_email(userid)
     # ---- Gate 1: selected_symbols ----
     selected_symbols = _parse_csv_list(_raw_first_key(programme, 'selected_symbols'))
@@ -2127,7 +2150,7 @@ def process_programme_job(programme_job):
 # ==============================================================================
 def main_loop():
     run_as_loop = False
-    loop_interval = 5
+    loop_interval = 10
     max_loops = None
     args = list(sys.argv[1:])
     for index, arg in enumerate(args):
@@ -2140,12 +2163,12 @@ def main_loop():
             run_as_loop = False
         elif lower.startswith('--interval='):
             try:
-                loop_interval = max(1, int(lower.split('=', 1)[1]))
+                loop_interval = min(10, max(5, int(lower.split('=', 1)[1])))
             except ValueError:
                 pass
         elif lower == '--interval' and index + 1 < len(args):
             try:
-                loop_interval = max(1, int(args[index + 1]))
+                loop_interval = min(10, max(5, int(args[index + 1])))
             except ValueError:
                 pass
         elif lower.startswith('--max-loops='):
@@ -2153,14 +2176,15 @@ def main_loop():
                 max_loops = int(lower.split('=', 1)[1])
             except ValueError:
                 pass
+    loop_interval = min(10, max(5, int(loop_interval)))
     print("\n" + "=" * 60)
     print("           BROKERCHARTS — PROGRAMME OHLC COLLECTOR", flush=True)
     print("=" * 60)
     print(f"  Loop Mode: {'ENABLED' if run_as_loop else 'DISABLED'}")
     if run_as_loop:
-        print("  Inter-loop delay: 0s (next loop starts immediately)")
+        print(f"  Inter-loop delay: {loop_interval}s (clamped to 5–10s)")
         print(f"  Max Loops: {max_loops if max_loops else 'Infinite'}")
-    print(f"  Rotation targets: {ROUND_TARGETS}  backfill_target={MAX_BARS_PER_TF}")
+    print("  Candle target source: server_account.chart_total_candles (empty/invalid values skip programme jobs)")
     print("=" * 60 + "\n")
     _worker_init()
     cpu_cores = os.cpu_count() or 1
@@ -2212,7 +2236,11 @@ def main_loop():
                     if not run_as_loop:
                         print("Single execution completed. Exiting...")
                         break
-                    # Immediate next scan: no one-second or configured interval sleep.
+                    if max_loops and loop_count >= max_loops:
+                        print(f"Maximum loops ({max_loops}) reached. Exiting...")
+                        break
+                    print(f"Next Broker Charts scan in {loop_interval}s.", flush=True)
+                    time.sleep(loop_interval)
                     continue
                 print(f"📊 Submitting {len(programmes)} programme job(s)", flush=True)
                 t0 = time.time()
@@ -2245,8 +2273,8 @@ def main_loop():
             if max_loops and loop_count >= max_loops:
                 print(f"Maximum loops ({max_loops}) reached. Exiting...")
                 break
-            # Do not sleep between collection cycles. The next scan starts
-            # as soon as the previous programme jobs have completed.
+            print(f"Next Broker Charts scan in {loop_interval}s.", flush=True)
+            time.sleep(loop_interval)
     except KeyboardInterrupt:
         print("\n[main] interrupted — shutting down")
     finally:

@@ -3296,7 +3296,7 @@ def main_loop():
             run_as_loop = False
         elif lower.startswith("--interval="):
             try:
-                loop_interval = max(1, int(lower.split("=", 1)[1]))
+                loop_interval = min(10, max(5, int(lower.split("=", 1)[1])))
             except ValueError:
                 pass
         elif lower == "--interval":
@@ -3307,10 +3307,11 @@ def main_loop():
     for index, arg in enumerate(args[:-1]):
         if arg.lower() == "--interval":
             try:
-                loop_interval = max(1, int(args[index + 1]))
+                loop_interval = min(10, max(5, int(args[index + 1])))
             except ValueError:
                 pass
 
+    loop_interval = min(10, max(5, int(loop_interval)))
     _build_timeframe_map()
     print(f"\n{'#'*70}")
     print("#  brokerdetails — broker login monitoring")

@@ -2,9 +2,9 @@ Option Explicit
 
 Dim fso, sh, shellApp, processEnv, localAppData, installRoot, cacheRoot
 Dim psScriptPath, markerPath, pythonMarkerPath, psFile, psExit, projectRoot
-Dim pythonwPath, pythonExePath, builderScript, adminResult, appRunning, clickedVbs
+Dim pythonwPath, builderScript, adminResult, appRunning, clickedVbs
 Dim psProcess, psStdOut, psStdErr, diagnosticText
-Dim builderLaunchPSPath, builderLaunchPSFile, builderLogPath, builderProcess, builderExit
+Dim builderLogPath, builderExit, builderCommand, builderLaunchError
 
 Set fso = CreateObject("Scripting.FileSystemObject")
 Set sh = CreateObject("WScript.Shell")
@@ -16,7 +16,6 @@ cacheRoot = fso.BuildPath(localAppData, "HarvHubAI\Bootstrap")
 psScriptPath = fso.BuildPath(cacheRoot, "visible_bootstrap.ps1")
 markerPath = fso.BuildPath(cacheRoot, "project_root.txt")
 pythonMarkerPath = fso.BuildPath(cacheRoot, "pythonw_path.txt")
-builderLaunchPSPath = fso.BuildPath(cacheRoot, "visible_builder_launch.ps1")
 builderLogPath = fso.BuildPath(cacheRoot, "builder_output.log")
 clickedVbs = WScript.ScriptFullName
 
@@ -79,41 +78,30 @@ If Not fso.FileExists(builderScript) Then
 End If
 
 Call EnsureFolderTree(installRoot)
-pythonExePath = fso.BuildPath(fso.GetParentFolderName(pythonwPath), "python.exe")
-If Not fso.FileExists(pythonExePath) Then
-    MsgBox "The matching python.exe console runtime was not found beside pythonw.exe: " & pythonExePath, vbCritical, "HarvHub AI build startup"
-    WScript.Quit 14
-End If
-
 processEnv("HARVHUBAI_SOURCE_ROOT") = projectRoot
 processEnv("HARVHUBAI_ROOT") = installRoot
 processEnv("HARVHUBAI_BOOTSTRAPPED") = "1"
 processEnv("HARVHUBAI_GITHUB_BOOTSTRAPPED") = "1"
+processEnv("HARVHUB_BUILDER_LOG") = builderLogPath
 
-' Launch the Tk builder with its console host hidden. The actual Tk window
-' remains visible; Python stdout/stderr are retained in builder_output.log.
-Set builderLaunchPSFile = fso.CreateTextFile(builderLaunchPSPath, True, False)
-builderLaunchPSFile.WriteLine "$ErrorActionPreference = 'Continue'"
-builderLaunchPSFile.WriteLine "$python = '" & Replace(pythonExePath, "'", "''") & "'"
-builderLaunchPSFile.WriteLine "$builder = '" & Replace(builderScript, "'", "''") & "'"
-builderLaunchPSFile.WriteLine "$log = '" & Replace(builderLogPath, "'", "''") & "'"
-builderLaunchPSFile.WriteLine "& $python -u $builder --install --force-rebuild *> $log"
-builderLaunchPSFile.WriteLine "$builderExit = $LASTEXITCODE"
-builderLaunchPSFile.WriteLine "exit $builderExit"
-builderLaunchPSFile.Close
-
-Set builderProcess = sh.Exec("powershell.exe -NoLogo -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File """ & builderLaunchPSPath & """")
-Do While builderProcess.Status = 0
-    WScript.Sleep 250
-Loop
-builderExit = builderProcess.ExitCode
+' Launch the builder with pythonw.exe directly. It creates its own visible,
+' topmost Tk window and captures build output in its in-window console/log file.
+' No cmd.exe or PowerShell wrapper is created during a normal launch.
+builderCommand = Chr(34) & pythonwPath & Chr(34) & " " & Chr(34) & builderScript & Chr(34) & " --install --force-rebuild"
+' Run the GUI-subsystem Python process directly. WindowStyle 0 prevents a
+' console host from being shown; the Tk builder window is independently visible.
+builderLaunchError = ""
+On Error Resume Next
+builderExit = sh.Run(builderCommand, 0, True)
+If Err.Number <> 0 Then
+    builderLaunchError = Err.Description
+    Err.Clear
+    builderExit = 1
+End If
+On Error GoTo 0
 If builderExit <> 0 Then
     diagnosticText = ReadAllText(builderLogPath)
-    If Len(Trim(diagnosticText)) = 0 Then
-        On Error Resume Next
-        diagnosticText = builderProcess.StdErr.ReadAll
-        On Error GoTo 0
-    End If
+    If Len(Trim(diagnosticText)) = 0 Then diagnosticText = builderLaunchError
     MsgBox "HarvHub AI build window exited with code " & builderExit & "." & vbCrLf & vbCrLf & diagnosticText, vbCritical, "HarvHub AI build"
     WScript.Quit builderExit
 End If
@@ -189,6 +177,7 @@ Function PSChunk02()
         "$form.MinimizeBox = $false", _
         "$form.ControlBox = $false", _
         "$form.ShowInTaskbar = $true", _
+        "$form.TopMost = $true", _
         "$form.BackColor = [System.Drawing.Color]::FromArgb(250,247,239)", _
         "$form.ForeColor = [System.Drawing.Color]::FromArgb(48,39,24)", _
         "$form.Font = New-Object System.Drawing.Font('Segoe UI', 9)", _
@@ -320,6 +309,8 @@ Function PSChunk09()
         "$script:closeButton.Add_Click({ $form.Close() })", _
         "$card.Controls.Add($script:closeButton)", _
         "$form.Show()", _
+        "$form.Activate()", _
+        "$form.BringToFront()", _
         "[System.Windows.Forms.Application]::DoEvents()", _
         "function Pump-Ui {", _
         "    $form.Refresh()", _
@@ -641,6 +632,14 @@ Function PSChunk22()
         "    if (!$clickedVbs -or !(Test-Path -LiteralPath $clickedVbs)) { throw 'The standalone HarvHubAI.vbs file is not accessible.' }", _
         "    Copy-Item -LiteralPath $clickedVbs -Destination (Join-Path $project 'HarvHubAI.vbs') -Force", _
         "    Copy-Item -LiteralPath $clickedVbs -Destination (Join-Path $project 'Build_HarvHubProgram.vbs') -Force", _
+        "    $localProjectFolder = Split-Path -Parent $clickedVbs", _
+        "    foreach ($overrideName in @('Build_HarvHubProgram.pyw','harvcore_manager.py')) {", _
+        "        $localOverride = Join-Path $localProjectFolder $overrideName", _
+        "        if (Test-Path -LiteralPath $localOverride -PathType Leaf) {", _
+        "            Copy-Item -LiteralPath $localOverride -Destination (Join-Path $project $overrideName) -Force", _
+        "            Add-UiLog ('Applied local startup fix: ' + $overrideName)", _
+        "        }", _
+        "    }", _
         "    foreach ($required in @('Build_HarvHubProgram.pyw','harvcore_manager.py','HarvHubAI.vbs','Build_HarvHubProgram.vbs')) {", _
         "        if (!(Test-Path -LiteralPath (Join-Path $project $required))) { throw ('Required installer file is missing: ' + $required) }", _
         "    }", _
@@ -722,9 +721,8 @@ End Function
 
 
 Sub StopExistingHarvHubProcesses()
-    Dim helperPath, helperFile, helperScript, cleanupExit, cleanupCmdPath, cleanupCmdFile
+    Dim helperPath, helperFile, helperScript, cleanupExit, cleanupError
     helperPath = fso.BuildPath(cacheRoot, "cleanup_" & Replace(fso.GetTempName(), ".tmp", "") & ".ps1")
-    cleanupCmdPath = fso.BuildPath(cacheRoot, "cleanup_" & Replace(fso.GetTempName(), ".tmp", "") & ".cmd")
 
     helperScript = Join(Array( _
         "$ErrorActionPreference = 'Stop'", _
@@ -834,37 +832,23 @@ Sub StopExistingHarvHubProcesses()
     helperFile.Write helperScript
     helperFile.Close
 
-    Set cleanupCmdFile = fso.CreateTextFile(cleanupCmdPath, True, False)
-    cleanupCmdFile.WriteLine "@echo off"
-    cleanupCmdFile.WriteLine "title HarvHub AI - Previous Process Cleanup"
-    cleanupCmdFile.WriteLine "color 0E"
-    cleanupCmdFile.WriteLine "echo."
-    cleanupCmdFile.WriteLine "echo  HARVHUB AI - SINGLE INSTANCE CHECK"
-    cleanupCmdFile.WriteLine "echo  Older HarvHub processes are being stopped before the new setup starts."
-    cleanupCmdFile.WriteLine "echo."
-    cleanupCmdFile.WriteLine "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File """ & helperPath & """"
-    cleanupCmdFile.WriteLine "set ""CLEANUP_EXIT=%ERRORLEVEL%"""
-    cleanupCmdFile.WriteLine "if not ""%CLEANUP_EXIT%""==""0"" ("
-    cleanupCmdFile.WriteLine "  echo."
-    cleanupCmdFile.WriteLine "  echo  ERROR: Previous HarvHub processes could not all be stopped."
-    cleanupCmdFile.WriteLine "  echo  Cleanup log: """ & fso.BuildPath(cacheRoot, "process_cleanup.log") & """"
-    cleanupCmdFile.WriteLine "  type """ & fso.BuildPath(cacheRoot, "process_cleanup.log") & """"
-    cleanupCmdFile.WriteLine "  pause"
-    cleanupCmdFile.WriteLine "  exit /b %CLEANUP_EXIT%"
-    cleanupCmdFile.WriteLine ")"
-    cleanupCmdFile.WriteLine "echo."
-    cleanupCmdFile.WriteLine "echo  HarvHub single-instance cleanup completed."
-    cleanupCmdFile.WriteLine "exit /b 0"
-    cleanupCmdFile.Close
-
-    cleanupExit = sh.Run("cmd.exe /d /c """ & cleanupCmdPath & """", 1, True)
+    ' Run process cleanup without opening a command window. PowerShell records
+    ' its own diagnostic details in process_cleanup.log when an error occurs.
+    cleanupError = ""
     On Error Resume Next
+    cleanupExit = sh.Run("powershell.exe -NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File """ & helperPath & """", 0, True)
+    If Err.Number <> 0 Then
+        cleanupError = Err.Description
+        Err.Clear
+        cleanupExit = 1
+    End If
     If fso.FileExists(helperPath) Then fso.DeleteFile helperPath, True
-    If fso.FileExists(cleanupCmdPath) Then fso.DeleteFile cleanupCmdPath, True
     On Error GoTo 0
 
     If cleanupExit <> 0 Then
-        MsgBox "HarvHub AI could not stop all earlier HarvHub setup, manager, build, or service processes. Setup has been stopped to prevent two instances from using the same files." & vbCrLf & vbCrLf & "Review: " & fso.BuildPath(cacheRoot, "process_cleanup.log"), vbCritical, "HarvHub AI process cleanup"
+        diagnosticText = ReadAllText(fso.BuildPath(cacheRoot, "process_cleanup.log"))
+        If Len(Trim(diagnosticText)) = 0 Then diagnosticText = cleanupError
+        MsgBox "HarvHub AI could not stop all earlier HarvHub setup, manager, build, or service processes. Setup has been stopped to prevent two instances from using the same files." & vbCrLf & vbCrLf & diagnosticText, vbCritical, "HarvHub AI process cleanup"
         WScript.Quit 13
     End If
 End Sub

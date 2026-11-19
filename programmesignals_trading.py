@@ -13884,7 +13884,7 @@ def main_loop():
     # The manager supplies a standard execution-type/interval pair to every
     # service. Preserve the legacy --loop=... switches for direct callers.
     run_as_loop = os.environ.get('HARVHUB_EXECUTION_TYPE', 'once').strip().lower() == 'loop'
-    loop_interval = max(1, int(os.environ.get('HARVHUB_LOOP_INTERVAL', '5') or 5))
+    loop_interval = min(10, max(5, int(os.environ.get('HARVHUB_LOOP_INTERVAL', '5') or 5)))
     max_loops = None
     args = list(sys.argv[1:])
 
@@ -13898,12 +13898,12 @@ def main_loop():
             run_as_loop = arg.split('=')[1].lower() in ('true', 'yes', '1', 'on')
         elif lower.startswith('--interval='):
             try:
-                loop_interval = max(1, int(arg.split('=', 1)[1]))
+                loop_interval = min(10, max(5, int(arg.split('=', 1)[1])))
             except ValueError:
                 pass
         elif lower == '--interval' and index + 1 < len(args):
             try:
-                loop_interval = max(1, int(args[index + 1]))
+                loop_interval = min(10, max(5, int(args[index + 1])))
             except ValueError:
                 pass
         elif lower.startswith('--max-loops='):
@@ -13912,6 +13912,7 @@ def main_loop():
             except ValueError:
                 pass
 
+    loop_interval = min(10, max(5, int(loop_interval)))
     print("\n" + "=" * 60)
     print("         PROGRAMMETRADES — PROGRAMME REQUEST + TRADE ORCHESTRATOR", flush=True)
     print("=" * 60)
@@ -13980,7 +13981,6 @@ def main_loop():
             except Exception as e:
                 print(f"Critical Error in Orchestrator Loop: {e}")
                 traceback.print_exc()
-                time.sleep(5)
 
             if not run_as_loop:
                 print("Single execution completed. Exiting...")
