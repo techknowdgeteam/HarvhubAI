@@ -79,6 +79,7 @@ import re
 import sys
 import time
 import json
+import math
 import socket
 import struct
 import threading
@@ -399,6 +400,10 @@ TIMEFRAME_SECONDS = {
 ROUND_TARGETS = (2000, 5000)
 # Strict retention ceiling for each programme/symbol/timeframe pair.
 MAX_BARS_PER_TF = 5000
+# A worker reconciles its existing stored history against MT5 once per pair
+# after startup, repairing valid-looking partial OHLC snapshots left by older
+# collector versions without repeatedly scanning all 5,000 bars every cycle.
+_REPAIRED_PAIRS_THIS_PROCESS = set()
 # First rotation: capture the newest 1,500 candles in one pass.
 # Historical rotations then request the next older page using an increasing
 # MT5 start_pos, so the newest page is never fetched again as backfill.
@@ -1032,6 +1037,138 @@ def _insert_candle_rows_batched(rows):
             failed = True
             print(f"      [CHARTS][INSERT FAIL] {msg}")
     return inserted_total, failed
+
+
+def _update_existing_candle_rows_batched(programme_id, userid, symbol,
+                                         timeframe, rows):
+    """
+    Refresh existing rows from authoritative MT5 rates.
+
+    MT5 position zero is a live, still-forming candle. The collector used to
+    INSERT it once and then permanently ignore later snapshots because its
+    candle_time already existed. Updating every matching row in the latest MT5
+    page also repairs previously stored partial snapshots when those candles
+    have since closed.
+
+    Uses bounded CASE updates instead of requiring a new unique database index.
+    Returns (number of rows reported changed, failure).
+    """
+    if not rows:
+        return 0, False
+
+    update_columns = [
+        'open_time', 'close_time', 'timezone', 'last_recorded_candle_time',
+        'open', 'high', 'low', 'close', 'candle_center', 'body_center',
+        'high_wick_center', 'low_wick_center', 'candle_width_center', 'volume',
+    ]
+    updated_total = 0
+    failed = False
+
+    for i in range(0, len(rows), INSERT_BATCH_SIZE):
+        chunk = rows[i:i + INSERT_BATCH_SIZE]
+        timestamps = [r['candle_time'] for r in chunk]
+        assignments = []
+
+        for column in update_columns:
+            cases = []
+            for row in chunk:
+                when_value = _sql_dt(row.get('candle_time'))
+                if column in ('open_time', 'close_time', 'last_recorded_candle_time'):
+                    then_value = _sql_dt(row.get(column))
+                else:
+                    then_value = _sql_quote(row.get(column))
+                cases.append(f"WHEN {when_value} THEN {then_value}")
+            assignments.append(
+                f"`{column}` = CASE `candle_time` {' '.join(cases)} ELSE `{column}` END"
+            )
+
+        times_sql = ', '.join(_sql_dt(value) for value in timestamps)
+        sql = (
+            "UPDATE candle_records SET " + ', '.join(assignments) +
+            " WHERE programmeid = " + _sql_int(programme_id) +
+            " AND userid = " + _sql_int(userid) +
+            " AND symbol = " + _sql_quote(symbol) +
+            " AND timeframe = " + _sql_quote(timeframe) +
+            f" AND candle_time IN ({times_sql})"
+        )
+        ok, affected, message = db_execute(sql, None, timeout=90.0, quiet=True)
+        if ok:
+            updated_total += max(0, int(affected or 0))
+        else:
+            failed = True
+            print(
+                f"      [CHARTS][UPDATE FAIL] {symbol} {timeframe}: {message}"
+            )
+
+    return updated_total, failed
+
+
+def _cleanup_broken_candle_rows(programme_id, userid, symbol, timeframe):
+    """
+    Remove structurally invalid OHLC rows and duplicate timestamps for this
+    exact programme/symbol/timeframe. Valid-looking historical snapshots are
+    corrected by _update_existing_candle_rows_batched() from MT5 source data.
+    """
+    scope = (
+        " WHERE programmeid = " + _sql_int(programme_id) +
+        " AND userid = " + _sql_int(userid) +
+        " AND symbol = " + _sql_quote(symbol) +
+        " AND timeframe = " + _sql_quote(timeframe)
+    )
+    invalid_sql = (
+        "DELETE FROM candle_records" + scope + " AND ("
+        "`open` IS NULL OR `high` IS NULL OR `low` IS NULL OR `close` IS NULL OR "
+        "`volume` IS NULL OR CAST(`high` AS DECIMAL(30,12)) < "
+        "GREATEST(CAST(`open` AS DECIMAL(30,12)), CAST(`close` AS DECIMAL(30,12))) OR "
+        "CAST(`low` AS DECIMAL(30,12)) > "
+        "LEAST(CAST(`open` AS DECIMAL(30,12)), CAST(`close` AS DECIMAL(30,12))) OR "
+        "CAST(`high` AS DECIMAL(30,12)) < CAST(`low` AS DECIMAL(30,12)) OR "
+        "CAST(`volume` AS DECIMAL(30,8)) < 0)"
+    )
+    ok, invalid_deleted, message = db_execute(
+        invalid_sql, None, timeout=90.0, quiet=True
+    )
+    if not ok:
+        print(
+            f"      [CHARTS][CLEANUP FAIL] {symbol} {timeframe}: "
+            f"invalid-row cleanup failed: {message}"
+        )
+        return None
+
+    # A repeated timestamp creates two adjacent chart slots for one bar.
+    # Keep the newest auto-increment row for each identical scoped timestamp.
+    duplicate_sql = (
+        "DELETE older FROM candle_records AS older "
+        "INNER JOIN candle_records AS newer ON "
+        "newer.programmeid = older.programmeid AND "
+        "newer.userid = older.userid AND "
+        "newer.symbol = older.symbol AND "
+        "newer.timeframe = older.timeframe AND "
+        "newer.candle_time = older.candle_time AND newer.id > older.id "
+        "WHERE older.programmeid = " + _sql_int(programme_id) +
+        " AND older.userid = " + _sql_int(userid) +
+        " AND older.symbol = " + _sql_quote(symbol) +
+        " AND older.timeframe = " + _sql_quote(timeframe)
+    )
+    ok, duplicate_deleted, message = db_execute(
+        duplicate_sql, None, timeout=90.0, quiet=True
+    )
+    if not ok:
+        print(
+            f"      [CHARTS][CLEANUP FAIL] {symbol} {timeframe}: "
+            f"duplicate-row cleanup failed: {message}"
+        )
+        return None
+
+    total_deleted = int(invalid_deleted or 0) + int(duplicate_deleted or 0)
+    if total_deleted:
+        print(
+            f"      [CHARTS][CLEANUP] {symbol} {timeframe}: removed "
+            f"{int(invalid_deleted or 0)} invalid and "
+            f"{int(duplicate_deleted or 0)} duplicate candle row(s)"
+        )
+    return total_deleted
+
 # ==============================================================================
 #  CANDLE BUILD (MT5 rates -> candle_records rows)
 # ==============================================================================
@@ -1121,6 +1258,36 @@ def _rates_to_rows(programme_id, userid, symbol, timeframe_key,
                 f"at timestamp {ts_unix}: {exc}"
             )
             continue
+
+        # Never write malformed source candles. A valid OHLC bar must contain
+        # both body prices inside its high/low range, and all values must be
+        # finite. This prevents corrupt MT5/API values from reaching the chart.
+        if not all(math.isfinite(value) for value in (o, h, l, c, v)):
+            print(
+                f"      [CHARTS][INVALID OHLC] {symbol} {timeframe_key}: "
+                f"non-finite value at timestamp {ts_unix}; candle rejected"
+            )
+            continue
+        if h < max(o, c) or l > min(o, c) or h < l or v < 0:
+            print(
+                f"      [CHARTS][INVALID OHLC] {symbol} {timeframe_key}: "
+                f"O={o} H={h} L={l} C={c} V={v} at timestamp {ts_unix}; "
+                "candle rejected"
+            )
+            continue
+
+        # Retain the existing database precision, then validate again because
+        # rounding must never invert the candle's high/low relationship.
+        o, h, l, c, v = (round(value, 8) for value in (o, h, l, c, v))
+        if h < max(o, c) or l > min(o, c) or h < l:
+            print(
+                f"      [CHARTS][INVALID OHLC] {symbol} {timeframe_key}: "
+                f"precision-normalized candle is inconsistent at {ts_unix}; rejected"
+            )
+            continue
+
+        upper_body = max(o, c)
+        lower_body = min(o, c)
         rows.append({
             'programmeid':               programme_id,
             'userid':                    userid,
@@ -1131,16 +1298,16 @@ def _rates_to_rows(programme_id, userid, symbol, timeframe_key,
             'close_time':                close_dt,
             'timezone':                  tz_name,
             'last_recorded_candle_time': open_dt,
-            'open':                      round(o, 8),
-            'high':                      round(h, 8),
-            'low':                       round(l, 8),
-            'close':                     round(c, 8),
+            'open':                      o,
+            'high':                      h,
+            'low':                       l,
+            'close':                     c,
             'candle_center':             round((h + l) / 2.0, 8),
             'body_center':               round((o + c) / 2.0, 8),
-            'high_wick_center':          round((h + c) / 2.0, 8),
-            'low_wick_center':           round((l + o) / 2.0 if c >= o else (c + l) / 2.0, 8),
+            'high_wick_center':          round((h + upper_body) / 2.0, 8),
+            'low_wick_center':           round((l + lower_body) / 2.0, 8),
             'candle_width_center':       round((h - l) / 2.0, 8),
-            'volume':                    round(v, 8),
+            'volume':                    v,
         })
     return rows
 # ==============================================================================
@@ -1155,6 +1322,74 @@ def _round_target_from_filled(filled):
         if filled < target:
             return target
     return MAX_BARS_PER_TF
+
+
+def _repair_existing_history_once(programme_id, userid, symbol, timeframe_key,
+                                  tf_const, tz_obj, tz_name, computer_tz=None):
+    """
+    Reconcile existing database rows against up to the newest 5,000 MT5 bars.
+
+    Older collector versions permanently kept the first snapshot of a candle
+    because an existing timestamp was treated as a completed row. A single
+    startup reconciliation corrects those stale-but-plausible OHLC values
+    across the whole retained window. It does not add missing history here;
+    normal latest/backfill rotation still owns inserts and the storage cap.
+    """
+    pair_key = (
+        int(programme_id), int(userid), str(symbol).upper(),
+        str(timeframe_key).lower(),
+    )
+    if pair_key in _REPAIRED_PAIRS_THIS_PROCESS:
+        return True
+
+    rates, fetch_failed, history_exhausted = _mt5_fetch_complete_page(
+        symbol, tf_const, 0, MAX_BARS_PER_TF,
+        f"{symbol} {timeframe_key} existing-history repair",
+    )
+    if fetch_failed:
+        print(
+            f"      [CHARTS][REPAIR] {symbol} {timeframe_key}: MT5 history "
+            "fetch failed; repair will retry on a later cycle"
+        )
+        return False
+    if not rates:
+        print(
+            f"      [CHARTS][REPAIR] {symbol} {timeframe_key}: no MT5 history "
+            "available; repair not marked complete"
+        )
+        return False
+
+    rows = _rates_to_rows(
+        programme_id, userid, symbol, timeframe_key, tz_obj, tz_name, rates,
+        computer_tz=computer_tz,
+    )
+    rows.sort(key=lambda row: row['candle_time'])
+    if not rows:
+        print(
+            f"      [CHARTS][REPAIR] {symbol} {timeframe_key}: source history "
+            "contained no valid OHLC rows; repair not marked complete"
+        )
+        return False
+
+    updated, update_failed = _update_existing_candle_rows_batched(
+        programme_id, userid, symbol, timeframe_key, rows,
+    )
+    if update_failed:
+        print(
+            f"      [CHARTS][REPAIR] {symbol} {timeframe_key}: database update "
+            "failed; repair will retry on a later cycle"
+        )
+        return False
+
+    _REPAIRED_PAIRS_THIS_PROCESS.add(pair_key)
+    print(
+        f"      [CHARTS][REPAIR] {symbol} {timeframe_key}: reconciled "
+        f"{len(rows)} MT5 source bars; existing rows updated={updated}; "
+        f"history_exhausted={history_exhausted}"
+    )
+    return True
+
+
 def _latest_pass(programme_id, userid, symbol, timeframe_key,
                  tf_const, tz_obj, tz_name, computer_tz=None):
     """
@@ -1187,9 +1422,19 @@ def _latest_pass(programme_id, userid, symbol, timeframe_key,
         programme_id, userid, symbol, timeframe_key,
         window_start, window_end,
     )
+
+    # Refresh all records that overlap this MT5 page, including the still-open
+    # bar and any historical candles previously stored before they closed.
+    updated, update_failed = _update_existing_candle_rows_batched(
+        programme_id, userid, symbol, timeframe_key, rows,
+    )
     fresh = [r for r in rows if r['candle_time'] not in existing]
     if not fresh:
-        return fetched, 0, False
+        print(
+            f"      [CHARTS] {symbol} {timeframe_key}: latest MT5 page refreshed "
+            f"existing candles={updated}; no new timestamps"
+        )
+        return fetched, 0, update_failed
     current_count = _count_stored_rows(programme_id, userid, symbol, timeframe_key)
     projected_count = current_count + len(fresh)
     if projected_count > MAX_BARS_PER_TF:
@@ -1203,11 +1448,12 @@ def _latest_pass(programme_id, userid, symbol, timeframe_key,
         if trimmed is None:
             return fetched, 0, True
     inserted, failed = _insert_candle_rows_batched(fresh)
+    failed = failed or update_failed
     trimmed = _trim_oldest_rows(programme_id, userid, symbol, timeframe_key)
     if trimmed is None:
         failed = True
     print(f"      [CHARTS] {symbol} {timeframe_key}: latest page "
-          f"fetched={fetched} new={len(fresh)} inserted={inserted}")
+          f"fetched={fetched} updated_existing={updated} new={len(fresh)} inserted={inserted}")
     return fetched, inserted, failed
 def _backfill_pass(programme_id, userid, symbol, timeframe_key,
                    tf_const, tz_obj, tz_name, start_pos, requested,
@@ -1251,13 +1497,17 @@ def _backfill_pass(programme_id, userid, symbol, timeframe_key,
         programme_id, userid, symbol, timeframe_key,
         window_start, window_end,
     )
+    updated, update_failed = _update_existing_candle_rows_batched(
+        programme_id, userid, symbol, timeframe_key, rows,
+    )
     fresh = [r for r in rows if r['candle_time'] not in existing]
     if not fresh:
         print(f"      [CHARTS][BACKFILL] {symbol} {timeframe_key}: "
               f"rotation at MT5 positions {start_pos}-"
-              f"{start_pos + fetched - 1}: fetched={fetched}, all already stored")
-        return fetched, 0, False
+              f"{start_pos + fetched - 1}: fetched={fetched}, updated_existing={updated}, all already stored")
+        return fetched, 0, update_failed
     inserted, failed = _insert_candle_rows_batched(fresh)
+    failed = failed or update_failed
     trimmed = _trim_oldest_rows(programme_id, userid, symbol, timeframe_key)
     if trimmed is None:
         failed = True
@@ -1284,6 +1534,18 @@ def _sync_one_symbol_timeframe(programme_id, userid, symbol, timeframe_key,
     if not mt5_symbol_select(symbol, True):
         print(f"      [CHARTS] {symbol} {timeframe_key}: symbol_select failed")
         return {'inserted': 0, 'skipped': True}
+    # First reconcile existing rows against the broker source. This lets MT5
+    # replace a stale/inconsistent snapshot before the cleanup removes rows
+    # that remain structurally invalid or duplicated.
+    _repair_existing_history_once(
+        programme_id, userid, symbol, timeframe_key, tf_const,
+        tz_obj, tz_name, computer_tz=computer_tz,
+    )
+    initial_cleanup = _cleanup_broken_candle_rows(
+        programme_id, userid, symbol, timeframe_key,
+    )
+    if initial_cleanup is None:
+        return {'inserted': 0, 'skipped': True, 'reason': 'candle_cleanup_failed'}
     initial_trim = _trim_oldest_rows(programme_id, userid, symbol, timeframe_key)
     if initial_trim is None:
         return {'inserted': 0, 'skipped': True, 'reason': 'retention_cleanup_failed'}
@@ -1375,6 +1637,11 @@ def _sync_one_symbol_timeframe(programme_id, userid, symbol, timeframe_key,
                           f"continuing toward {next_target}")
             # A short MT5 page is not assumed to be the end. The next request
             # probes the next position. Only an empty response ends history.
+    final_cleanup = _cleanup_broken_candle_rows(
+        programme_id, userid, symbol, timeframe_key,
+    )
+    if final_cleanup is None:
+        insert_failed = True
     final_trim = _trim_oldest_rows(programme_id, userid, symbol, timeframe_key)
     if final_trim is None:
         insert_failed = True
