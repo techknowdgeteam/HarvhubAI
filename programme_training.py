@@ -36,6 +36,7 @@ from pathlib import Path
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 BRIDGE_HOST = "127.0.0.1"
 BRIDGE_PORT = 5599
@@ -429,25 +430,36 @@ def tf_milliseconds(tf: str) -> Optional[int]:
 
 
 def parse_datetime(value: Any) -> Optional[datetime]:
+    """Parse SQL/ISO timestamps and the epoch values accepted by the chart."""
     if value is None or str(value).strip() == "":
         return None
     if isinstance(value, datetime):
         dt = value
     else:
-        raw = str(value).strip().replace("T", " ")
-        if raw.endswith("Z"):
-            raw = raw[:-1] + "+00:00"
-        try:
-            dt = datetime.fromisoformat(raw)
-        except ValueError:
-            for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
-                try:
-                    dt = datetime.strptime(raw[:26], fmt)
-                    break
-                except ValueError:
-                    dt = None  # type: ignore[assignment]
-            if dt is None:
+        raw = str(value).strip()
+        if re.fullmatch(r"-?\d{10,13}(?:\.\d+)?", raw):
+            try:
+                numeric = float(raw)
+                seconds = numeric / 1000.0 if abs(numeric) >= 1e12 else numeric
+                dt = datetime.fromtimestamp(seconds, tz=timezone.utc)
+            except (ValueError, TypeError, OverflowError, OSError):
                 return None
+        else:
+            normalized = re.sub(r"^(\d{4})\.(\d{1,2})\.(\d{1,2})(?=\s|$)", r"\1-\2-\3", raw)
+            normalized = normalized.replace("T", " ")
+            if normalized.endswith("Z"):
+                normalized = normalized[:-1] + "+00:00"
+            try:
+                dt = datetime.fromisoformat(normalized)
+            except ValueError:
+                for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+                    try:
+                        dt = datetime.strptime(normalized[:26], fmt)
+                        break
+                    except ValueError:
+                        dt = None  # type: ignore[assignment]
+                if dt is None:
+                    return None
     if dt.tzinfo is not None:
         dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
     return dt
@@ -1815,7 +1827,8 @@ def make_trade_record(parent_root: Dict[str, Any], trade_root: Dict[str, Any], f
                       confirmation_name: str = "", parent_candles: Optional[Sequence[Dict[str, Any]]] = None,
                       parent_tf: str = "", proj: Optional[Sequence[Dict[str, int]]] = None,
                       provider_rr: Optional[float] = None, provider_rr_type: str = "",
-                      source_timeframe: Optional[str] = None) -> Optional[Dict[str, Any]]:
+                      source_timeframe: Optional[str] = None,
+                      account_rules: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
     """Build one historical trade exactly from the matched family and saved targets."""
     if family.get("noTrade") or not trade_root.get("useForTrades"):
         return None
@@ -1911,7 +1924,13 @@ def make_trade_record(parent_root: Dict[str, Any], trade_root: Dict[str, Any], f
     trigger_idx = find_entry_trigger(candles, entry_idx, entry_price, order)
     if trigger_idx is not None and trigger_idx <= entry_idx:
         trigger_idx = None
-    outcome, sl_trigger, tp_trigger = evaluate_outcome(candles, trigger_idx, sl_price, tp_price, order)
+    trade_state = evaluate_trade_outcome_with_breakeven(
+        candles, trigger_idx, sl_price, tp_price, order, entry_price,
+        (account_rules or {}).get("trades_breakeven") or [],
+    )
+    outcome = str(trade_state.get("outcome") or "pending entry")
+    sl_trigger = trade_state.get("sl_trigger")
+    tp_trigger = trade_state.get("tp_trigger")
     reward_distance = abs(tp_price - entry_price)
     family_rr = reward_distance / risk_distance if risk_distance > 0 else None
 
@@ -1940,7 +1959,7 @@ def make_trade_record(parent_root: Dict[str, Any], trade_root: Dict[str, Any], f
         if as_int(index) is not None and 0 <= int(index) < len(candles)
     }
 
-    return {
+    record = {
         "programme_id": programme_id,
         "userid": user_id,
         "symbol": symbol,
@@ -1978,13 +1997,35 @@ def make_trade_record(parent_root: Dict[str, Any], trade_root: Dict[str, Any], f
         "minimum_risk_reward_applied": int(minimum_rr_applied),
         "outcome": outcome,
         "stoploss_hit": int(outcome == "stoploss hit"),
-        "profit_reached": int(outcome == "take profit reached"),
+        "profit_reached": int(outcome == "take profit reached" or (outcome == "breakeven" and (as_float(trade_state.get("breakeven_stop_rr"), 0.0) or 0.0) >= 0.01)),
         "pending_entry": int(outcome == "pending entry"),
         "in_trade": int(outcome == "in trade"),
-        "closed_trade": int(outcome in {"stoploss hit", "take profit reached"}),
-        "trade_value_r": -1.0 if outcome == "stoploss hit" else (max(0.0, family_rr or 0.0) if outcome == "take profit reached" else 0.0),
+        "closed_trade": int(outcome in {"stoploss hit", "take profit reached", "breakeven", "breakeven stop hit", "breakeven hit"}),
+        "trade_value_r": -1.0 if outcome == "stoploss hit" else (
+            max(0.0, family_rr or 0.0) if outcome == "take profit reached" else
+            max(0.0, as_float(trade_state.get("breakeven_stop_rr"), 0.0) or 0.0)
+            if outcome in {"breakeven", "breakeven hit"} and (as_float(trade_state.get("breakeven_stop_rr"), 0.0) or 0.0) >= 0.01 else 0.0
+        ),
+        "restricted_date_hit": 0,
+        "restricted_day_hit": 0,
+        "restricted_date_matches_json": "[]",
+        "restricted_day_matches_json": "[]",
+        "excluded_from_analytics": 0,
+        "analytics_exclusion_reason": None,
+        "breakeven_triggered": int(bool(trade_state.get("breakeven_triggered"))),
+        "breakeven_floating_profit_rr": trade_state.get("breakeven_floating_profit_rr"),
+        "breakeven_stop_rr": trade_state.get("breakeven_stop_rr"),
+        "breakeven_stop_price": trade_state.get("breakeven_stop_price"),
+        "breakeven_trigger_time": candle_stamp(trade_state.get("breakeven_trigger_index")),
+        "breakeven_stop_hit": int(outcome in {"breakeven", "breakeven stop hit", "breakeven hit"}),
+        "max_floating_rr": as_float(trade_state.get("max_floating_rr"), 0.0) or 0.0,
         "effective_take_profit_type": effective_tp_type,
     }
+    source_main_time = _source_main_candle_time(parent_root, family, candles, parent_candles)
+    apply_account_management_trade_rules(
+        record, candles, trigger_idx, entry_idx, source_main_time, account_rules,
+    )
+    return record
 
 def match_row(programme_id: int, user_id: int, symbol: str, timeframe: str,
               root: Dict[str, Any], family: Dict[str, Any], candles: Sequence[Dict[str, Any]],
@@ -2010,6 +2051,12 @@ def match_row(programme_id: int, user_id: int, symbol: str, timeframe: str,
         "outcome": "identify but don't trade" if family.get("noTrade") else "matched family",
         "stoploss_hit": 0, "profit_reached": 0, "pending_entry": 0, "in_trade": 0,
         "closed_trade": 0, "trade_value_r": 0.0,
+        "restricted_date_hit": 0, "restricted_day_hit": 0,
+        "restricted_date_matches_json": "[]", "restricted_day_matches_json": "[]",
+        "excluded_from_analytics": 0, "analytics_exclusion_reason": None,
+        "breakeven_triggered": 0, "breakeven_floating_profit_rr": None,
+        "breakeven_stop_rr": None, "breakeven_stop_price": None,
+        "breakeven_trigger_time": None, "breakeven_stop_hit": 0, "max_floating_rr": 0.0,
     }
 
 
@@ -2189,8 +2236,28 @@ ANALYTICS_COLUMNS = [
     "stoploss_trigger_time", "take_profit_trigger_time", "event_time", "entry_price", "stoploss_price",
     "take_profit_price", "configured_take_profit_price", "risk_reward", "configured_risk_reward",
     "minimum_risk_reward_applied", "outcome", "stoploss_hit", "profit_reached", "pending_entry", "in_trade",
-    "closed_trade", "trade_value_r",
+    "closed_trade", "trade_value_r", "restricted_date_hit", "restricted_day_hit",
+    "restricted_date_matches_json", "restricted_day_matches_json", "excluded_from_analytics",
+    "analytics_exclusion_reason", "breakeven_triggered", "breakeven_floating_profit_rr",
+    "breakeven_stop_rr", "breakeven_stop_price", "breakeven_trigger_time",
+    "breakeven_stop_hit", "max_floating_rr",
 ]
+
+ANALYTICS_ADDITIVE_COLUMNS = {
+    "restricted_date_hit": "TINYINT(1) NOT NULL DEFAULT 0",
+    "restricted_day_hit": "TINYINT(1) NOT NULL DEFAULT 0",
+    "restricted_date_matches_json": "MEDIUMTEXT NULL DEFAULT NULL",
+    "restricted_day_matches_json": "MEDIUMTEXT NULL DEFAULT NULL",
+    "excluded_from_analytics": "TINYINT(1) NOT NULL DEFAULT 0",
+    "analytics_exclusion_reason": "VARCHAR(120) NULL DEFAULT NULL",
+    "breakeven_triggered": "TINYINT(1) NOT NULL DEFAULT 0",
+    "breakeven_floating_profit_rr": "DECIMAL(20,8) NULL DEFAULT NULL",
+    "breakeven_stop_rr": "DECIMAL(20,8) NULL DEFAULT NULL",
+    "breakeven_stop_price": "DECIMAL(30,12) NULL DEFAULT NULL",
+    "breakeven_trigger_time": "DATETIME NULL DEFAULT NULL",
+    "breakeven_stop_hit": "TINYINT(1) NOT NULL DEFAULT 0",
+    "max_floating_rr": "DECIMAL(20,8) NOT NULL DEFAULT 0",
+}
 
 
 def load_candles(db: BridgeClient, programme_id: int, user_id: int,
@@ -2263,6 +2330,382 @@ def load_provider_risk_reward(db: BridgeClient, programme: Dict[str, Any]) -> Di
     except BridgeError as exc:
         log.warning("    Signals Provision risk/reward lookup failed; saved root RR will be used: %s", str(exc)[:1000])
         return result
+
+def resolve_account_management_developer_id(db: BridgeClient, user_id: int) -> int:
+    """Resolve Account Management ownership by HarvHub email, with legacy ID fallback.
+
+    Account Management tables key rows by developers.id. It is unsafe to assume
+    developers.id always equals harvhub.id, so mirror the Signals Dashboard lookup.
+    """
+    if user_id <= 0:
+        return user_id
+    try:
+        if not table_exists(db, "harvhub") or not table_exists(db, "developers"):
+            return user_id
+        harvhub_columns = {str(column).lower() for column in get_columns(db, "harvhub")}
+        developer_columns = {str(column).lower() for column in get_columns(db, "developers")}
+        if not {"id", "email"}.issubset(harvhub_columns) or not {"id", "email"}.issubset(developer_columns):
+            return user_id
+        owner_rows = db.fetch_all(
+            "SELECT `email` FROM `harvhub` WHERE `id`=%s LIMIT 1", [user_id], timeout=30
+        )
+        email = str(owner_rows[0].get("email") or "").strip() if owner_rows else ""
+        if not email:
+            return user_id
+        developer_rows = db.fetch_all(
+            "SELECT `id` FROM `developers` WHERE LOWER(`email`)=LOWER(%s) LIMIT 1",
+            [email], timeout=30,
+        )
+        developer_id = as_int(developer_rows[0].get("id"), 0) if developer_rows else 0
+        return developer_id if developer_id and developer_id > 0 else user_id
+    except Exception as exc:
+        log.warning("Account Management developer lookup failed; using legacy HarvHub ID %s: %s", user_id, str(exc)[:500])
+        return user_id
+
+
+def load_account_management_rules(db: BridgeClient, programme: Dict[str, Any]) -> Dict[str, Any]:
+    """Load the same programme-scoped Account Management rules as programme_training.php."""
+    programme_id = as_int(programme.get("id"), 0) or 0
+    user_id = as_int(programme.get("userid"), 0) or 0
+    developer_id = resolve_account_management_developer_id(db, user_id)
+    timezone_name = str(programme.get("timezone") or "").strip()
+    rules: Dict[str, Any] = {
+        "timezone": timezone_name or "UTC",
+        "restricted_dates": [],
+        "restricted_days": [],
+        "trades_breakeven": [],
+    }
+    rules["developer_id"] = developer_id
+    if programme_id <= 0 or developer_id <= 0:
+        return rules
+
+    table_specs = {
+        "restricted_dates": ("accountmanagement_restricted_dates", ["restricted_date"]),
+        "restricted_days": ("accountmanagement_restricted_days", ["day", "from_time", "to_time"]),
+        "trades_breakeven": ("accountmanagement_trades_breakeven", ["floating_profit_at_risk_reward", "breakeven_at_risk_reward"]),
+    }
+    for rule_key, (table, wanted_fields) in table_specs.items():
+        try:
+            if not table_exists(db, table):
+                continue
+            columns = {str(column).lower() for column in get_columns(db, table)}
+            if not {"developerid", "programme_id"}.issubset(columns):
+                log.warning("Account Management table %s is missing developerid/programme_id; skipping %s rules", table, rule_key)
+                continue
+            selected = [field for field in wanted_fields if field.lower() in columns]
+            if selected:
+                fields_sql = ",".join(f"`{field}`" for field in selected)
+                rules[rule_key] = db.fetch_all(
+                    f"SELECT {fields_sql} FROM `{table}` WHERE `developerid`=%s AND `programme_id`=%s ORDER BY `id` ASC",
+                    [developer_id, programme_id], timeout=60,
+                )
+            if not timezone_name and "timezone" in columns:
+                timezone_rows = db.fetch_all(
+                    f"SELECT `timezone` FROM `{table}` WHERE `developerid`=%s AND `programme_id`=%s "
+                    "AND `timezone` IS NOT NULL AND `timezone`<>'' ORDER BY `id` ASC LIMIT 1",
+                    [developer_id, programme_id], timeout=30,
+                )
+                if timezone_rows:
+                    candidate = str(timezone_rows[0].get("timezone") or "").strip()
+                    if candidate:
+                        timezone_name = candidate
+        except Exception as exc:
+            log.warning("Account Management %s rules could not be loaded: %s", rule_key, str(exc)[:700])
+
+    try:
+        ZoneInfo(timezone_name or "UTC")
+        rules["timezone"] = timezone_name or "UTC"
+    except (ZoneInfoNotFoundError, ValueError):
+        log.warning("Invalid programme timezone %r; restricted-window rules will use UTC", timezone_name)
+        rules["timezone"] = "UTC"
+    return rules
+
+
+def parse_account_risk_reward(value: Any) -> Optional[float]:
+    """Mirror the browser's ptParseRiskReward() for Account Management values."""
+    if value is None or str(value).strip() == "":
+        return None
+    raw = str(value).strip()
+    pair = re.fullmatch(r"\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*:\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*", raw)
+    if pair:
+        left, right = as_float(pair.group(1)), as_float(pair.group(2))
+        return right / left if left not in (None, 0) and right is not None else None
+    return as_float(re.sub(r"R$", "", raw, flags=re.IGNORECASE).strip())
+
+
+def evaluate_trade_outcome_with_breakeven(
+    candles: Sequence[Dict[str, Any]], trigger: Optional[int],
+    sl_price: Optional[float], tp_price: Optional[float], order_type: str,
+    entry_price: Optional[float], breakeven_rules: Optional[Sequence[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """Mirror programme_training.php ptEvaluateTradeOutcome() candle by candle."""
+    result: Dict[str, Any] = {
+        "outcome": "pending entry", "sl_trigger": None, "tp_trigger": None,
+        "breakeven_triggered": False, "breakeven_floating_profit_rr": None,
+        "breakeven_stop_rr": None, "breakeven_stop_price": None,
+        "breakeven_trigger_index": None, "max_floating_rr": 0.0,
+    }
+    if trigger is None or sl_price is None or tp_price is None or entry_price is None:
+        return result
+    if not (0 <= int(trigger) < len(candles)):
+        return result
+    risk_distance = abs(float(entry_price) - float(sl_price))
+    if not (risk_distance > 0):
+        return result
+
+    normalized_rules: List[Dict[str, float]] = []
+    for rule in breakeven_rules or []:
+        floating = parse_account_risk_reward(rule.get("floating_profit_at_risk_reward"))
+        stop_rr = parse_account_risk_reward(rule.get("breakeven_at_risk_reward"))
+        if floating is None or stop_rr is None or floating <= 0:
+            continue
+        normalized_rules.append({"floating_rr": floating, "stop_rr": max(0.0, stop_rr)})
+    normalized_rules.sort(key=lambda rule: (rule["floating_rr"], rule["stop_rr"]))
+
+    is_long = normalize_order(order_type).startswith("buy")
+    active_stop = float(sl_price)
+    next_rule_index = 0
+    applied_rule: Optional[Dict[str, float]] = None
+    result["outcome"] = "in trade"
+
+    for index in range(int(trigger), len(candles)):
+        candle = candles[index]
+        high, low = as_float(candle.get("high")), as_float(candle.get("low"))
+        if high is None or low is None:
+            continue
+        favourable_move = (high - float(entry_price)) if is_long else (float(entry_price) - low)
+        floating_rr = favourable_move / risk_distance
+        if floating_rr == floating_rr and abs(floating_rr) != float("inf"):
+            result["max_floating_rr"] = max(float(result["max_floating_rr"]), floating_rr)
+
+        # Only rules activated on completed earlier bars govern this bar.
+        stop_touched = low <= active_stop if is_long else high >= active_stop
+        target_touched = high >= float(tp_price) if is_long else low <= float(tp_price)
+        if stop_touched:
+            if result["breakeven_triggered"]:
+                # A locked stop at >= +0.01R is a profitable breakeven exit.
+                # A true 0R stop is separately identified as a breakeven stop hit.
+                locked_rr = as_float(result.get("breakeven_stop_rr"), 0.0) or 0.0
+                result["outcome"] = "breakeven" if locked_rr >= 0.01 else "breakeven stop hit"
+            else:
+                result["outcome"] = "stoploss hit"
+            result["sl_trigger"] = index
+            break
+        if target_touched:
+            # The TP candle can also cross a BE threshold; retain that audit data.
+            while next_rule_index < len(normalized_rules) and floating_rr >= normalized_rules[next_rule_index]["floating_rr"]:
+                rule = normalized_rules[next_rule_index]
+                next_rule_index += 1
+                moved_stop = float(entry_price) + (risk_distance * rule["stop_rr"] if is_long else -risk_distance * rule["stop_rr"])
+                if applied_rule is None or (moved_stop > active_stop if is_long else moved_stop < active_stop):
+                    active_stop = moved_stop
+                    applied_rule = rule
+                    result["breakeven_triggered"] = True
+                    result["breakeven_floating_profit_rr"] = rule["floating_rr"]
+                    result["breakeven_stop_rr"] = rule["stop_rr"]
+                    result["breakeven_stop_price"] = active_stop
+                    result["breakeven_trigger_index"] = index
+            result["outcome"] = "take profit reached"
+            result["tp_trigger"] = index
+            break
+
+        # Newly reached levels activate only for subsequent candles.
+        while next_rule_index < len(normalized_rules) and floating_rr >= normalized_rules[next_rule_index]["floating_rr"]:
+            rule = normalized_rules[next_rule_index]
+            next_rule_index += 1
+            moved_stop = float(entry_price) + (risk_distance * rule["stop_rr"] if is_long else -risk_distance * rule["stop_rr"])
+            if applied_rule is None or (moved_stop > active_stop if is_long else moved_stop < active_stop):
+                active_stop = moved_stop
+                applied_rule = rule
+                result["breakeven_triggered"] = True
+                result["breakeven_floating_profit_rr"] = rule["floating_rr"]
+                result["breakeven_stop_rr"] = rule["stop_rr"]
+                result["breakeven_stop_price"] = active_stop
+                result["breakeven_trigger_index"] = index
+    return result
+
+
+def _programme_datetime_parts(raw_value: Any, timezone_name: str) -> Optional[Dict[str, Any]]:
+    """Mirror ptProgrammeDateParts(): naive SQL times are programme-local."""
+    if raw_value is None or str(raw_value).strip() == "":
+        return None
+    try:
+        zone = ZoneInfo(timezone_name or "UTC")
+    except (ZoneInfoNotFoundError, ValueError):
+        zone = timezone.utc
+
+    raw_text = str(raw_value).strip()
+    try:
+        if re.fullmatch(r"-?\d{10,13}(?:\.\d+)?", raw_text):
+            numeric = float(raw_text)
+            epoch_seconds = numeric / 1000.0 if abs(numeric) >= 1e12 else numeric
+            dt = datetime.fromtimestamp(epoch_seconds, tz=zone)
+        else:
+            normalized = re.sub(r"^(\d{4})\.(\d{1,2})\.(\d{1,2})(?=\s|$)", r"\1-\2-\3", raw_text)
+            naive_match = re.fullmatch(
+                r"(\d{4})[-/](\d{1,2})[-/](\d{1,2})(?:[ T](\d{1,2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?)?",
+                normalized,
+            )
+            if naive_match:
+                year, month, day, hour, minute, second = naive_match.groups()
+                # A timezone-less SQL/terminal timestamp is already programme-local.
+                dt = datetime(int(year), int(month), int(day), int(hour or 0), int(minute or 0), int(second or 0))
+            else:
+                iso_text = normalized.replace("T", " ")
+                if iso_text.endswith("Z"):
+                    iso_text = iso_text[:-1] + "+00:00"
+                dt = datetime.fromisoformat(iso_text)
+                if dt.tzinfo is not None:
+                    dt = dt.astimezone(zone).replace(tzinfo=None)
+    except (ValueError, TypeError, OverflowError, OSError):
+        return None
+    return {
+        "date": dt.strftime("%Y-%m-%d"),
+        "weekday_index": (dt.weekday() + 1) % 7,  # JS: Sunday=0
+        "time_minutes": dt.hour * 60 + dt.minute + dt.second / 60.0,
+    }
+
+
+def _rule_time_minutes(value: Any) -> Optional[float]:
+    match = re.fullmatch(r"\s*(\d{1,2}):(\d{2})(?::(\d{2}))?\s*", str(value or ""))
+    if not match:
+        return None
+    hour, minute, second = int(match.group(1)), int(match.group(2)), int(match.group(3) or 0)
+    if hour > 23 or minute > 59 or second > 59:
+        return None
+    return hour * 60 + minute + second / 60.0
+
+
+def _source_main_candle_time(
+    parent_root: Dict[str, Any], family: Dict[str, Any],
+    candles: Sequence[Dict[str, Any]], parent_candles: Optional[Sequence[Dict[str, Any]]],
+) -> Optional[Any]:
+    """Resolve the same original parent-root main candle used by chart rule checks."""
+    source_family = family.get("parentFamily") or family
+    source_candles = parent_candles if parent_candles is not None else candles
+    trees = sorted(parent_root.get("trees") or [], key=lambda tree: as_int(tree.get("id"), 0) or 0)
+    if not trees:
+        return None
+    tree = trees[0]
+    main = tree.get("main") or {}
+    identity = main.get("selectedExistingId") or main.get("offsetTo") or main.get("id")
+    conditions = source_family.get("conditions") or []
+    for condition in conditions:
+        if (str(condition.get("treeId")) == str(tree.get("id"))
+                and str(condition.get("rootId", parent_root.get("id"))) == str(parent_root.get("id"))
+                and condition.get("mainCandleId") is not None):
+            candle_id = str(condition.get("mainCandleId"))
+            for candle in source_candles:
+                if candle.get("id") is not None and str(candle.get("id")) == candle_id:
+                    return candle.get("time") or candle.get("open_time") or candle.get("timestamp")
+    if identity not in (None, ""):
+        index = as_int((source_family.get("map") or {}).get(str(identity)))
+        if index is not None and 0 <= index < len(source_candles):
+            candle = source_candles[index]
+            return candle.get("time") or candle.get("open_time") or candle.get("timestamp")
+    return None
+
+
+def apply_account_management_trade_rules(
+    record: Dict[str, Any], candles: Sequence[Dict[str, Any]],
+    trigger_index: Optional[int], entry_index: Optional[int],
+    source_main_candle_time: Any, rules: Optional[Dict[str, Any]],
+) -> None:
+    """Apply programme_training.php restricted-date/day matching to a trade row."""
+    rule_data = rules or {}
+    timezone_name = str(rule_data.get("timezone") or "UTC")
+    candidates: List[Dict[str, Any]] = []
+
+    def add_time(raw: Any, basis: str) -> None:
+        parts = _programme_datetime_parts(raw, timezone_name)
+        if parts is None:
+            return
+        key = parts["date"] + "|" + str(parts["time_minutes"])
+        if any(item["key"] == key for item in candidates):
+            return
+        candidates.append({"key": key, "raw": str(raw), "basis": basis, "parts": parts})
+
+    def add_candle_index(index: Optional[int], basis: str) -> None:
+        if index is None:
+            return
+        numeric_index = as_int(index)
+        if numeric_index is None or not (0 <= numeric_index < len(candles)):
+            return
+        candle = candles[numeric_index]
+        add_time(candle.get("time") or candle.get("open_time") or candle.get("timestamp"), basis)
+
+    # Candle-native values are authoritative. SQL-normalized record timestamps
+    # are fallbacks only, because converting an offset timestamp to DATETIME can
+    # otherwise discard its original programme-timezone context.
+    add_candle_index(trigger_index, "entry trigger")
+    if not candidates:
+        add_time(record.get("entry_trigger_time"), "entry trigger")
+    add_candle_index(entry_index, "Entry-at anchor")
+    if len(candidates) < 2:
+        add_time(record.get("entry_anchor_time"), "Entry-at anchor")
+    add_time(source_main_candle_time, "source-root identification candle")
+
+    primary = next((item for item in candidates if item["basis"].startswith("entry trigger")), None)
+    if primary is None:
+        primary = next((item for item in candidates if item["basis"].startswith("entry execution")), None)
+    if primary is None and candidates:
+        primary = candidates[0]
+    record["trade_entry_date"] = primary["parts"]["date"] if primary else None
+
+    restricted_date_matches: List[Dict[str, Any]] = []
+    for rule in rule_data.get("restricted_dates") or []:
+        restricted_date = str(rule.get("restricted_date") or "").strip()[:10]
+        if not restricted_date:
+            continue
+        match = next((item for item in candidates if item["parts"]["date"] == restricted_date), None)
+        if match:
+            restricted_date_matches.append({
+                "date": restricted_date, "matchedAt": match["raw"], "matchBasis": match["basis"],
+            })
+
+    weekday_indexes = {"sunday": 0, "monday": 1, "tuesday": 2, "wednesday": 3,
+                       "thursday": 4, "friday": 5, "saturday": 6}
+    restricted_day_matches: List[Dict[str, Any]] = []
+    for rule in rule_data.get("restricted_days") or []:
+        configured_day = str(rule.get("day") or "").strip()
+        configured_index = weekday_indexes.get(configured_day.lower())
+        from_minutes = _rule_time_minutes(rule.get("from_time"))
+        to_minutes = _rule_time_minutes(rule.get("to_time"))
+        if configured_index is None or from_minutes is None or to_minutes is None:
+            continue
+        matched_time = None
+        for candidate in candidates:
+            parts = candidate["parts"]
+            weekday = parts["weekday_index"]
+            minute = parts["time_minutes"]
+            if from_minutes == to_minutes:
+                matched = weekday == configured_index
+            elif from_minutes < to_minutes:
+                matched = weekday == configured_index and from_minutes <= minute <= to_minutes
+            else:
+                following_day = (configured_index + 1) % 7
+                matched = ((weekday == configured_index and minute >= from_minutes)
+                           or (weekday == following_day and minute <= to_minutes))
+            if matched:
+                matched_time = candidate
+                break
+        if matched_time:
+            restricted_day_matches.append({
+                "day": configured_day,
+                "from_time": str(rule.get("from_time") or ""),
+                "to_time": str(rule.get("to_time") or ""),
+                "matchedDate": matched_time["parts"]["date"],
+                "matchedAt": matched_time["raw"],
+                "matchBasis": matched_time["basis"],
+            })
+
+    record["restricted_date_hit"] = int(bool(restricted_date_matches))
+    record["restricted_day_hit"] = int(bool(restricted_day_matches))
+    record["restricted_date_matches_json"] = safe_json(restricted_date_matches)
+    record["restricted_day_matches_json"] = safe_json(restricted_day_matches)
+    record["excluded_from_analytics"] = int(bool(restricted_date_matches or restricted_day_matches))
+    record["analytics_exclusion_reason"] = "restricted trading window" if record["excluded_from_analytics"] else None
+
 
 def _analytics_identity(record: Dict[str, Any]) -> Dict[str, Any]:
     """Stable identity used for scope-safe analytics reads/upserts."""
@@ -2404,6 +2847,14 @@ def persist_pair(db: BridgeClient, programme_id: int, user_id: int, symbol: str,
 
     columns = get_columns(db, "programme_analytics")
     lower_columns = {str(column).lower() for column in columns}
+    for column, definition in ANALYTICS_ADDITIVE_COLUMNS.items():
+        if column.lower() not in lower_columns:
+            db.execute(
+                f"ALTER TABLE `programme_analytics` ADD COLUMN `{column}` {definition}",
+                timeout=90,
+            )
+            columns.append(column)
+            lower_columns.add(column.lower())
     if "live_trades" not in lower_columns:
         position = " AFTER `trade_configured`" if "trade_configured" in lower_columns else ""
         try:
@@ -2506,7 +2957,13 @@ def _trade_outcome_counts(records: Sequence[Dict[str, Any]]) -> Dict[str, int]:
         "families": len(records),
         "trades": sum(1 for r in records if int(r.get("trade_configured") or 0) == 1),
         "stoploss": sum(1 for r in records if r.get("outcome") == "stoploss hit"),
-        "profit": sum(1 for r in records if r.get("outcome") == "take profit reached"),
+        "profit": sum(1 for r in records if r.get("outcome") in {"take profit reached", "breakeven"}),
+        "take_profit": sum(1 for r in records if r.get("outcome") == "take profit reached"),
+        "breakeven_profit": sum(1 for r in records if r.get("outcome") == "breakeven"),
+        "breakeven_stop_hit": sum(1 for r in records if r.get("outcome") in {"breakeven stop hit", "breakeven hit"}),
+        "restricted_date": sum(1 for r in records if int(r.get("restricted_date_hit") or 0) == 1),
+        "restricted_day": sum(1 for r in records if int(r.get("restricted_day_hit") or 0) == 1),
+        "excluded": sum(1 for r in records if int(r.get("excluded_from_analytics") or 0) == 1),
         "pending": sum(1 for r in records if r.get("outcome") == "pending entry"),
         "in_trade": sum(1 for r in records if r.get("outcome") == "in trade"),
     }
@@ -2676,6 +3133,15 @@ def process_programme(db: BridgeClient, programme: Dict[str, Any]) -> Dict[str, 
             print("    DATA WARNING: candle timestamps are not ascending; PHP chart matching receives oldest-to-newest candles")
 
     provider = load_provider_risk_reward(db, programme)
+    account_rules = load_account_management_rules(db, programme)
+    print(
+        "Account Management rules loaded: "
+        f"timezone={account_rules.get('timezone') or 'UTC'}, "
+        f"developer_id={account_rules.get('developer_id') or user_id}, "
+        f"restricted_dates={len(account_rules.get('restricted_dates') or [])}, "
+        f"restricted_days={len(account_rules.get('restricted_days') or [])}, "
+        f"breakeven_rules={len(account_rules.get('trades_breakeven') or [])}"
+    )
     print("converting and building into json")
     snapshot_payload = {
         "schema": "programme_training_runtime_snapshot_v1",
@@ -2711,6 +3177,7 @@ def process_programme(db: BridgeClient, programme: Dict[str, Any]) -> Dict[str, 
             "restoration_engine": "programme_training.php ptRestoreSavedRows() compatible",
         },
         "provider_risk_reward": provider,
+        "account_management_rules": account_rules,
         "candles": fetched_candles,
     }
 
@@ -2731,6 +3198,7 @@ def process_programme(db: BridgeClient, programme: Dict[str, Any]) -> Dict[str, 
         provider_data = snapshot.get("provider_risk_reward") or {}
         provider_rr = as_float(provider_data.get("risk_reward"))
         provider_rr_type = str(provider_data.get("risk_reward_type") or "")
+        account_rule_data = snapshot.get("account_management_rules") or {}
         records_by_pair: Dict[Tuple[str, str], List[Dict[str, Any]]] = {
             pair: [] for pair in required_pairs_ordered
         }
@@ -2791,6 +3259,7 @@ def process_programme(db: BridgeClient, programme: Dict[str, Any]) -> Dict[str, 
                                 provider_rr=provider_rr,
                                 provider_rr_type=provider_rr_type,
                                 source_timeframe=parent_tf,
+                                account_rules=account_rule_data,
                             )
                         record = trade if trade else base
                         parent_records.append(record)
@@ -3046,6 +3515,7 @@ def process_programme(db: BridgeClient, programme: Dict[str, Any]) -> Dict[str, 
                                 provider_rr=provider_rr,
                                 provider_rr_type=provider_rr_type,
                                 source_timeframe=parent_tf,
+                                account_rules=account_rule_data,
                             )
                         final_record = trade if trade else base
                         records_by_pair.setdefault((symbol, child_tf), []).append(final_record)
@@ -3101,6 +3571,15 @@ def process_programme(db: BridgeClient, programme: Dict[str, Any]) -> Dict[str, 
             if not records:
                 print(f"  {symbol} {timeframe.upper()}: 0 analytics rows from this run; no new row inserted")
                 continue
+            pair_counts = _trade_outcome_counts(records)
+            print(
+                f"  {symbol} {timeframe.upper()}: calculated {pair_counts['trades']} trade(s) "
+                f"(TP={pair_counts['take_profit']}, BE-profit exits={pair_counts['breakeven_profit']}, "
+                f"SL={pair_counts['stoploss']}, BE-triggered={sum(1 for r in records if int(r.get('breakeven_triggered') or 0) == 1)}, "
+                f"BE-stop hits={pair_counts['breakeven_stop_hit']}, pending={pair_counts['pending']}, "
+                f"in_trade={pair_counts['in_trade']}, restricted_date={pair_counts['restricted_date']}, "
+                f"restricted_day={pair_counts['restricted_day']}, excluded={pair_counts['excluded']})"
+            )
             persistence = persist_pair(db, programme_id, user_id, symbol, timeframe, records)
             saved = sum(persistence.values())
             totals["pairs"] += 1
