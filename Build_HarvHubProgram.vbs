@@ -4,6 +4,7 @@ Dim fso, sh, shellApp, processEnv, localAppData, installRoot, cacheRoot
 Dim psScriptPath, markerPath, pythonMarkerPath, psFile, psExit, projectRoot
 Dim pythonwPath, builderScript, adminResult, appRunning, clickedVbs
 Dim psProcess, psStdOut, psStdErr, diagnosticText
+Dim validatorProcess, validationCommand, validationStdOut, validationStdErr, validationExit, validationOutput
 Dim builderLogPath, builderExit, builderCommand, builderLaunchError
 
 Set fso = CreateObject("Scripting.FileSystemObject")
@@ -87,6 +88,42 @@ If Err.Number <> 0 Then
     Err.Clear
     Call ShowDiagnosticWindow("HarvHub AI bootstrap script could not be closed", diagnosticText)
     WScript.Quit 18
+End If
+
+' Parse the exact generated PowerShell file before running it. This catches
+' missing braces, unterminated strings, and other parser errors at the launcher
+' boundary, with a copyable diagnostic rather than a partially started setup.
+processEnv("HARVHUBAI_BOOTSTRAP_PS_SCRIPT") = psScriptPath
+validationCommand = "$p=$env:HARVHUBAI_BOOTSTRAP_PS_SCRIPT; $t=$null; $e=$null; [void][System.Management.Automation.Language.Parser]::ParseFile($p,[ref]$t,[ref]$e); if($e.Count -gt 0){$e | ForEach-Object { $_.ToString() }; exit 1}; Write-Output 'PowerShell syntax validation passed.'"
+On Error Resume Next
+Set validatorProcess = sh.Exec("powershell.exe -NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -Command """ & validationCommand & """")
+If Err.Number <> 0 Then
+    diagnosticText = "Could not start the PowerShell syntax validator." & vbCrLf & _
+        "Generated script: " & psScriptPath & vbCrLf & _
+        "VBScript error " & Err.Number & ": " & Err.Description
+    Err.Clear
+    Call ShowDiagnosticWindow("HarvHub AI bootstrap syntax validation could not start", diagnosticText)
+    WScript.Quit 20
+End If
+On Error GoTo 0
+Do While validatorProcess.Status = 0
+    WScript.Sleep 100
+Loop
+validationExit = validatorProcess.ExitCode
+validationStdOut = ""
+validationStdErr = ""
+On Error Resume Next
+validationStdOut = validatorProcess.StdOut.ReadAll
+validationStdErr = validatorProcess.StdErr.ReadAll
+On Error GoTo 0
+validationOutput = Trim(validationStdErr & vbCrLf & validationStdOut)
+If validationExit <> 0 Then
+    If Len(validationOutput) = 0 Then validationOutput = "PowerShell parser rejected the generated bootstrap without returning details."
+    Call ShowDiagnosticWindow("HarvHub AI generated PowerShell contains a syntax error", _
+        "The bootstrap was NOT executed because its generated PowerShell failed parser validation." & vbCrLf & _
+        "Validator exit code: " & validationExit & vbCrLf & _
+        "Generated script: " & psScriptPath & vbCrLf & vbCrLf & validationOutput)
+    WScript.Quit 21
 End If
 
 Set psProcess = sh.Exec("powershell.exe -NoLogo -NoProfile -STA -WindowStyle Hidden -ExecutionPolicy Bypass -File """ & psScriptPath & """")
@@ -431,6 +468,14 @@ End Function
 
 Function PSChunk11()
     PSChunk11 = Join(Array( _
+        "            $script:stepLabels[$n].ForeColor = [System.Drawing.Color]::FromArgb(184,135,32)", _
+        "        } else {", _
+        "            $script:stepLabels[$n].Text = 'o  ' + $stepNames[$n]", _
+        "            $script:stepLabels[$n].ForeColor = [System.Drawing.Color]::FromArgb(130,116,93)", _
+        "        }", _
+        "    }", _
+        "    Pump-Ui", _
+        "}", _
         "function Download-ToFile([string]$Url, [string]$Destination, [string]$Label, [long]$ResumeOffset = 0) {", _
         "    Add-UiLog(('Downloading ' + $Label + '.'))", _
         "    $request = $null; $response = $null; $inputStream = $null; $outputStream = $null", _
