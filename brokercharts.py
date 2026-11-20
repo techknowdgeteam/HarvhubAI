@@ -7,7 +7,7 @@ never purged to enforce that target; live candles may grow stored history.
 REPLACES update_developers() + import os.py (fetch_charts_all_brokers).
 ARCHITECTURE
 ------------
-* Same bridge pattern as brokerdetails.py / programmetrades.py: this file
+* Same bridge pattern as brokerdetails.py / signals_trading.py: this file
   is a TCP CLIENT of the long-running mysqlremote bridge. It does not
   launch Chrome and does not import mysqlremote.
 * One channel per worker process. Batching is used aggressively so the
@@ -115,7 +115,7 @@ except Exception:
 DEFAULT_MT5_PATH     = r"C:\xampp\htdocs\harvhubAI\mt5\MetaTrader 5"
 MT5_DESTINATION_PATH = r"C:\xampp\htdocs\harvhubAI\mt5"
 # ==============================================================================
-#  BRIDGE CLIENT — same protocol as brokerdetails.py / programmetrades.py
+#  BRIDGE CLIENT — same protocol as brokerdetails.py / signals_trading.py
 # ==============================================================================
 BRIDGE_HOST = "127.0.0.1"
 BRIDGE_PORT = 5599

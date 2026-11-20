@@ -177,7 +177,6 @@ Function PSChunk02()
         "$form.MinimizeBox = $false", _
         "$form.ControlBox = $false", _
         "$form.ShowInTaskbar = $true", _
-        "$form.TopMost = $true", _
         "$form.BackColor = [System.Drawing.Color]::FromArgb(250,247,239)", _
         "$form.ForeColor = [System.Drawing.Color]::FromArgb(48,39,24)", _
         "$form.Font = New-Object System.Drawing.Font('Segoe UI', 9)", _
@@ -590,7 +589,7 @@ End Function
 
 Function PSChunk20()
     PSChunk20 = Join(Array( _
-        "    $sourceNames = @('mysqlremote.py','brokerdetails.py','brokercharts.py','programme_training.py','programmesignals_trading.py','signals_provision_challenge.py','ip.py','notification_email.py','notification_service.py','harvhub_ipc.py')", _
+        "    $sourceNames = @('mysqlremote.py','brokerdetails.py','brokercharts.py','programme_training.py','signals_trading.py','signals_provision_challenge.py','ip.py','notification_email.py','notification_service.py','harvhub_ipc.py')", _
         "    foreach ($name in $sourceNames) {", _
         "        $target = Join-Path $payload $name", _
         "        $baseName = [System.IO.Path]::GetFileNameWithoutExtension($name)", _
@@ -743,6 +742,7 @@ Sub StopExistingHarvHubProcesses()
         "    [void]$protectedIds.Add($launcherPid)", _
         "    $launcherParent = $all | Where-Object { [int]$_.ProcessId -eq [int]$launcher.ParentProcessId } | Select-Object -First 1", _
         "    if ($launcherParent -and ([string]$launcherParent.Name -match '^(wscript|cscript)\.exe$')) { [void]$protectedIds.Add([int]$launcherParent.ProcessId) }", _
+        "    $legacySignalsTradingName = 'programme' + 'signals_trading.py'", _
         "    $processById = @{}", _
         "    foreach ($proc in $all) { $processById[[int]$proc.ProcessId] = $proc }", _
         "    $rootIds = New-Object 'System.Collections.Generic.HashSet[int]'", _
@@ -756,7 +756,7 @@ Sub StopExistingHarvHubProcesses()
         "        elseif (($name -eq 'wscript.exe' -or $name -eq 'cscript.exe') -and $cmd -match '(?i)(HarvHubAI|Build_HarvHubProgram)\.vbs') { $isHarvHub = $true }", _
         "        elseif ($name -eq 'powershell.exe' -and $cmd -match '(?i)(visible_bootstrap\.ps1|visible_builder_launch\.ps1|console_first_bootstrap\.ps1|cleanup_[^\\]*\.ps1)') { $isHarvHub = $true }", _
         "        elseif ($name -eq 'cmd.exe' -and $cmd -match '(?i)(HarvHubAI_First_Time_Setup\.cmd|HarvHubAI_Visible_(Installer|Build)\.cmd|cleanup_[^\\]*\.cmd)') { $isHarvHub = $true }", _
-        "        elseif (($name -eq 'python.exe' -or $name -eq 'pythonw.exe') -and $cmd -match '(?i)(Build_HarvHubProgram\.pyw|mysqlremote\.py|brokerdetails\.py|brokercharts\.py|programme_training\.py|programmesignals_trading\.py|signals_provision_challenge\.py)') { $isHarvHub = $true }", _
+        "        elseif (($name -eq 'python.exe' -or $name -eq 'pythonw.exe') -and (($cmd -match '(?i)(Build_HarvHubProgram\.pyw|mysqlremote\.py|brokerdetails\.py|brokercharts\.py|programme_training\.py|signals_trading\.py|signals_provision_challenge\.py)') -or $cmd -match ('(?i)' + [regex]::Escape($legacySignalsTradingName)))) { $isHarvHub = $true }", _
         "        elseif ($name -match '^python-3\..*-amd64\.exe$' -and $cmd -match '(?i)HarvHubAI\\Bootstrap') { $isHarvHub = $true }", _
         "        if (!$isHarvHub) { continue }", _
         "        $older = $false", _
@@ -863,7 +863,9 @@ End Function
 Function IsInstalledHarvHubRunning(ByVal targetPath)
     Dim wmi, processes, proc, executablePath, commandLine, processName, workerNames, workerName
     IsInstalledHarvHubRunning = False
-    workerNames = Array("build_harvhubprogram.pyw", "mysqlremote.py", "brokerdetails.py", "brokercharts.py", "programme_training.py", "programmesignals_trading.py", "signals_provision_challenge.py")
+    workerNames = Array("build_harvhubprogram.pyw", "mysqlremote.py", "brokerdetails.py", "brokercharts.py", "programme_training.py", "signals_trading.py", "signals_provision_challenge.py")
+    ReDim Preserve workerNames(UBound(workerNames) + 1)
+    workerNames(UBound(workerNames)) = "programme" & "signals_trading.py"
     On Error Resume Next
     Set wmi = GetObject("winmgmts:\\.\root\cimv2")
     Set processes = wmi.ExecQuery("SELECT Name,ExecutablePath,CommandLine FROM Win32_Process WHERE Name='HarvHubAI.exe' OR Name='pythonw.exe' OR Name='python.exe'")

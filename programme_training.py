@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """Python counterpart of programme_training.php's saved-configuration matcher.
 
-Only programmes assigned to this computer's VPS IP are considered, including
-active follower programmes hosted by a directly assigned owner programme. Only
-roots with apply_to_chart enabled are processed. Begin Test does not control
+Only programmes assigned to this computer's public VPS IP are eligible. This
+includes programmes directly assigned to the IP and active follower programmes
+hosted by a directly assigned owner. IP detection or VPS-assignment schema errors
+fail closed: no programme is processed without a verified IP association.
+Use --programme-id only to narrow the already IP-authorized programme set.
+Only roots with apply_to_chart enabled are processed. Begin Test does not control
 programme discovery: when enabled, only newly detected pending-entry orders are
 written to programme_analytics with live_trades=1; every other analytics record
 is History (live_trades=0). When Begin Test is disabled, all records are History.
@@ -12,8 +15,38 @@ The worker fetches the exact configured symbol/timeframe candle scopes, restores
 the saved configuration into the same JS-shaped runtime model, writes both into
 temporary JSON, reloads that JSON, and then runs root/tree matching,
 confirmation projection and historical trade calculations without chart
-rendering. It never modifies candle_records, creates broker orders, or writes to
-programme_trades.
+rendering. Each scan snapshots the existing analytics setup groups and compares
+newly calculated records with the existing database content. Exact programme trade
+and analytics matches are left untouched (no INSERT or UPDATE); changed stable
+identities are updated in place; only missing identities are inserted. Programme
+trades are synchronized and verified before analytics writes. Obsolete analytics
+rows are deleted only after every expected analytics identity and payload has been
+read back and verified. programme_trades rows are never deleted; investor copies
+and broker trade IDs are not repurposed. The worker never modifies candle_records
+or creates broker orders.
+
+IMPORTANT: PHP/PDO PARITY FOR MYSQL NULL VALUES
+------------------------------------------------
+MySQL Remote can serialize an actual SQL NULL as the literal text "NULL" in a
+row returned to Python. PHP PDO exposes that same database value as an actual
+null. Therefore every MySQL row must be normalized at the database boundary
+before configuration restoration or matching begins: the Python worker converts
+the SQL-NULL text sentinel to Python None, just as PHP PDO does.
+
+Do not solve this mismatch with matcher-specific workarounds, additional
+fallback rules, or independent Python-only matching behavior. The Python
+configuration restoration and matcher must follow programme_training.php's
+saved-row restoration, defaults, identity handling, and matching decisions.
+Only the SQL-NULL sentinel is converted here; legitimate empty strings, "0",
+"false", and other stored text values are not rewritten by this conversion.
+
+IMPORTANT: MYSQL REMOTE SQL TEXT LITERAL FORMAT
+------------------------------------------------
+For SQL text values sent through this worker's MySQL Remote/PHP query path,
+use the charset-introduced hexadecimal form `_utf8mb4 X'...'`. The form
+`CONVERT(X'...' USING utf8mb4)` was tested through the same query interface
+and failed, while `_utf8mb4 X'...'` succeeded. Keep this encoding centralized
+in sql_literal(); do not introduce a separate Python-only encoding per query.
 """
 from __future__ import annotations
 
@@ -32,9 +65,11 @@ import time
 import traceback
 import tempfile
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP, localcontext
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -79,7 +114,10 @@ def sql_literal(value: Any) -> str:
         raw = value
     else:
         raw = str(value).encode("utf-8")
-    return "CONVERT(X'" + raw.hex() + "' USING utf8mb4)"
+    # Match the verified MySQL Remote/PHP query-interface representation.
+    # CONVERT(X'...' USING utf8mb4) fails through that endpoint, while the
+    # equivalent _utf8mb4 X'...' character-set introducer succeeds.
+    return "_utf8mb4 X'" + raw.hex() + "'"
 
 
 def interpolate_sql(sql: str, params: Optional[Sequence[Any]] = None) -> str:
@@ -129,8 +167,24 @@ def _bridge_error_is_transient(message: Any) -> bool:
         'timed out', 'timeout (last=', 'cannot talk to bridge',
         'mysqlremote bridge closed', 'connection refused',
         'connection reset', 'forcibly closed', 'temporarily unavailable',
+        'non-json response', '[empty response]', 'empty response',
+        'text/html; charset=utf-8', 'upstream returned html',
+        'signal is aborted without reason', 'aborterror', 'the operation was aborted',
+        'request timed out', 'database request timed out',
     )
     return any(marker in value for marker in markers)
+
+
+def format_sql_for_console(sql: str) -> str:
+    """Format SQL diagnostics as readable multi-line text for the console."""
+    compact = re.sub(r"\s+", " ", str(sql or "")).strip()
+    keywords = r"\s+(FROM|WHERE|GROUP BY|ORDER BY|HAVING|LIMIT|AND|OR)\s+"
+    return re.sub(
+        keywords,
+        lambda match: "\n    " + match.group(1).upper() + " ",
+        compact,
+        flags=re.IGNORECASE,
+    )
 
 
 class BridgeClient:
@@ -157,9 +211,9 @@ class BridgeClient:
             buf.extend(part)
         return bytes(buf)
 
-    def _connect(self) -> None:
+    def _connect(self, response_timeout: float = 120.0) -> None:
         self.sock = socket.create_connection((self.host, self.port), timeout=15)
-        self.sock.settimeout(120)
+        self.sock.settimeout(max(120.0, float(response_timeout)))
 
     def _close(self) -> None:
         if self.sock is not None:
@@ -175,14 +229,21 @@ class BridgeClient:
             raise BridgeError(f'bridge request exceeds frame limit: {len(body)} bytes')
         frame = HEADER.pack(len(body)) + body
         safe_to_replay = ('sql' not in payload) or _bridge_sql_is_read(payload.get('sql'))
+        try:
+            operation_timeout = float(payload.get('timeout', 90.0))
+        except (TypeError, ValueError):
+            operation_timeout = 90.0
+        # The socket must outlive the browser/PHP query timeout. Never replay writes.
+        response_timeout = max(120.0, min(600.0, operation_timeout + 60.0))
         last_error: Optional[Exception] = None
         with self._request_lock:
             for attempt in range(2):
                 sent = False
                 try:
                     if self.sock is None:
-                        self._connect()
+                        self._connect(response_timeout)
                     assert self.sock is not None
+                    self.sock.settimeout(response_timeout)
                     self.sock.sendall(frame)
                     sent = True
                     (length,) = HEADER.unpack(self._recv_exact(HEADER.size))
@@ -280,11 +341,23 @@ class BridgeClient:
                 delay = min(10.0, delay * 1.6)
                 continue
 
-            detail_text = json.dumps(reply, ensure_ascii=False, default=str)
-            sql_preview = re.sub(r'\s+', ' ', rendered_sql).strip()[:1600]
-            raise BridgeError(
-                f'{message}; bridge_reply={detail_text[:5000]}; SQL={sql_preview}'
-            )
+            statement_errors = []
+            for index, statement in enumerate(reply.get('statement_results') or [], start=1):
+                if not isinstance(statement, dict):
+                    continue
+                statement_status = str(statement.get('status') or '').strip().lower()
+                if statement_status not in {'success', 'ok'}:
+                    statement_message = str(statement.get('message') or 'statement failed').strip()
+                    statement_errors.append(f'Statement {index}: {statement_message}')
+
+            query_id = reply.get('query_id')
+            error_lines = [f'Database query failed: {message}']
+            if query_id:
+                error_lines.append(f'Query ID: {query_id}')
+            error_lines.extend(statement_errors)
+            error_lines.append('SQL sent to MySQL Remote:')
+            error_lines.extend('    ' + line for line in format_sql_for_console(rendered_sql).splitlines())
+            raise BridgeError('\n'.join(error_lines))
 
     def fetch_all(self, sql: str, params: Optional[Sequence[Any]] = None,
                   timeout: float = 90.0) -> List[Dict[str, Any]]:
@@ -301,8 +374,41 @@ class BridgeClient:
         self.invalidate_channel()
 
 
+def normalise_mysql_value(value: Any) -> Any:
+    """Convert MySQL Remote's serialized SQL NULL sentinel to Python None.
+
+    PHP PDO returns SQL NULL as null. Depending on the MySQL Remote response
+    path, the same value can reach this worker as the string "NULL" instead.
+    Normalize that representation once, at the database boundary, so every
+    downstream configuration and matcher function sees the same value PHP
+    sees. Do not collapse empty strings, numeric zero, the text "0", or other
+    ordinary strings into NULL here.
+    """
+    if isinstance(value, str) and value.strip().casefold() == "null":
+        return None
+    if isinstance(value, bytes):
+        # The bridge normally returns JSON strings, but support byte-valued
+        # adapters without changing the contents of any non-NULL byte value.
+        try:
+            if value.decode("utf-8", errors="strict").strip().casefold() == "null":
+                return None
+        except UnicodeDecodeError:
+            pass
+    if isinstance(value, list):
+        return [normalise_mysql_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(normalise_mysql_value(item) for item in value)
+    if isinstance(value, dict):
+        return {key: normalise_mysql_value(item) for key, item in value.items()}
+    return value
+
+
 def normalise_row(row: Dict[str, Any]) -> Dict[str, Any]:
-    return {str(k).strip().lower(): v for k, v in row.items()}
+    """Match PHP PDO row values before any saved configuration is restored."""
+    return {
+        str(key).strip().lower(): normalise_mysql_value(value)
+        for key, value in row.items()
+    }
 
 
 def as_int(value: Any, default: Optional[int] = None) -> Optional[int]:
@@ -489,6 +595,44 @@ def table_exists(db: BridgeClient, table: str) -> bool:
         "WHERE `table_schema`=DATABASE() AND `table_name`=%s LIMIT 1",
         [table], timeout=30)
     return bool(rows)
+
+
+DEFAULT_TRADES_SETUP_PER_GROUP = 100
+
+
+def load_trades_setup_per_group(db: BridgeClient) -> int:
+    """Read setup-group size from the normalized server_operational_settings table."""
+    try:
+        rows = db.fetch_all(
+            "SELECT `trades_setup_per_group` "
+            "FROM `server_operational_settings` WHERE `id`=1 LIMIT 1",
+            timeout=30,
+        )
+        configured = as_int(rows[0].get("trades_setup_per_group"), 0) if rows else 0
+        return configured if configured is not None and configured > 0 else DEFAULT_TRADES_SETUP_PER_GROUP
+    except Exception as exc:
+        log.warning(
+            "Could not read server_operational_settings.trades_setup_per_group; "
+            "using default %s: %s",
+            DEFAULT_TRADES_SETUP_PER_GROUP, str(exc)[:600],
+        )
+        return DEFAULT_TRADES_SETUP_PER_GROUP
+
+
+def split_family_ordinal(ordinal: Any, setup_group_limit: int) -> Tuple[int, int]:
+    """Map a global 1-based family ordinal to (setup_group_id, local family_number)."""
+    limit = max(1, int(setup_group_limit or DEFAULT_TRADES_SETUP_PER_GROUP))
+    number = max(1, as_int(ordinal, 1) or 1)
+    return ((number - 1) // limit) + 1, ((number - 1) % limit) + 1
+
+
+def family_group_identity(family: Dict[str, Any], setup_group_limit: int) -> Tuple[int, int, int]:
+    """Return the global ordinal, chart setup_group_id, and group-local family number."""
+    ordinal = as_int(family.get("familyNumber"), 0) or 0
+    if ordinal <= 0:
+        raise ValueError("A matched family must have a positive familyNumber before analytics persistence")
+    group_id, local_number = split_family_ordinal(ordinal, setup_group_limit)
+    return ordinal, group_id, local_number
 
 
 # --------------------------- Candle maths / matching ---------------------------
@@ -903,7 +1047,14 @@ def group_rows(rows: List[Dict[str, Any]], confirmation: bool = False) -> List[D
             "expanded": False,
             "trees": trees,
             "enabled": True,
-            "applyToChart": truthy(template.get("apply_to_chart"), True) if not is_null_db_value(template.get("apply_to_chart")) else truthy(template.get("run_in_python"), True),
+            # Match PHP ptRestoreSavedRows(): fall back only for SQL NULL / missing.
+            # Empty strings and numeric/string zero remain explicitly disabled.
+            "applyToChart": (
+                (lambda flag: flag is True or flag == 1 or flag == "1")(
+                    template.get("apply_to_chart") if template.get("apply_to_chart") is not None
+                    else template.get("run_in_python")
+                )
+            ),
             "useForTrades": truthy(template.get("use_for_trade")),
             "tradeFor": str(template.get("trade_for") or "root").lower(),
             "entryFrom": str(template.get("entry_at") or template.get("entry_from") or ""),
@@ -1118,73 +1269,83 @@ def candle_sequence_diagnostics(candles: Sequence[Dict[str, Any]]) -> Dict[str, 
 
 
 def print_tree_configuration(root: Dict[str, Any]) -> None:
-    """Print the restored identities and links that the matcher actually uses."""
+    """Print the restored identities and links in a readable hierarchy."""
     root_name = _root_display_name(root)
-    print(
-        f"  CONFIG {root_name} (root_id={root.get('id')}): "
-        f"timeframes={','.join(root.get('timeframes') or []) or '(none)'}, "
-        f"trade_for={root.get('tradeFor')}, use_for_trades={bool(root.get('useForTrades'))}, "
-        f"trees={len(root.get('trees') or [])}"
-    )
-    for index, tree in enumerate(sorted(root.get("trees") or [], key=lambda t: as_int(t.get("id"), 0) or 0)):
-        main, ref = tree.get("main") or {}, tree.get("reference") or {}
+    print(f"  Root: {root_name} (ID {root.get('id')})")
+    print(f"    Timeframes: {', '.join(tf.upper() for tf in (root.get('timeframes') or [])) or '(none)'}")
+    print(f"    Trade target: {root.get('tradeFor') or 'root'} | Trade enabled: {'yes' if root.get('useForTrades') else 'no'}")
+    trees = sorted(root.get('trees') or [], key=lambda t: as_int(t.get('id'), 0) or 0)
+    print(f"    Configured trees: {len(trees)}")
+    for index, tree in enumerate(trees, start=1):
+        main, ref = tree.get('main') or {}, tree.get('reference') or {}
+        main_identity = main.get('selectedExistingId') or main.get('offsetTo') or main.get('id')
+        ref_identity = ref.get('selectedExistingId') or ref.get('existingCandleId') or ref.get('id')
         print(
-            f"    TREE {tree.get('id')} [{index}] mode={tree.get('groupSelectionType')} "
-            f"necessity={tree.get('groupNecessity')} action={tree.get('ifGroupFound')} | "
-            f"MAIN {main.get('name')!r} id={main.get('id')} identity="
-            f"{main.get('selectedExistingId') or main.get('offsetTo') or main.get('id')} "
-            f"type={main.get('mainCandleType')} position={main.get('position')} "
-            f"offset={main.get('offsetPosition')} point={main.get('offsetPosPoint')} "
-            f"level={main.get('priceLevel')} op={main.get('operator')} "
-            f"new_group_anchor={main.get('newGroupOffsetTo')} "
-            f"direction={main.get('newGroupDirection')} "
-            f"window=({tree.get('regionFromCandleId')},{tree.get('regionToCandleId')}) | "
-            f"REF {ref.get('name')!r} id={ref.get('id')} identity="
-            f"{ref.get('selectedExistingId') or ref.get('existingCandleId') or ref.get('id')} "
-            f"mode={ref.get('referenceMode')} type={ref.get('refCandleType')} "
-            f"position={ref.get('position')} offset={ref.get('offsetPosition')} "
-            f"point={ref.get('offsetPosPoint')} level={ref.get('priceLevel')}"
+            f"      Tree {tree.get('id')} ({index}/{len(trees)}) | "
+            f"mode={tree.get('groupSelectionType')} | necessity={tree.get('groupNecessity')} | "
+            f"action={tree.get('ifGroupFound')}"
+        )
+        print(
+            f"        Main: {main.get('name')!r} | ID={main.get('id')} | "
+            f"identity={main_identity} | type={main.get('mainCandleType')}"
+        )
+        print(
+            f"          position={main.get('position')} | offset={main.get('offsetPosition')} | "
+            f"point={main.get('offsetPosPoint')} | price={main.get('priceLevel')} {main.get('operator')}"
+        )
+        print(
+            f"        Reference: {ref.get('name')!r} | ID={ref.get('id')} | "
+            f"identity={ref_identity} | mode={ref.get('referenceMode')} | "
+            f"type={ref.get('refCandleType')}"
+        )
+        print(
+            f"          position={ref.get('position')} | offset={ref.get('offsetPosition')} | "
+            f"point={ref.get('offsetPosPoint')} | price={ref.get('priceLevel')}"
         )
     for cr in (root.get("confirmationRoots") or []):
         print(
-            f"    CONFIRMATION {cr.get('name')!r} id={cr.get('id')} "
-            f"timeframes={','.join(cr.get('timeframes') or []) or '(none)'} "
-            f"anchor_id={cr.get('anchorCandleId')} anchor_name={cr.get('anchorCandleName')!r} "
-            f"anchor_time={cr.get('anchorTime')} trees={len(cr.get('trees') or [])} "
-            f"use_for_trades={bool(cr.get('useForTrades'))}, trade_for={root.get('tradeFor')}"
+            f"    Confirmation: {_root_display_name(cr, True)} (ID {cr.get('id')}) | "
+            f"timeframes={', '.join(tf.upper() for tf in (cr.get('timeframes') or [])) or '(none)'}"
+        )
+        print(
+            f"      Anchor: ID={cr.get('anchorCandleId')} | "
+            f"name={cr.get('anchorCandleName')!r} | time={cr.get('anchorTime')} | "
+            f"trees={len(cr.get('trees') or [])} | trade_enabled={'yes' if cr.get('useForTrades') else 'no'}"
         )
 
 
 def print_matcher_diagnostics(root: Dict[str, Any], candle_count: int) -> None:
+    """Print matcher counters as short, grouped diagnostic lines."""
     diagnostics = root.get("_matcherDiagnostics") or []
     if not diagnostics:
-        print("  MATCHER TRACE: no tree diagnostics were produced (root has no trees or no candles)")
+        print("  Matcher diagnostics: none produced (no configured trees or no candle input).")
         return
-    print(f"  MATCHER TRACE: {len(diagnostics)} tree(s), input candles={candle_count}, cap={MAX_ROOT_MATCH_STATES} states")
+    print(f"  Matcher diagnostics: {len(diagnostics)} tree(s) | input candles={candle_count:,} | state cap={MAX_ROOT_MATCH_STATES:,}")
     for item in diagnostics:
-        fields = (
-            f"incoming={item.get('incoming_states', 0)}, "
-            f"main_scan={item.get('main_candles_scanned', 0)}, "
-            f"main_type_ok={item.get('main_type_matches', 0)}, "
-            f"ref_checks={item.get('reference_candidate_checks', 0)}, "
-            f"ref_type_ok={item.get('reference_type_matches', 0)}, "
-            f"ref_type_rejected={item.get('reference_type_rejections', 0)}, "
-            f"ref_oob={item.get('reference_out_of_bounds', 0)}, "
-            f"price_checks={item.get('price_comparisons', 0)}, "
-            f"price_ok={item.get('price_matches', 0)}, "
-            f"price_rejected={item.get('price_rejections', 0)}, "
-            f"new_group_ref_ok={item.get('new_group_reference_resolved', 0)}, "
-            f"anchor_missing={item.get('missing_anchor_states', 0)}, "
-            f"anchor_unset={item.get('anchor_not_configured', False)}, "
-            f"window_invalid={item.get('window_invalid_states', 0)}, "
-            f"identity_missing={item.get('identity_missing_states', 0)}, "
-            f"preselected_ref_reused={item.get('preselected_reference_reuses', 0)}, "
-            f"output={item.get('retained_states', 0)}"
+        print(f"    Tree {item.get('tree_id')}: {item.get('main_name')} -> {item.get('reference_name')}")
+        print(
+            f"      Input/main: incoming={item.get('incoming_states', 0):,} | "
+            f"main scanned={item.get('main_candles_scanned', 0):,} | "
+            f"main type matches={item.get('main_type_matches', 0):,}"
         )
         print(
-            f"    TREE {item.get('tree_id')} {item.get('main_name')} -> {item.get('reference_name')}: "
-            f"{fields}; blocker={item.get('blocker') or 'no specific blocker recorded'}"
+            f"      Reference: checks={item.get('reference_candidate_checks', 0):,} | "
+            f"type matches={item.get('reference_type_matches', 0):,} | "
+            f"type rejected={item.get('reference_type_rejections', 0):,} | "
+            f"out of bounds={item.get('reference_out_of_bounds', 0):,}"
         )
+        print(
+            f"      Price: comparisons={item.get('price_comparisons', 0):,} | "
+            f"matches={item.get('price_matches', 0):,} | "
+            f"rejected={item.get('price_rejections', 0):,}"
+        )
+        print(
+            f"      Result: retained={item.get('retained_states', 0):,} | "
+            f"missing identity={item.get('identity_missing_states', 0):,} | "
+            f"missing anchor={item.get('missing_anchor_states', 0):,} | "
+            f"invalid window={item.get('window_invalid_states', 0):,}"
+        )
+        print(f"      Blocker: {item.get('blocker') or 'none'}")
 
 
 # ---------------------------- Root family matcher ----------------------------
@@ -1828,7 +1989,8 @@ def make_trade_record(parent_root: Dict[str, Any], trade_root: Dict[str, Any], f
                       parent_tf: str = "", proj: Optional[Sequence[Dict[str, int]]] = None,
                       provider_rr: Optional[float] = None, provider_rr_type: str = "",
                       source_timeframe: Optional[str] = None,
-                      account_rules: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+                      account_rules: Optional[Dict[str, Any]] = None,
+                      setup_group_limit: int = DEFAULT_TRADES_SETUP_PER_GROUP) -> Optional[Dict[str, Any]]:
     """Build one historical trade exactly from the matched family and saved targets."""
     if family.get("noTrade") or not trade_root.get("useForTrades"):
         return None
@@ -1949,6 +2111,9 @@ def make_trade_record(parent_root: Dict[str, Any], trade_root: Dict[str, Any], f
         candle = candles[index]
         return dt_text(candle.get("time") or candle.get("open_time"))
 
+    family_ordinal, setup_group_id, group_family_number = family_group_identity(
+        family, setup_group_limit
+    )
     signature = family_identity_signature(
         int(parent_root["id"]), timeframe, confirmation_root_id,
         family.get("map") or {}, candles,
@@ -1969,7 +2134,9 @@ def make_trade_record(parent_root: Dict[str, Any], trade_root: Dict[str, Any], f
         "root_name": parent_root.get("name") or f"Root {parent_root['id']}",
         "confirmation_root_id": int(confirmation_root_id),
         "confirmation_root_name": confirmation_name or None,
-        "family_number": int(family.get("familyNumber") or 0),
+        "family_number": group_family_number,
+        "setup_group_id": setup_group_id,
+        "family_ordinal": family_ordinal,  # transient global ordinal used during staged refresh
         "family_signature": signature,
         "family_map_json": safe_json(family_map),
         "match_json": safe_json(family.get("conditions") or []),
@@ -2030,13 +2197,19 @@ def make_trade_record(parent_root: Dict[str, Any], trade_root: Dict[str, Any], f
 def match_row(programme_id: int, user_id: int, symbol: str, timeframe: str,
               root: Dict[str, Any], family: Dict[str, Any], candles: Sequence[Dict[str, Any]],
               confirmation_root_id: int = 0, confirmation_name: str = "",
-              source_timeframe: Optional[str] = None) -> Dict[str, Any]:
+              source_timeframe: Optional[str] = None,
+              setup_group_limit: int = DEFAULT_TRADES_SETUP_PER_GROUP) -> Dict[str, Any]:
+    family_ordinal, setup_group_id, group_family_number = family_group_identity(
+        family, setup_group_limit
+    )
     return {
         "programme_id": programme_id, "userid": user_id, "symbol": symbol,
         "timeframe": timeframe.lower(), "source_timeframe": (source_timeframe or timeframe).lower(),
         "root_id": int(root["id"]), "root_name": root.get("name") or f"Root {root['id']}",
         "confirmation_root_id": int(confirmation_root_id), "confirmation_root_name": confirmation_name or None,
-        "family_number": int(family.get("familyNumber") or 0),
+        "family_number": group_family_number,
+        "setup_group_id": setup_group_id,
+        "family_ordinal": family_ordinal,  # transient global ordinal used during staged refresh
         "family_signature": family_identity_signature(int(root["id"]), timeframe, confirmation_root_id, family.get("map") or {}, candles),
         "family_map_json": safe_json({k: candles[int(v)].get("id") for k, v in (family.get("map") or {}).items() if 0 <= int(v) < len(candles)}),
         "match_json": safe_json(family.get("conditions") or []),
@@ -2062,7 +2235,7 @@ def match_row(programme_id: int, user_id: int, symbol: str, timeframe: str,
 
 # ------------------------------- VPS/IP scope ---------------------------------
 def detect_vps_ip() -> Optional[str]:
-    """Return this machine's public IP, preferring the configured override.
+    """Return this machine's public IP, preferring the configured local override.
 
     programme_vps.programme_vps_ip_address stores the public VPS address, so a
     private interface address is not a safe substitute. If detection fails the
@@ -2102,18 +2275,25 @@ def _in_sql(values: Iterable[int]) -> Tuple[str, List[int]]:
 
 
 # ------------------------------- VPS programme scope ---------------------------
-def discover_programmes(db: BridgeClient,
-                       programme_id: Optional[int] = None,
-                       vps_ip: Optional[str] = None) -> List[Dict[str, Any]]:
-    """Return programmes bound to this VPS IP, plus active hosted followers.
+def discover_programmes(
+    db: BridgeClient,
+    programme_id: Optional[int] = None,
+    vps_ip: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Return only programmes bound to this VPS IP or active hosted followers.
 
-    The newest Signals Provider interest row is attached only as a status flag;
-    Begin Test never restricts which VPS-associated programmes are processed.
-    If the IP or required VPS schema cannot be verified, discovery fails closed.
+    Direct programme bindings must match both programme ID and owner user ID.
+    Active follower bindings are inherited only from a directly assigned owner.
+    --programme-id is applied after the VPS association has been established and
+    therefore can never bypass this guard. Missing IP or required VPS schema
+    returns an empty result (fail closed).
     """
     local_ip = str(vps_ip or detect_vps_ip() or "").strip()
     if not local_ip:
-        log.error("VPS scope unavailable: public IP could not be detected; refusing an unscoped programme scan")
+        log.error(
+            "VPS scope unavailable: public IP could not be detected; "
+            "refusing an unscoped programme scan"
+        )
         return []
     try:
         local_ip = str(ipaddress.ip_address(local_ip))
@@ -2121,8 +2301,23 @@ def discover_programmes(db: BridgeClient,
         log.error("VPS scope unavailable: invalid VPS IP %r; refusing an unscoped programme scan", local_ip)
         return []
 
+    if programme_id is not None:
+        try:
+            requested_programme_id = int(programme_id)
+        except (TypeError, ValueError, OverflowError):
+            log.error("Invalid --programme-id value %r; refusing programme discovery", programme_id)
+            return []
+        if requested_programme_id <= 0:
+            log.error("Invalid --programme-id value %r; programme IDs must be positive", programme_id)
+            return []
+    else:
+        requested_programme_id = None
+
     if not table_exists(db, "programme_vps"):
-        log.error("VPS scope unavailable: programme_vps table does not exist; refusing an unscoped programme scan")
+        log.error(
+            "VPS scope unavailable: programme_vps table does not exist; "
+            "refusing an unscoped programme scan"
+        )
         return []
 
     vps_columns = {name.lower() for name in get_columns(db, "programme_vps")}
@@ -2146,6 +2341,8 @@ def discover_programmes(db: BridgeClient,
         if pid and pid > 0 and uid and uid > 0:
             owner_user_by_programme[pid] = uid
 
+    # Only active followers of directly assigned owner programmes are included.
+    # A follower is never allowed to grant access to another host's programmes.
     roles: Dict[int, set[str]] = {pid: {"owner"} for pid in owner_user_by_programme}
     follower_owner: Dict[int, set[int]] = {}
     if owner_user_by_programme and table_exists(db, "programme_vps_hosts_followers"):
@@ -2195,6 +2392,7 @@ def discover_programmes(db: BridgeClient,
         uid = as_int(programme.get("userid"))
         if not pid or not uid or pid not in roles:
             continue
+
         # A direct VPS owner binding must still match programme.userid. Active
         # followers are independently owned and are allowed through their host.
         if "owner" in roles[pid] and owner_user_by_programme.get(pid) != uid:
@@ -2217,20 +2415,22 @@ def discover_programmes(db: BridgeClient,
         programme["begin_test_started_at"] = interest.get("signal_testing_started_at")
         output.append(programme)
 
-    if programme_id is not None:
-        output = [item for item in output if as_int(item.get("id")) == int(programme_id)]
+    # A requested programme is only a narrowing filter over the already-authorized
+    # list; it cannot cause an unassigned programme to be fetched or processed.
+    if requested_programme_id is not None:
+        output = [item for item in output if as_int(item.get("id")) == requested_programme_id]
 
     log.info(
         "VPS scope resolved: IP=%s | direct owner bindings=%s | associated programmes=%s%s",
         local_ip, len(owner_user_by_programme), len(output),
-        f" (programme filter {programme_id})" if programme_id is not None else "",
+        f" (programme filter {requested_programme_id})" if requested_programme_id is not None else "",
     )
     return output
 
 # ------------------------------- DB operations --------------------------------
 ANALYTICS_COLUMNS = [
     "programme_id", "userid", "symbol", "timeframe", "source_timeframe", "root_id", "root_name",
-    "confirmation_root_id", "confirmation_root_name", "family_number", "family_signature", "family_map_json",
+    "confirmation_root_id", "confirmation_root_name", "family_number", "setup_group_id", "rebuild_batch_token", "family_signature", "family_map_json",
     "match_json", "matched_family", "trade_configured", "live_trades", "order_type", "direction", "entry_name", "stoploss_name",
     "take_profit_name", "entry_anchor_time", "entry_trigger_time", "stoploss_time", "take_profit_time",
     "stoploss_trigger_time", "take_profit_trigger_time", "event_time", "entry_price", "stoploss_price",
@@ -2708,23 +2908,203 @@ def apply_account_management_trade_rules(
 
 
 def _analytics_identity(record: Dict[str, Any]) -> Dict[str, Any]:
-    """Stable identity used for scope-safe analytics reads/upserts."""
+    """Stable chart-family identity, including its setup group."""
     return {
         "programme_id": record.get("programme_id"),
-        "userid": record.get("userid"),
         "symbol": record.get("symbol"),
         "timeframe": record.get("timeframe"),
+        "source_timeframe": record.get("source_timeframe"),
         "root_id": record.get("root_id"),
         "confirmation_root_id": record.get("confirmation_root_id") or 0,
-        "source_timeframe": record.get("source_timeframe"),
+        "setup_group_id": record.get("setup_group_id"),
         "family_number": record.get("family_number"),
     }
 
 
 ANALYTICS_IDENTITY_COLUMNS = [
-    "programme_id", "userid", "symbol", "timeframe", "root_id",
-    "confirmation_root_id", "source_timeframe", "family_number",
+    "programme_id", "symbol", "timeframe", "source_timeframe", "root_id",
+    "confirmation_root_id", "setup_group_id", "family_number",
 ]
+
+
+ANALYTICS_INTEGER_COLUMNS = {
+    "programme_id", "userid", "root_id", "confirmation_root_id", "family_number",
+    "setup_group_id", "matched_family", "trade_configured", "live_trades",
+    "minimum_risk_reward_applied", "stoploss_hit", "profit_reached", "pending_entry",
+    "in_trade", "closed_trade", "restricted_date_hit", "restricted_day_hit",
+    "excluded_from_analytics", "breakeven_triggered", "breakeven_stop_hit",
+}
+ANALYTICS_DECIMAL_COLUMNS = {
+    "entry_price", "stoploss_price", "take_profit_price", "configured_take_profit_price",
+    "risk_reward", "configured_risk_reward", "trade_value_r",
+    "breakeven_floating_profit_rr", "breakeven_stop_rr", "breakeven_stop_price",
+    "max_floating_rr",
+}
+# Populated from information_schema for the active programme_analytics table.
+# Comparisons must use the precision MariaDB actually stores, not Python's
+# binary-float representation of the calculation result.
+ANALYTICS_DECIMAL_SCALES: Dict[str, int] = {}
+ANALYTICS_NUMERIC_TYPES: Dict[str, str] = {}
+ANALYTICS_NUMERIC_PRECISIONS: Dict[str, Optional[int]] = {}
+ANALYTICS_JSON_COLUMNS = {
+    "family_map_json", "match_json", "restricted_date_matches_json",
+    "restricted_day_matches_json",
+}
+ANALYTICS_TIME_COLUMNS = {
+    "entry_anchor_time", "entry_trigger_time", "stoploss_time", "take_profit_time",
+    "stoploss_trigger_time", "take_profit_trigger_time", "event_time",
+    "breakeven_trigger_time",
+}
+
+
+def _analytics_identity_key(record: Dict[str, Any]) -> Tuple[Any, ...]:
+    """Canonical, user-scoped chart-family key matching PHP's group identity."""
+    source_tf = record.get("source_timeframe")
+    if isinstance(source_tf, bytes):
+        source_tf = source_tf.decode("utf-8", errors="replace")
+    source_tf = None if source_tf is None else str(source_tf).strip().casefold()
+    symbol = str(record.get("symbol") or "").strip().casefold()
+    timeframe = str(record.get("timeframe") or "").strip().casefold()
+    return (
+        as_int(record.get("userid"), 0) or 0,
+        as_int(record.get("programme_id"), 0) or 0,
+        symbol,
+        timeframe,
+        source_tf,
+        as_int(record.get("root_id"), 0) or 0,
+        as_int(record.get("confirmation_root_id"), 0) or 0,
+        as_int(record.get("setup_group_id"), 1) or 1,
+        as_int(record.get("family_number"), 0) or 0,
+    )
+
+
+def load_analytics_decimal_metadata(db: BridgeClient) -> Dict[str, int]:
+    """Load real DECIMAL scales from MariaDB before any analytics comparison.
+
+    Python may calculate values such as 0.9497499999999998 while a DECIMAL(20,10)
+    column stores 0.9497500000. We must compare at the database column scale.
+    The metadata is refreshed for each programme run so schema changes are picked
+    up without hardcoded precision assumptions.
+    """
+    global ANALYTICS_DECIMAL_SCALES, ANALYTICS_NUMERIC_TYPES, ANALYTICS_NUMERIC_PRECISIONS
+
+    wanted = sorted(ANALYTICS_DECIMAL_COLUMNS)
+    placeholders = ",".join(["%s"] * len(wanted))
+    rows = db.fetch_all(
+        "SELECT `COLUMN_NAME` AS `column_name`, `DATA_TYPE` AS `data_type`, "
+        "`NUMERIC_PRECISION` AS `numeric_precision`, `NUMERIC_SCALE` AS `numeric_scale` "
+        "FROM `information_schema`.`COLUMNS` "
+        "WHERE `TABLE_SCHEMA`=DATABASE() AND `TABLE_NAME`='programme_analytics' "
+        f"AND `COLUMN_NAME` IN ({placeholders})",
+        wanted,
+        timeout=60,
+    )
+
+    numeric_types: Dict[str, str] = {}
+    numeric_precisions: Dict[str, Optional[int]] = {}
+    decimal_scales: Dict[str, int] = {}
+    for row in rows:
+        column = str(row.get("column_name") or "").strip().lower()
+        data_type = str(row.get("data_type") or "").strip().lower()
+        if not column:
+            continue
+        numeric_types[column] = data_type
+        numeric_precisions[column] = as_int(row.get("numeric_precision"), None)
+        if data_type in {"decimal", "numeric"}:
+            scale = as_int(row.get("numeric_scale"), None)
+            if scale is None or scale < 0:
+                raise RuntimeError(
+                    f"MariaDB returned no valid NUMERIC_SCALE for programme_analytics.{column}; "
+                    "refusing unsafe floating-point comparison."
+                )
+            decimal_scales[column] = scale
+
+    returned = set(numeric_types)
+    missing = sorted(set(wanted) - returned)
+    if missing:
+        raise RuntimeError(
+            "Could not load numeric column metadata for programme_analytics: "
+            + ", ".join(missing)
+            + ". Refusing analytics reconciliation because decimal precision is unknown."
+        )
+
+    ANALYTICS_DECIMAL_SCALES = decimal_scales
+    ANALYTICS_NUMERIC_TYPES = numeric_types
+    ANALYTICS_NUMERIC_PRECISIONS = numeric_precisions
+
+    decimal_summary = ", ".join(
+        f"{column}={scale}" for column, scale in sorted(decimal_scales.items())
+    )
+    non_decimal = sorted(
+        column for column, data_type in numeric_types.items()
+        if data_type not in {"decimal", "numeric"}
+    )
+    print(
+        "  programme_analytics numeric precision loaded from information_schema: "
+        f"DECIMAL scales [{decimal_summary or 'none'}]"
+        + (f" | non-DECIMAL numeric columns [{', '.join(non_decimal)}]" if non_decimal else "")
+    )
+    return dict(decimal_scales)
+
+
+def _canonical_analytics_value(column: str, value: Any) -> Any:
+    """Compare values at the actual MariaDB column precision.
+
+    DECIMAL values are quantized to information_schema.NUMERIC_SCALE using
+    MariaDB-compatible half-away-from-zero rounding (ROUND_HALF_UP). This removes
+    harmless Python float tails while still detecting differences at stored scale.
+    """
+    value = normalise_mysql_value(value)
+    if value is None:
+        return 0 if column == "confirmation_root_id" else None
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="replace")
+    if column in ANALYTICS_INTEGER_COLUMNS:
+        parsed = as_int(value)
+        return parsed if parsed is not None else str(value).strip()
+    if column in ANALYTICS_DECIMAL_COLUMNS:
+        try:
+            number = Decimal(str(value).strip())
+            if not number.is_finite():
+                return str(value).strip()
+            scale = ANALYTICS_DECIMAL_SCALES.get(column)
+            if scale is not None:
+                quantum = Decimal(1).scaleb(-scale)
+                precision = ANALYTICS_NUMERIC_PRECISIONS.get(column) or 0
+                digits = len(number.as_tuple().digits)
+                with localcontext() as context:
+                    context.prec = max(38, precision + scale + 4, digits + scale + 4)
+                    return number.quantize(quantum, rounding=ROUND_HALF_UP)
+            # FLOAT/DOUBLE columns do not expose a DECIMAL scale. Keep them
+            # numeric and normalize exponent/trailing-zero representation.
+            return number.normalize()
+        except (InvalidOperation, ValueError, TypeError):
+            return str(value).strip()
+    if column in ANALYTICS_JSON_COLUMNS:
+        if isinstance(value, (dict, list)):
+            parsed = value
+        else:
+            raw = str(value).strip()
+            try:
+                parsed = json.loads(raw)
+            except (ValueError, TypeError):
+                return raw
+        return json.dumps(parsed, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    if column in ANALYTICS_TIME_COLUMNS:
+        normalized = dt_text(value)
+        return normalized if normalized is not None else str(value).strip()
+    if column in {"symbol", "timeframe", "source_timeframe"}:
+        return str(value).strip().casefold()
+    return str(value) if not isinstance(value, (int, float, bool)) else value
+
+
+def analytics_records_equal(existing: Dict[str, Any], expected: Dict[str, Any]) -> bool:
+    """True only when every stored analytics field already equals this scan's result."""
+    return all(
+        _canonical_analytics_value(column, existing.get(column))
+        == _canonical_analytics_value(column, expected.get(column))
+        for column in ANALYTICS_COLUMNS
+    )
 
 
 def _unique_index_column_sets(db: BridgeClient, table: str) -> List[set]:
@@ -2757,157 +3137,1786 @@ def _has_exact_unique_identity(db: BridgeClient, table: str,
     return any(columns == target for columns in _unique_index_column_sets(db, table))
 
 
-def _identity_where(identity: Dict[str, Any], columns: Sequence[str]) -> Tuple[str, List[Any]]:
-    """Build an analytics identity predicate with NULL/0 confirmation parity.
+def _unique_index_definitions(db: BridgeClient, table: str) -> Dict[str, set]:
+    """Return unique indexes by name and their lower-case column sets."""
+    rows = db.fetch_all(f"SHOW INDEX FROM `{table}`", timeout=30)
+    grouped: Dict[str, List[Tuple[int, str]]] = {}
+    for row in rows:
+        if as_int(row.get("non_unique"), 1) != 0:
+            continue
+        name = str(row.get("key_name") or "").strip()
+        column = str(row.get("column_name") or "").strip().lower()
+        if not name or not column:
+            continue
+        sequence = as_int(row.get("seq_in_index"), 1) or 1
+        grouped.setdefault(name, []).append((sequence, column))
+    return {
+        name: {column for _sequence, column in sorted(items)}
+        for name, items in grouped.items() if items
+    }
 
-    Older analytics rows may store a root-only confirmation ID as NULL while
-    current rows use 0. They represent the same logical identity.
+
+def prepare_analytics_rebuild_state(
+    db: BridgeClient, programme_id: int, user_id: int, setup_group_limit: int
+) -> Dict[str, Any]:
+    """Capture every old analytics row and its group identity without deleting it.
+
+    The snapshot is used for incremental reconciliation: exact matches are left
+    untouched, changed identities are updated in place, and genuinely new
+    identities are inserted. Only old rows absent from the verified result set
+    are eligible for deletion at the end.
     """
-    parts: List[str] = []
-    values: List[Any] = []
-    for column in columns:
-        if column == "confirmation_root_id":
-            parts.append("COALESCE(`confirmation_root_id`,0)=%s")
-            value = identity.get(column)
-            values.append(0 if value in (None, "") else value)
-        else:
-            parts.append(f"`{column}`=%s")
-            values.append(identity.get(column))
-    return " AND ".join(parts), values
-
-
-def _insert_or_refresh_row(
-    db: BridgeClient,
-    table: str,
-    record: Dict[str, Any],
-    columns: Sequence[str],
-    identity_columns: Sequence[str],
-    has_unique_identity: bool,
-    label: str,
-) -> str:
-    """Insert or refresh one analytics identity without deleting history.
-
-    First locate an existing logical identity (including legacy NULL confirmation
-    IDs), then update it. Only a genuinely new identity is inserted. This avoids
-    duplicate root-only rows when an older row uses confirmation_root_id=NULL.
-    """
-    values = [record.get(column) for column in columns]
-    identity = {column: record.get(column) for column in identity_columns}
-    where_sql, where_values = _identity_where(identity, identity_columns)
-    insert_columns_sql = ",".join(f"`{column}`" for column in columns)
-    insert_marks = "(" + ",".join(["%s"] * len(columns)) + ")"
-    update_columns = [column for column in columns if column not in identity_columns]
-
-    existing = db.fetch_all(
-        f"SELECT 1 AS `found` FROM `{table}` WHERE {where_sql} LIMIT 1",
-        where_values, timeout=60,
-    )
-    if existing:
-        set_sql = ",".join(f"`{column}`=%s" for column in update_columns)
-        update_values = [record.get(column) for column in update_columns] + where_values
-        try:
-            db.execute(
-                f"UPDATE `{table}` SET {set_sql} WHERE {where_sql}",
-                update_values, timeout=120,
-            )
-            return "updated"
-        except BridgeError as exc:
-            log.warning(
-                "    %s: bridge does not permit refreshing this existing row; preserving history: %s",
-                label, str(exc)[:900],
-            )
-            return "preserved"
-
-    if has_unique_identity:
-        update_sql = ",".join(f"`{column}`=VALUES(`{column}`)" for column in update_columns)
-        upsert_sql = (
-            f"INSERT INTO `{table}` ({insert_columns_sql}) VALUES {insert_marks} "
-            f"ON DUPLICATE KEY UPDATE {update_sql}"
-        )
-        try:
-            db.query(upsert_sql, values, timeout=120)
-            return "upserted"
-        except BridgeError as exc:
-            log.warning(
-                "    %s: insert/upsert form rejected; trying insert-only for this new identity: %s",
-                label, str(exc)[:900],
-            )
-
-    db.query(
-        f"INSERT INTO `{table}` ({insert_columns_sql}) VALUES {insert_marks}",
-        values, timeout=120,
-    )
-    return "inserted"
-
-def persist_pair(db: BridgeClient, programme_id: int, user_id: int, symbol: str, timeframe: str,
-                 records: List[Dict[str, Any]]) -> Dict[str, int]:
-    """Persist analytics using each record's already-decided live/history flag."""
     if not table_exists(db, "programme_analytics"):
-        raise RuntimeError("Required table programme_analytics does not exist; create the analytics schema first.")
+        raise RuntimeError("Required table programme_analytics does not exist; refusing to start a fresh rebuild.")
 
-    columns = get_columns(db, "programme_analytics")
-    lower_columns = {str(column).lower() for column in columns}
+    limit = max(1, int(setup_group_limit or DEFAULT_TRADES_SETUP_PER_GROUP))
+    columns = {column.lower() for column in get_columns(db, "programme_analytics")}
+    if "family_number" not in columns:
+        raise RuntimeError("programme_analytics is missing required column family_number")
+
+    group_column_added = False
+    if "setup_group_id" not in columns:
+        db.execute(
+            "ALTER TABLE `programme_analytics` ADD COLUMN `setup_group_id` "
+            "BIGINT(20) UNSIGNED NOT NULL DEFAULT 1 AFTER `family_number`",
+            timeout=90,
+        )
+        columns.add("setup_group_id")
+        group_column_added = True
+        print("  Added programme_analytics.setup_group_id for chart-compatible setup grouping.")
+
+    if "rebuild_batch_token" not in columns:
+        db.execute(
+            "ALTER TABLE `programme_analytics` ADD COLUMN `rebuild_batch_token` "
+            "VARCHAR(64) NULL DEFAULT NULL AFTER `setup_group_id`",
+            timeout=90,
+        )
+        columns.add("rebuild_batch_token")
+        print("  Added nullable programme_analytics.rebuild_batch_token for interrupted-refresh cleanup.")
+
     for column, definition in ANALYTICS_ADDITIVE_COLUMNS.items():
-        if column.lower() not in lower_columns:
+        if column.lower() not in columns:
             db.execute(
                 f"ALTER TABLE `programme_analytics` ADD COLUMN `{column}` {definition}",
                 timeout=90,
             )
-            columns.append(column)
-            lower_columns.add(column.lower())
-    if "live_trades" not in lower_columns:
-        position = " AFTER `trade_configured`" if "trade_configured" in lower_columns else ""
-        try:
-            db.execute(
-                "ALTER TABLE `programme_analytics` ADD COLUMN `live_trades` TINYINT(1) NOT NULL DEFAULT 0" + position,
-                timeout=90,
-            )
-            columns = get_columns(db, "programme_analytics")
-            lower_columns = {str(column).lower() for column in columns}
-        except BridgeError as exc:
-            raise RuntimeError(
-                "programme_analytics.live_trades is missing and could not be added. "
-                "Run the programme_analytics_live_trades.sql migration. " + str(exc)
-            ) from exc
-
-    missing = [column for column in ANALYTICS_COLUMNS if column.lower() not in lower_columns]
-    if missing:
-        raise RuntimeError("programme_analytics is missing required column(s): " + ", ".join(missing))
-
-    counters = {"inserted": 0, "upserted": 0, "updated": 0, "preserved": 0}
-    unique_identity = _has_exact_unique_identity(db, "programme_analytics", ANALYTICS_IDENTITY_COLUMNS)
-    for record in _deduplicate_records(records):
-        record["live_trades"] = 1 if as_int(record.get("live_trades"), 0) == 1 else 0
-        status = _insert_or_refresh_row(
-            db, "programme_analytics", record, ANALYTICS_COLUMNS,
-            ANALYTICS_IDENTITY_COLUMNS, unique_identity,
-            f"{symbol} {timeframe.upper()} root {record.get('root_id')} family {record.get('family_number')}",
+            columns.add(column.lower())
+            print(f"  Added programme_analytics.{column} compatibility column.")
+    if "live_trades" not in columns:
+        position = " AFTER `trade_configured`" if "trade_configured" in columns else ""
+        db.execute(
+            "ALTER TABLE `programme_analytics` ADD COLUMN `live_trades` TINYINT(1) NOT NULL DEFAULT 0" + position,
+            timeout=90,
         )
-        counters[status] = counters.get(status, 0) + 1
+        columns.add("live_trades")
+        print("  Added programme_analytics.live_trades compatibility column.")
+    missing_columns = [column for column in ANALYTICS_COLUMNS if column.lower() not in columns]
+    if missing_columns:
+        raise RuntimeError(
+            "programme_analytics is missing required column(s): " + ", ".join(missing_columns)
+        )
+    if "id" not in columns:
+        raise RuntimeError(
+            "programme_analytics.id is required for safe row-level incremental cleanup; no rows were changed."
+        )
 
-    if not records:
-        log.info("    %s %s: no matched families to write; existing historical analytics were not deleted", symbol, timeframe.upper())
+    # Resolve actual precision before loading/comparing existing analytics.
+    # If metadata cannot be read, stop before writing rather than misclassifying
+    # exact database values as changed or accepting genuinely different values.
+    load_analytics_decimal_metadata(db)
+
+    # Remove only obsolete family unique indexes that omit setup_group_id. They
+    # would reject a valid family_number restart in a later group.
+    old_identity = {column for column in ANALYTICS_IDENTITY_COLUMNS if column != "setup_group_id"}
+    index_definitions = _unique_index_definitions(db, "programme_analytics")
+    for index_name, index_columns in index_definitions.items():
+        if (
+            index_name.lower() != "primary"
+            and "setup_group_id" not in index_columns
+            and old_identity.issubset(index_columns)
+        ):
+            if not re.fullmatch(r"[A-Za-z0-9_$]+", index_name):
+                raise RuntimeError(f"Unsafe analytics index name returned by database: {index_name!r}")
+            db.execute(f"ALTER TABLE `programme_analytics` DROP INDEX `{index_name}`", timeout=90)
+            print(f"  Replaced legacy analytics family index: {index_name}")
+
+    # Legacy rows with globally increasing family_number need one-time conversion
+    # into the same group/local numbering used by PHP. Rows carrying an old batch
+    # token are not rewritten here; the later comparison will retain them only if
+    # their identity/payload belongs to the current calculated dataset.
+    legacy_rows = 0
+    if group_column_added:
+        legacy_rows = 1
+    else:
+        check_rows = db.fetch_all(
+            "SELECT COUNT(*) AS `legacy_rows` FROM `programme_analytics` "
+            "WHERE `programme_id`=%s AND `userid`=%s AND `rebuild_batch_token` IS NULL "
+            "AND `family_number`>%s",
+            [programme_id, user_id, limit], timeout=60,
+        )
+        legacy_rows = as_int(check_rows[0].get("legacy_rows"), 0) if check_rows else 0
+    if legacy_rows:
+        db.execute(
+            "UPDATE `programme_analytics` SET `setup_group_id`=FLOOR((`family_number`-1)/%s)+1 "
+            "WHERE `programme_id`=%s AND `userid`=%s AND `rebuild_batch_token` IS NULL "
+            "AND `family_number`>%s",
+            [limit, programme_id, user_id, limit], timeout=120,
+        )
+        db.execute(
+            "UPDATE `programme_analytics` SET `family_number`=MOD(`family_number`-1,%s)+1 "
+            "WHERE `programme_id`=%s AND `userid`=%s AND `rebuild_batch_token` IS NULL "
+            "AND `family_number`>%s",
+            [limit, programme_id, user_id, limit], timeout=120,
+        )
+        print("  Migrated legacy global family numbers into setup_group_id + group-local family_number.")
+
+    # Ensure the unique identity includes the setup group, as the PHP analytics
+    # contract does. Fail closed if it cannot be installed; do not delete any rows.
+    index_definitions = _unique_index_definitions(db, "programme_analytics")
+    wanted = {column.lower() for column in ANALYTICS_IDENTITY_COLUMNS}
+    if not any(index_columns == wanted for index_columns in index_definitions.values()):
+        base_name = "uq_programme_analytics_family_group"
+        candidate = base_name
+        suffix = 2
+        while candidate in index_definitions:
+            candidate = f"{base_name}_{suffix}"
+            suffix += 1
+        db.execute(
+            f"CREATE UNIQUE INDEX `{candidate}` ON `programme_analytics` "
+            "(`programme_id`,`symbol`,`timeframe`,`source_timeframe`,`root_id`,"
+            "`confirmation_root_id`,`setup_group_id`,`family_number`)",
+            timeout=120,
+        )
+        print(f"  Verified group-aware analytics identity index: {candidate}")
+
+    group_rows = db.fetch_all(
+        "SELECT `symbol`,`timeframe`,`root_id`,COALESCE(`confirmation_root_id`,0) AS `confirmation_root_id`, "
+        "COALESCE(`source_timeframe`,'') AS `source_timeframe`,`setup_group_id`,COUNT(*) AS `row_count`, "
+        "MIN(`family_number`) AS `min_family_number`,MAX(`family_number`) AS `max_family_number` "
+        "FROM `programme_analytics` WHERE `programme_id`=%s AND `userid`=%s "
+        "GROUP BY `symbol`,`timeframe`,`root_id`,COALESCE(`confirmation_root_id`,0),"
+        "COALESCE(`source_timeframe`,''),`setup_group_id` "
+        "ORDER BY `symbol`,`timeframe`,`root_id`,COALESCE(`confirmation_root_id`,0),`setup_group_id`",
+        [programme_id, user_id], timeout=90,
+    )
+    highwater_rows = db.fetch_all(
+        "SELECT COUNT(*) AS `row_count`,COALESCE(MAX(`setup_group_id`),0) AS `max_group_id`, "
+        "COALESCE(MAX((`setup_group_id`-1)*%s+`family_number`),0) AS `max_global_ordinal`, "
+        "COALESCE(MAX(`family_number`),0) AS `max_family_number`, "
+        "SUM(CASE WHEN `rebuild_batch_token` IS NOT NULL THEN 1 ELSE 0 END) AS `leftover_staged_rows` "
+        "FROM `programme_analytics` WHERE `programme_id`=%s AND `userid`=%s",
+        [limit, programme_id, user_id], timeout=60,
+    )
+    highwater = highwater_rows[0] if highwater_rows else {}
+    old_row_count = as_int(highwater.get("row_count"), 0) or 0
+    old_max_group_id = as_int(highwater.get("max_group_id"), 0) or 0
+    old_max_global_ordinal = as_int(highwater.get("max_global_ordinal"), 0) or 0
+    old_max_family_number = as_int(highwater.get("max_family_number"), 0) or 0
+    leftover_staged_rows = as_int(highwater.get("leftover_staged_rows"), 0) or 0
+
+    # Capture each original row, including its primary key and complete analytics
+    # payload. This lets the next scan retain exact matches without writing them.
+    existing_select_columns = ["id"] + ANALYTICS_COLUMNS
+    existing_records = db.fetch_all(
+        "SELECT " + ",".join(f"`{column}`" for column in existing_select_columns) +
+        " FROM `programme_analytics` WHERE `programme_id`=%s AND `userid`=%s ORDER BY `id`",
+        [programme_id, user_id], timeout=120,
+    )
+    if len(existing_records) != old_row_count:
+        raise RuntimeError(
+            "Could not capture a consistent programme_analytics snapshot: "
+            f"count query returned {old_row_count:,}, row snapshot returned {len(existing_records):,}. "
+            "No analytics rows will be deleted."
+        )
+    existing_by_identity: Dict[Tuple[Any, ...], List[Dict[str, Any]]] = {}
+    for existing_record in existing_records:
+        existing_by_identity.setdefault(_analytics_identity_key(existing_record), []).append(existing_record)
+
+    print("\nEXISTING ANALYTICS GROUP SNAPSHOT (captured before incremental reconciliation)")
+    if not group_rows:
+        print("  No existing rows; the first fresh dataset will start at setup group 1, family 1.")
+    else:
+        print("  Symbol/TF | Root | Confirmation | Group | Rows | Family range")
+        for row in group_rows:
+            print(
+                f"  {str(row.get('symbol') or '')} {str(row.get('timeframe') or '').upper()} | "
+                f"{row.get('root_id')} | {row.get('confirmation_root_id')} | "
+                f"{row.get('setup_group_id')} | {as_int(row.get('row_count'),0) or 0:,} | "
+                f"{row.get('min_family_number')}–{row.get('max_family_number')}"
+            )
+        print(f"  Existing analytics rows: {old_row_count:,}; highest group: {old_max_group_id:,}; "
+              f"highest global family ordinal: {old_max_global_ordinal:,}.")
+    if leftover_staged_rows:
+        print(f"  Rows carrying a leftover refresh marker: {leftover_staged_rows:,}; "
+              "they will be compared with this scan and removed only if obsolete after verification.")
+
+    return {
+        "setup_group_limit": limit,
+        "existing_groups": group_rows,
+        "existing_rows": old_row_count,
+        "old_max_group_id": old_max_group_id,
+        "old_max_global_ordinal": old_max_global_ordinal,
+        "existing_records": existing_records,
+        "existing_by_identity": existing_by_identity,
+        "kept_existing_ids": set(),
+        "desired_records": {},
+    }
+
+
+ANALYTICS_INSERT_BATCH_SIZE = 50
+ANALYTICS_UPDATE_BATCH_SIZE = 20
+
+
+def _analytics_bulk_parallel_limit(db: BridgeClient) -> int:
+    """Read the Selenium bridge's bounded async-channel execution limit."""
+    cached = getattr(db, "_analytics_bulk_parallel_limit", None)
+    if cached is not None:
+        return int(cached)
+    limit = 1
+    try:
+        status = db.request({"op": "bridge_status"})
+        transport = str(status.get("transport") or "").lower()
+        safe_selenium_channels = (
+            transport == "selenium_webdriver"
+            and status.get("webdriver_io_serialized") is True
+        )
+        if safe_selenium_channels:
+            configured = as_int(status.get("max_parallel_sql_channels"), 1) or 1
+            limit = max(1, min(4, configured))
+    except Exception:
+        # Older bridge versions remain compatible but are restricted to one
+        # request at a time because they do not advertise safe channel dispatch.
+        limit = 1
+    setattr(db, "_analytics_bulk_parallel_limit", limit)
+    return limit
+
+
+def _run_analytics_bulk_jobs(
+    db: BridgeClient, jobs: Sequence[Tuple[str, Sequence[Any]]], label: str,
+) -> None:
+    """Run independent SQL batches across bounded Selenium DOM channels.
+
+    Each worker owns one persistent mysqlremote channel/window. Selenium
+    commands are serialized by the bridge, while each window's JavaScript fetch
+    continues asynchronously, allowing up to the bridge's configured number of
+    independent PHP/MySQL requests to be in flight at once.
+    """
+    if not jobs:
+        return
+
+    worker_count = min(_analytics_bulk_parallel_limit(db), len(jobs))
+    if worker_count <= 1:
+        print(
+            f"    {label.replace('_', ' ').title()}: {len(jobs)} SQL batch(es) "
+            "through one persistent Selenium channel"
+        )
+        for batch_number, (sql, params) in enumerate(jobs, start=1):
+            reply = db.query(sql, params, timeout=180)
+            affected = as_int(reply.get("affected_rows"), 0) or 0
+            query_id = reply.get("query_id") or "not returned"
+            print(
+                f"      {label.replace('_', ' ')} batch {batch_number:,}/{len(jobs):,} "
+                f"SQL succeeded | query_id={query_id} | affected_rows={affected:,}"
+            )
+        return
+
+    # Assign multiple batches to each worker so a Selenium DOM window is
+    # created once and reused, rather than opening/closing a window per batch.
+    worker_jobs: List[List[Tuple[int, Tuple[str, Sequence[Any]]]]] = [
+        [] for _ in range(worker_count)
+    ]
+    for index, job in enumerate(jobs):
+        worker_jobs[index % worker_count].append((index + 1, job))
+
+    print(
+        f"    {label.replace('_', ' ').title()}: {len(jobs)} SQL batch(es) "
+        f"across {worker_count} Selenium channels (browser fetches async)"
+    )
+
+    def run_worker(worker_index: int, assigned: Sequence[Tuple[int, Tuple[str, Sequence[Any]]]]) -> None:
+        client = BridgeClient(
+            host=db.host,
+            port=db.port,
+            owner=f"{db.owner}_{label}_{worker_index + 1}",
+        )
+        try:
+            total = len(assigned)
+            for local_index, (_global_index, (sql, params)) in enumerate(assigned, start=1):
+                reply = client.query(sql, params, timeout=180)
+                affected = as_int(reply.get("affected_rows"), 0) or 0
+                query_id = reply.get("query_id") or "not returned"
+                print(
+                    f"      {label.replace('_', ' ')} channel {worker_index + 1}: "
+                    f"batch {local_index:,}/{total:,} SQL succeeded | "
+                    f"query_id={query_id} | affected_rows={affected:,}"
+                )
+        finally:
+            client.close()
+
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        futures = [
+            executor.submit(run_worker, worker_index, assigned)
+            for worker_index, assigned in enumerate(worker_jobs)
+            if assigned
+        ]
+        # Resolve all workers. A failure stops verification/deletion; already
+        # committed rows are detected by the next scan's stable identity check.
+        for future in futures:
+            future.result()
+
+
+def _flush_analytics_insert_batches(
+    db: BridgeClient, pending: Sequence[Dict[str, Any]], columns: Sequence[str],
+    programme_id: int, user_id: int,
+) -> int:
+    """Insert new analytics identities with multi-row INSERT batches via Selenium."""
+    del programme_id, user_id  # already embedded in each prepared record
+    jobs: List[Tuple[str, Sequence[Any]]] = []
+    insert_columns_sql = ",".join(f"`{column}`" for column in columns)
+    row_marks = "(" + ",".join(["%s"] * len(columns)) + ")"
+    for offset in range(0, len(pending), ANALYTICS_INSERT_BATCH_SIZE):
+        chunk = pending[offset:offset + ANALYTICS_INSERT_BATCH_SIZE]
+        values_sql = ",".join(row_marks for _ in chunk)
+        params: List[Any] = []
+        for record in chunk:
+            params.extend(record.get(column) for column in columns)
+        sql = (
+            f"INSERT INTO `programme_analytics` ({insert_columns_sql}) "
+            f"VALUES {values_sql}"
+        )
+        jobs.append((sql, params))
+    _run_analytics_bulk_jobs(db, jobs, "analytics_insert")
+    print(f"    Analytics bulk insert complete: {len(pending):,} new row(s)")
+    return len(pending)
+
+def _flush_analytics_update_batches(
+    db: BridgeClient,
+    pending: Sequence[Tuple[int, Dict[str, Any], Sequence[str]]],
+    columns: Sequence[str], programme_id: int, user_id: int,
+) -> int:
+    """Update changed analytics rows in CASE/WHEN batches via Selenium."""
+    jobs: List[Tuple[str, Sequence[Any]]] = []
+    excluded = {"programme_id", "userid"}
+    for offset in range(0, len(pending), ANALYTICS_UPDATE_BATCH_SIZE):
+        chunk = pending[offset:offset + ANALYTICS_UPDATE_BATCH_SIZE]
+        set_parts: List[str] = []
+        params: List[Any] = []
+        changed_by_row = {
+            row_id: set(changed_columns)
+            for row_id, _record, changed_columns in chunk
+        }
+        rows_by_id = {row_id: record for row_id, record, _changed in chunk}
+
+        for column in columns:
+            if column in excluded:
+                continue
+            pairs = [
+                (row_id, rows_by_id[row_id].get(column))
+                for row_id, changed in changed_by_row.items()
+                if column in changed
+            ]
+            if not pairs:
+                continue
+            case_sql = "CASE `id` " + " ".join("WHEN %s THEN %s" for _ in pairs)
+            case_sql += f" ELSE `{column}` END"
+            set_parts.append(f"`{column}`={case_sql}")
+            for row_id, value in pairs:
+                params.extend([row_id, value])
+
+        if not set_parts:
+            continue
+
+        ids = [row_id for row_id, _record, _changed in chunk]
+        where_marks = ",".join(["%s"] * len(ids))
+        params.extend(ids)
+        params.extend([programme_id, user_id])
+        sql = (
+            "UPDATE `programme_analytics` SET " + ",".join(set_parts) +
+            f" WHERE `id` IN ({where_marks}) "
+            "AND `programme_id`=%s AND `userid`=%s"
+        )
+        jobs.append((sql, params))
+
+    _run_analytics_bulk_jobs(db, jobs, "analytics_update")
+    print(f"    Analytics bulk update complete: {len(pending):,} changed row(s)")
+    return len(pending)
+
+def persist_pair(
+    db: BridgeClient, programme_id: int, user_id: int, symbol: str, timeframe: str,
+    records: List[Dict[str, Any]], rebuild_state: Dict[str, Any],
+    setup_group_limit: int = DEFAULT_TRADES_SETUP_PER_GROUP,
+) -> Dict[str, int]:
+    """Incrementally reconcile analytics, preserving exact rows and batching writes.
+
+    Identical identity + identical payload => keep the exact old row untouched.
+    Existing identity + changed payload => update the same row in a CASE batch.
+    Missing identity => insert only that row in a multi-row INSERT batch.
+    Old rows are deleted only after the complete desired data has been verified.
+    """
+    counters = {"inserted": 0, "updated": 0, "unchanged": 0}
+    existing_by_identity = rebuild_state["existing_by_identity"]
+    kept_ids = rebuild_state["kept_existing_ids"]
+    desired_records = rebuild_state["desired_records"]
+    columns = ANALYTICS_COLUMNS
+    pending_inserts: List[Dict[str, Any]] = []
+    pending_updates: List[Tuple[int, Dict[str, Any], Sequence[str]]] = []
+
+    for source_record in _deduplicate_records(records):
+        record = {column: source_record.get(column) for column in columns}
+        record["programme_id"] = int(programme_id)
+        record["userid"] = int(user_id)
+        record["symbol"] = str(record.get("symbol") or symbol)
+        record["timeframe"] = str(record.get("timeframe") or timeframe).lower()
+        record["live_trades"] = 1 if as_int(record.get("live_trades"), 0) == 1 else 0
+        record["rebuild_batch_token"] = None
+
+        group_id = as_int(record.get("setup_group_id"), 0) or 0
+        family_number = as_int(record.get("family_number"), 0) or 0
+        if group_id <= 0 or family_number <= 0 or family_number > max(1, int(setup_group_limit)):
+            ordinal = as_int(source_record.get("family_ordinal"), 0) or 0
+            if ordinal <= 0:
+                raise RuntimeError(
+                    f"{symbol} {timeframe.upper()}: analytics row has invalid setup-group identity "
+                    f"(group={group_id}, family={family_number}, ordinal={ordinal})."
+                )
+            group_id = ((ordinal - 1) // max(1, int(setup_group_limit))) + 1
+            family_number = ((ordinal - 1) % max(1, int(setup_group_limit))) + 1
+            record["setup_group_id"] = group_id
+            record["family_number"] = family_number
+
+        key = _analytics_identity_key(record)
+        if key in desired_records:
+            if analytics_records_equal(desired_records[key], record):
+                counters["unchanged"] += 1
+                continue
+            raise RuntimeError(
+                f"Duplicate calculated analytics identity in {symbol} {timeframe.upper()}: {key!r}"
+            )
+        desired_records[key] = dict(record)
+
+        candidates = existing_by_identity.get(key, [])
+        identical = next(
+            (row for row in candidates if analytics_records_equal(row, record)), None
+        )
+        if identical is not None:
+            old_id = as_int(identical.get("id"), 0) or 0
+            if old_id <= 0:
+                raise RuntimeError("Existing identical analytics row has no valid primary key id.")
+            kept_ids.add(old_id)
+            counters["unchanged"] += 1
+            continue
+
+        if candidates:
+            target = min(
+                candidates,
+                key=lambda row: as_int(row.get("id"), 2**63 - 1) or 2**63 - 1,
+            )
+            old_id = as_int(target.get("id"), 0) or 0
+            if old_id <= 0:
+                raise RuntimeError(
+                    "Existing analytics row has no valid primary key id; refusing duplicate insert."
+                )
+            changed_columns = [
+                column for column in columns
+                if column not in {"programme_id", "userid"}
+                and _canonical_analytics_value(column, target.get(column))
+                != _canonical_analytics_value(column, record.get(column))
+            ]
+            if changed_columns:
+                pending_updates.append((old_id, dict(record), changed_columns))
+                counters["updated"] += 1
+            else:
+                counters["unchanged"] += 1
+            kept_ids.add(old_id)
+            target.update(record)
+            target["id"] = old_id
+        else:
+            pending_inserts.append(dict(record))
+            counters["inserted"] += 1
+
+    # Each bulk statement is submitted as one SQL operation through the
+    # Selenium-controlled PHP interface. Writes are never replayed
+    # automatically after an ambiguous browser/transport failure; the next
+    # scan safely recognises any rows that did reach MySQL.
+    if pending_updates:
+        _flush_analytics_update_batches(
+            db, pending_updates, columns, programme_id, user_id
+        )
+    if pending_inserts:
+        _flush_analytics_insert_batches(
+            db, pending_inserts, columns, programme_id, user_id
+        )
+
     return counters
 
+def _analytics_diagnostic_value(value: Any, max_length: int = 180) -> str:
+    """Compact, unambiguous representation of a database value for console diagnostics."""
+    value = normalise_mysql_value(value)
+    if value is None:
+        rendered = "NULL"
+    elif isinstance(value, (dict, list, tuple)):
+        try:
+            rendered = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+        except Exception:
+            rendered = repr(value)
+    elif isinstance(value, str):
+        rendered = repr(value)
+    else:
+        rendered = repr(value)
+    if len(rendered) > max_length:
+        rendered = rendered[:max_length - 3] + "..."
+    return rendered
 
-def reset_programme_live_trades(db: BridgeClient, programme_id: int, user_id: int) -> int:
-    """Set all existing analytics for this programme to History before recalculation."""
-    if not table_exists(db, "programme_analytics"):
-        return 0
-    columns = {name.lower() for name in get_columns(db, "programme_analytics")}
-    if "live_trades" not in columns:
-        # persist_pair() adds the column if needed; its default is History (0).
-        return 0
-    return db.execute(
-        "UPDATE `programme_analytics` SET `live_trades`=0 "
-        "WHERE `programme_id`=%s AND `userid`=%s",
+
+def _analytics_record_differences(
+    actual: Dict[str, Any], expected: Dict[str, Any]
+) -> List[Tuple[str, Any, Any]]:
+    """Return field-level (column, expected, actual) differences after canonicalization."""
+    differences: List[Tuple[str, Any, Any]] = []
+    for column in ANALYTICS_COLUMNS:
+        expected_value = expected.get(column)
+        actual_value = actual.get(column)
+        if _canonical_analytics_value(column, actual_value) != _canonical_analytics_value(column, expected_value):
+            differences.append((column, expected_value, actual_value))
+    return differences
+
+
+def verify_incremental_analytics_dataset(
+    db: BridgeClient, programme_id: int, user_id: int,
+    desired_records: Dict[Tuple[Any, ...], Dict[str, Any]],
+) -> int:
+    """Verify every desired analytics identity and print exact field differences."""
+    columns = ["id"] + ANALYTICS_COLUMNS
+    current_rows = db.fetch_all(
+        "SELECT " + ",".join(f"`{column}`" for column in columns) +
+        " FROM `programme_analytics` WHERE `programme_id`=%s AND `userid`=%s ORDER BY `id`",
         [programme_id, user_id], timeout=120,
+    )
+    current_by_identity: Dict[Tuple[Any, ...], List[Dict[str, Any]]] = {}
+    for row in current_rows:
+        current_by_identity.setdefault(_analytics_identity_key(row), []).append(row)
+
+    missing: List[Tuple[Any, ...]] = []
+    mismatched: List[Tuple[Any, ...]] = []
+    mismatch_column_counts: Dict[str, int] = {}
+    mismatch_column_examples: Dict[str, Tuple[Tuple[Any, ...], int, Any, Any]] = {}
+    mismatch_samples: List[Tuple[Tuple[Any, ...], int, List[Tuple[str, Any, Any]], int]] = []
+    duplicate_candidate_identities = 0
+
+    for key, expected in desired_records.items():
+        candidates = current_by_identity.get(key, [])
+        if not candidates:
+            missing.append(key)
+            continue
+        if len(candidates) > 1:
+            duplicate_candidate_identities += 1
+        candidate_differences = [
+            (row, _analytics_record_differences(row, expected)) for row in candidates
+        ]
+        exact = next((row for row, differences in candidate_differences if not differences), None)
+        if exact is not None:
+            continue
+
+        mismatched.append(key)
+        # Pick the closest persisted candidate so diagnostics describe the
+        # smallest actionable difference, even when legacy duplicate identities exist.
+        best_row, best_differences = min(
+            candidate_differences,
+            key=lambda item: (len(item[1]), as_int(item[0].get("id"), 2**63 - 1) or 2**63 - 1),
+        )
+        row_id = as_int(best_row.get("id"), 0) or 0
+        mismatch_samples.append((key, row_id, best_differences, len(candidates)))
+        for column, expected_value, actual_value in best_differences:
+            mismatch_column_counts[column] = mismatch_column_counts.get(column, 0) + 1
+            mismatch_column_examples.setdefault(
+                column, (key, row_id, expected_value, actual_value)
+            )
+
+    print(
+        f"  Incremental analytics verification: expected={len(desired_records):,} | "
+        f"database rows read={len(current_rows):,} | identities found={len(current_by_identity):,} | "
+        f"missing={len(missing):,} | payload mismatches={len(mismatched):,}"
+    )
+    if duplicate_candidate_identities:
+        print(
+            f"  Verification note: {duplicate_candidate_identities:,} desired identity/identities "
+            "have multiple database rows; closest candidate shown in diagnostics."
+        )
+
+    if missing or mismatched:
+        print("  ANALYTICS VERIFICATION DIAGNOSTICS — exact stored-vs-expected differences")
+        if missing:
+            print(f"    Missing identity count: {len(missing):,}")
+            for key in missing[:10]:
+                print(f"      MISSING identity={key!r}")
+            if len(missing) > 10:
+                print(f"      ... {len(missing) - 10:,} additional missing identities omitted")
+
+        if mismatched:
+            print(
+                f"    Mismatched identity count: {len(mismatched):,}; "
+                f"distinct mismatched columns: {len(mismatch_column_counts):,}"
+            )
+            for column, count in sorted(
+                mismatch_column_counts.items(), key=lambda item: (-item[1], item[0])
+            ):
+                key, row_id, expected_value, actual_value = mismatch_column_examples[column]
+                print(
+                    f"      COLUMN `{column}` differs in {count:,}/{len(mismatched):,} rows | "
+                    f"sample row_id={row_id} | expected={_analytics_diagnostic_value(expected_value)} | "
+                    f"database={_analytics_diagnostic_value(actual_value)} | identity={key!r}"
+                )
+
+            print("    Representative mismatched records:")
+            for key, row_id, differences, candidate_count in mismatch_samples[:5]:
+                print(
+                    f"      row_id={row_id} | identity={key!r} | "
+                    f"same-identity database rows={candidate_count} | "
+                    f"different columns={len(differences)}"
+                )
+                for column, expected_value, actual_value in differences[:20]:
+                    print(
+                        f"        `{column}`: expected={_analytics_diagnostic_value(expected_value)}; "
+                        f"database={_analytics_diagnostic_value(actual_value)}"
+                    )
+                if len(differences) > 20:
+                    print(f"        ... {len(differences) - 20:,} additional differing columns omitted")
+            if len(mismatch_samples) > 5:
+                print(f"      ... {len(mismatch_samples) - 5:,} additional mismatched records omitted")
+
+        raise RuntimeError(
+            "Incremental analytics verification failed. Existing analytics have NOT been deleted. "
+            f"Missing={len(missing):,}, mismatched={len(mismatched):,}. "
+            "See ANALYTICS VERIFICATION DIAGNOSTICS above for exact columns and values."
+        )
+    return len(desired_records)
+
+
+def delete_obsolete_analytics_rows(
+    db: BridgeClient, programme_id: int, user_id: int,
+    existing_records: Sequence[Dict[str, Any]], kept_existing_ids: set,
+) -> int:
+    """Delete only captured old rows not represented by the fully verified dataset."""
+    obsolete_ids = sorted({
+        as_int(row.get("id"), 0) or 0
+        for row in existing_records
+        if (as_int(row.get("id"), 0) or 0) > 0
+        and (as_int(row.get("id"), 0) or 0) not in kept_existing_ids
+    })
+    if not obsolete_ids:
+        print("  Obsolete old analytics rows: 0 — every existing row is still represented; nothing to delete.")
+        return 0
+
+    deleted = 0
+    for offset in range(0, len(obsolete_ids), 100):
+        chunk = obsolete_ids[offset:offset + 100]
+        marks = ",".join(["%s"] * len(chunk))
+        deleted += db.execute(
+            "DELETE FROM `programme_analytics` WHERE `programme_id`=%s AND `userid`=%s "
+            f"AND `id` IN ({marks})",
+            [programme_id, user_id, *chunk], timeout=120,
+        )
+    remaining_count = 0
+    for offset in range(0, len(obsolete_ids), 100):
+        chunk = obsolete_ids[offset:offset + 100]
+        marks = ",".join(["%s"] * len(chunk))
+        remaining = db.fetch_all(
+            "SELECT COUNT(*) AS `remaining_obsolete` FROM `programme_analytics` "
+            f"WHERE `programme_id`=%s AND `userid`=%s AND `id` IN ({marks})",
+            [programme_id, user_id, *chunk], timeout=90,
+        )
+        remaining_count += as_int(remaining[0].get("remaining_obsolete"), 0) if remaining else 0
+    if (remaining_count or 0) != 0:
+        raise RuntimeError(
+            f"Obsolete analytics cleanup incomplete: {remaining_count} old row(s) remain. "
+            "All verified current analytics rows have been preserved."
+        )
+    return deleted
+
+
+def verify_final_analytics_row_count(
+    db: BridgeClient, programme_id: int, user_id: int, expected_rows: int,
+) -> int:
+    rows = db.fetch_all(
+        "SELECT COUNT(*) AS `row_count` FROM `programme_analytics` "
+        "WHERE `programme_id`=%s AND `userid`=%s",
+        [programme_id, user_id], timeout=90,
+    )
+    actual = as_int(rows[0].get("row_count"), 0) if rows else 0
+    actual = max(0, actual or 0)
+    if actual != expected_rows:
+        raise RuntimeError(
+            f"Final incremental analytics count mismatch: expected={expected_rows:,}, found={actual:,}."
+        )
+    print(f"  Final analytics verification: {actual:,} row(s) match the current calculated dataset.")
+    return actual
+
+
+
+# ---------------------- Programme Trades first-stage sync -------------------
+PROGRAMME_TRADE_REQUEST_COLUMNS = {
+    "order_request_status": "VARCHAR(64) NULL DEFAULT NULL",
+    "order_request_filled": "TINYINT(1) NOT NULL DEFAULT 0",
+    "order_request_filled_failure_reason": "VARCHAR(500) NULL DEFAULT NULL",
+}
+
+
+def _first_record_value(record: Dict[str, Any], names: Sequence[str]) -> Any:
+    """PHP pa_firstRowValue parity: zero and False are valid populated values."""
+    for name in names:
+        if name in record and record[name] is not None and record[name] != "":
+            return record[name]
+    return None
+
+
+def _resolve_programme_trade_timeframe(
+    record: Dict[str, Any], roots: Sequence[Dict[str, Any]]
+) -> str:
+    """Mirror programme_analytics.php pa_resolveChartTimeframe()."""
+    root_id = as_int(record.get("root_id"), 0) or 0
+    confirmation_id = as_int(record.get("confirmation_root_id"), 0) or 0
+    root = next((item for item in roots if (as_int(item.get("id"), 0) or 0) == root_id), None)
+    configured: List[str] = []
+    if confirmation_id > 0 and root:
+        for confirmation in root.get("confirmationRoots") or []:
+            if (as_int(confirmation.get("id"), 0) or 0) == confirmation_id:
+                configured = [str(value).strip().lower() for value in (confirmation.get("timeframes") or [])]
+                break
+    elif root:
+        configured = [str(value).strip().lower() for value in (root.get("timeframes") or [])]
+
+    candidates = [
+        str(record.get("timeframe") or "").strip().lower(),
+        str(record.get("source_timeframe") or "").strip().lower(),
+    ]
+    for candidate in candidates:
+        if candidate and candidate in configured:
+            return candidate
+    if confirmation_id > 0:
+        return candidates[1] or candidates[0]
+    return candidates[0] or candidates[1]
+
+
+def _schema_column_exists(db: BridgeClient, table: str, column: str) -> bool:
+    rows = db.fetch_all(
+        "SELECT COUNT(*) AS `n` FROM `information_schema`.`COLUMNS` "
+        "WHERE `TABLE_SCHEMA`=DATABASE() AND `TABLE_NAME`=" + sql_literal(table) +
+        " AND `COLUMN_NAME`=" + sql_literal(column),
+        timeout=60,
+    )
+    return bool(rows and (as_int(rows[0].get("n"), 0) or 0) > 0)
+
+
+def _schema_index_columns(db: BridgeClient, table: str, index_name: str) -> Optional[Tuple[str, ...]]:
+    rows = db.fetch_all(f"SHOW INDEX FROM `{table}`", timeout=90)
+    found = [
+        row for row in rows
+        if str(row.get("key_name") or "").strip().lower() == index_name.lower()
+    ]
+    if not found:
+        return None
+    found.sort(key=lambda row: as_int(row.get("seq_in_index"), 0) or 0)
+    return tuple(str(row.get("column_name") or "").strip().lower() for row in found)
+
+
+def _execute_ddl_and_verify(
+    db: BridgeClient,
+    sql: str,
+    description: str,
+    verifier,
+    timeout: float = 240,
+) -> None:
+    """Run DDL once, then verify server state even if Selenium lost its response.
+
+    A browser AbortController can lose the HTTP response after MariaDB commits
+    DDL. Do not blindly replay that write: read the resulting schema and accept
+    it only when the requested change is demonstrably present.
+    """
+    write_error: Optional[Exception] = None
+    try:
+        db.execute(sql, timeout=timeout)
+    except Exception as exc:
+        write_error = exc
+
+    try:
+        applied = bool(verifier())
+    except Exception as verify_exc:
+        if write_error is not None:
+            raise RuntimeError(
+                f"{description}: DDL response was lost and schema verification also failed: "
+                f"{verify_exc}. Original DDL error: {write_error}"
+            ) from write_error
+        raise RuntimeError(f"{description}: could not verify database schema: {verify_exc}") from verify_exc
+
+    if applied:
+        if write_error is not None:
+            print(
+                f"  Verified {description}: MariaDB applied the change despite the lost "
+                "Selenium/PHP response; the DDL was NOT replayed."
+            )
+        return
+
+    if write_error is not None:
+        raise RuntimeError(
+            f"{description}: DDL failed and the requested schema change is not present. "
+            f"The write was not replayed. Original error: {write_error}"
+        ) from write_error
+    raise RuntimeError(f"{description}: SQL returned but the expected schema change is absent.")
+
+
+def ensure_programme_trade_sync_schema(db: BridgeClient) -> None:
+    """Ensure trade-sync schema, tolerating a lost DDL acknowledgement safely."""
+    if not table_exists(db, "programme_trades"):
+        raise RuntimeError(
+            "Required table programme_trades does not exist; refusing to continue to analytics writes."
+        )
+
+    # One SHOW COLUMNS lookup replaces repeated per-column metadata requests.
+    trade_columns = {column.lower() for column in get_columns(db, "programme_trades")}
+    additions = [
+        ("contract_id", "BIGINT(20) UNSIGNED NOT NULL DEFAULT 1", " AFTER `programmeid`"),
+        ("setup_group_id", "BIGINT(20) UNSIGNED NOT NULL DEFAULT 1", " AFTER `contract_id`"),
+        ("chart_identity_hash", "CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NULL DEFAULT NULL", " AFTER `tradeid`"),
+        ("live", "TINYINT(1) NOT NULL DEFAULT 0 COMMENT '1=Live, 0=History'", " AFTER `tradeid`"),
+        ("trade_time", "DATETIME NULL DEFAULT NULL", " AFTER `live`"),
+    ]
+    for column, definition, position in additions:
+        if column not in trade_columns:
+            _execute_ddl_and_verify(
+                db,
+                f"ALTER TABLE `programme_trades` ADD COLUMN `{column}` {definition}{position}",
+                f"programme_trades.{column}",
+                lambda column=column: _schema_column_exists(db, "programme_trades", column),
+                timeout=240,
+            )
+            trade_columns.add(column)
+            print(f"  Added/verified programme_trades.{column} compatibility column.")
+
+    for column, definition in PROGRAMME_TRADE_REQUEST_COLUMNS.items():
+        if column not in trade_columns:
+            _execute_ddl_and_verify(
+                db,
+                f"ALTER TABLE `programme_trades` ADD COLUMN `{column}` {definition}",
+                f"programme_trades.{column}",
+                lambda column=column: _schema_column_exists(db, "programme_trades", column),
+                timeout=240,
+            )
+            trade_columns.add(column)
+            print(f"  Added/verified programme_trades.{column} compatibility column.")
+
+    required_trade_columns = {
+        "id", "userid", "programmeid", "contract_id", "setup_group_id", "investor_id",
+        "tradeid", "chart_identity_hash", "symbol", "ordertype", "orderstatus", "timeframe", "entry", "stoploss",
+        "takeprofit", "trade_risk_reward", "pnl", "pnl_risk_reward", "trade_status", "live",
+        "trade_time", "order_request_status", "order_request_filled",
+        "order_request_filled_failure_reason",
+    }
+    actual_trade_columns = trade_columns
+    missing = sorted(required_trade_columns - actual_trade_columns)
+    if missing:
+        raise RuntimeError(
+            "programme_trades is missing required PHP-compatible column(s): " + ", ".join(missing)
+        )
+
+    # Optional lookup index: verify post-write state if the Selenium response is lost.
+    try:
+        expected_contract_index = ("userid", "programmeid", "contract_id")
+        actual_contract_index = _schema_index_columns(db, "programme_trades", "idx_programme_trades_contract")
+        if actual_contract_index is None:
+            _execute_ddl_and_verify(
+                db,
+                "ALTER TABLE `programme_trades` ADD KEY `idx_programme_trades_contract` "
+                "(`userid`,`programmeid`,`contract_id`)",
+                "programme_trades.idx_programme_trades_contract",
+                lambda: _schema_index_columns(db, "programme_trades", "idx_programme_trades_contract")
+                    == expected_contract_index,
+                timeout=240,
+            )
+        elif actual_contract_index != expected_contract_index:
+            raise RuntimeError(f"existing contract index has unexpected columns: {actual_contract_index}")
+    except Exception as exc:
+        log.warning("  Programme trades contract lookup index warning: %s", str(exc).splitlines()[0][:500])
+
+    # Required unique index for safe batch insert + exact generated-ID lookup.
+    expected_hash_index = ("userid", "programmeid", "chart_identity_hash")
+    actual_hash_index = _schema_index_columns(db, "programme_trades", "uniq_programme_trades_chart_hash")
+    if actual_hash_index is None:
+        _execute_ddl_and_verify(
+            db,
+            "ALTER TABLE `programme_trades` ADD UNIQUE KEY `uniq_programme_trades_chart_hash` "
+            "(`userid`,`programmeid`,`chart_identity_hash`)",
+            "programme_trades.uniq_programme_trades_chart_hash",
+            lambda: _schema_index_columns(db, "programme_trades", "uniq_programme_trades_chart_hash")
+                == expected_hash_index,
+            timeout=300,
+        )
+    elif actual_hash_index != expected_hash_index:
+        raise RuntimeError(
+            "programme_trades.uniq_programme_trades_chart_hash exists with unexpected columns: "
+            f"{actual_hash_index}; expected {expected_hash_index}."
+        )
+
+    identity_table_sql = (
+        "CREATE TABLE IF NOT EXISTS `programme_trade_chart_identity` ("
+        "`programme_trade_id` BIGINT(20) UNSIGNED NOT NULL,"
+        "`userid` BIGINT(20) UNSIGNED NOT NULL,"
+        "`programmeid` BIGINT(20) UNSIGNED NOT NULL,"
+        "`contract_id` BIGINT(20) UNSIGNED NOT NULL DEFAULT 1,"
+        "`identity_hash` CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,"
+        "`chart_trade_id` VARCHAR(255) NULL DEFAULT NULL,"
+        "`root_id` BIGINT(20) UNSIGNED NULL DEFAULT NULL,"
+        "`confirmation_root_id` BIGINT(20) UNSIGNED NULL DEFAULT NULL,"
+        "`family_number` BIGINT(20) UNSIGNED NULL DEFAULT NULL,"
+        "`setup_group_id` BIGINT(20) UNSIGNED NOT NULL DEFAULT 1,"
+        "`family_signature` TEXT NULL,"
+        "`symbol` VARCHAR(64) NOT NULL,"
+        "`timeframe` VARCHAR(32) NOT NULL,"
+        "`source_timeframe` VARCHAR(32) NULL DEFAULT NULL,"
+        "`entry_anchor_time` VARCHAR(40) NULL DEFAULT NULL,"
+        "`entry_trigger_time` VARCHAR(40) NULL DEFAULT NULL,"
+        "`outcome` VARCHAR(64) NULL DEFAULT NULL,"
+        "`created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+        "`updated_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,"
+        "PRIMARY KEY (`programme_trade_id`),"
+        "UNIQUE KEY `uniq_programme_trade_chart_identity` (`userid`,`programmeid`,`identity_hash`),"
+        "KEY `idx_programme_trade_chart_root` (`userid`,`programmeid`,`root_id`,`confirmation_root_id`),"
+        "KEY `idx_programme_trade_chart_contract` (`userid`,`programmeid`,`contract_id`)"
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci"
+    )
+    if not table_exists(db, "programme_trade_chart_identity"):
+        _execute_ddl_and_verify(
+            db,
+            identity_table_sql,
+            "programme_trade_chart_identity table",
+            lambda: table_exists(db, "programme_trade_chart_identity"),
+            timeout=300,
+        )
+
+    identity_columns = {column.lower() for column in get_columns(db, "programme_trade_chart_identity")}
+    if "setup_group_id" not in identity_columns:
+        _execute_ddl_and_verify(
+            db,
+            "ALTER TABLE `programme_trade_chart_identity` ADD COLUMN `setup_group_id` "
+            "BIGINT(20) UNSIGNED NOT NULL DEFAULT 1 AFTER `family_number`",
+            "programme_trade_chart_identity.setup_group_id",
+            lambda: _schema_column_exists(db, "programme_trade_chart_identity", "setup_group_id"),
+            timeout=240,
+        )
+        identity_columns.add("setup_group_id")
+
+    required_identity_columns = {
+        "programme_trade_id", "userid", "programmeid", "contract_id", "identity_hash",
+        "chart_trade_id", "root_id", "confirmation_root_id", "family_number", "setup_group_id",
+        "family_signature", "symbol", "timeframe", "source_timeframe", "entry_anchor_time",
+        "entry_trigger_time", "outcome",
+    }
+    missing_identity = sorted(required_identity_columns - identity_columns)
+    if missing_identity:
+        raise RuntimeError(
+            "programme_trade_chart_identity is missing required column(s): "
+            + ", ".join(missing_identity)
+        )
+
+
+def _latest_programme_contract_id(
+    db: BridgeClient, programme_id: int, user_id: int
+) -> int:
+    latest = 0
+    if table_exists(db, "programme"):
+        programme_columns = {column.lower() for column in get_columns(db, "programme")}
+        if "contract_id" in programme_columns:
+            rows = db.fetch_all(
+                "SELECT `contract_id` FROM `programme` WHERE `id`=%s AND `userid`=%s LIMIT 1",
+                [programme_id, user_id], timeout=45,
+            )
+            if rows:
+                latest = max(latest, as_int(rows[0].get("contract_id"), 0) or 0)
+    rows = db.fetch_all(
+        "SELECT COALESCE(MAX(`contract_id`),0) AS `latest_contract_id` "
+        "FROM `programme_trades` WHERE `userid`=%s AND `programmeid`=%s",
+        [user_id, programme_id], timeout=60,
+    )
+    if rows:
+        latest = max(latest, as_int(rows[0].get("latest_contract_id"), 0) or 0)
+    return latest if latest > 0 else 1
+
+
+def _normalise_trade_outcome_for_programme_trade(outcome: Any) -> str:
+    value = str(outcome or "").strip().lower()
+    value = re.sub(r"[\s_-]+", " ", value)
+    return value
+
+
+def _build_programme_trade_sync_row(
+    record: Dict[str, Any], roots: Sequence[Dict[str, Any]], contract_id: int
+) -> Optional[Dict[str, Any]]:
+    """Prepare one canonical chart trade using the PHP pa_syncProgrammeTrades rules."""
+    if as_int(record.get("trade_configured"), 0) != 1:
+        return None
+    if "matched_family" in record and as_int(record.get("matched_family"), 0) == 0:
+        return None
+
+    symbol = str(record.get("symbol") or "").strip()
+    timeframe = _resolve_programme_trade_timeframe(record, roots)
+    if not symbol or not timeframe:
+        return None
+
+    root_id = as_int(record.get("root_id"), 0) or 0
+    confirmation_raw = record.get("confirmation_root_id")
+    confirmation_id = 0 if confirmation_raw in (None, "") else (as_int(confirmation_raw, 0) or 0)
+    confirmation_db_id = confirmation_id if confirmation_id > 0 else None
+    family_number = as_int(record.get("family_number"))
+    setup_group_id = max(1, as_int(record.get("setup_group_id"), 1) or 1)
+    is_identifiable = root_id > 0 and family_number is not None and family_number > 0
+    if is_identifiable:
+        trade_kind = "confirmation" if confirmation_id > 0 else "root"
+        chart_trade_id = "|".join((
+            trade_kind, str(root_id), str(confirmation_id), timeframe,
+            str(setup_group_id), str(family_number),
+        ))
+        identity_seed = symbol + "|" + chart_trade_id
+    else:
+        chart_trade_id = None
+        identity_seed = "unidentified|" + symbol + "|" + timeframe + "|" + str(
+            record.get("id") or hashlib.sha256(safe_json(record).encode("utf-8")).hexdigest()
+        )
+    identity_hash = hashlib.sha256(identity_seed.encode("utf-8")).hexdigest()
+
+    outcome = _normalise_trade_outcome_for_programme_trade(record.get("outcome"))
+    pnl = _first_record_value(record, ("pnl", "profit_loss", "profitandloss"))
+    pnl = as_float(pnl) if pnl is not None else None
+    pnl_risk_reward = _first_record_value(record, ("pnl_risk_reward",))
+    live = 1 if as_int(record.get("live_trades"), 0) == 1 else 0
+    trade_time = _first_record_value(record, (
+        "trade_time", "entry_trigger_time", "entry_anchor_time", "event_time", "open_time", "created_at"
+    ))
+
+    flat_outcomes = {
+        "closed flat", "breakeven", "break even", "breakeven hit",
+        "closed at breakeven", "closed breakeven", "breakeven stop hit",
+    }
+    profit_outcomes = {"closed in profit", "closed profit", "profit", "profitable"}
+    loss_outcomes = {"closed in loss", "closed loss", "loss", "losing"}
+    terminal_outcomes = {
+        "stoploss hit", "take profit reached", "closed", "position closed",
+        "manual close", "manually closed",
+    } | flat_outcomes | profit_outcomes | loss_outcomes
+
+    if outcome in flat_outcomes and pnl is None:
+        pnl = 0.0
+
+    if outcome == "in trade":
+        order_status = "running"
+    elif outcome == "pending entry":
+        order_status = "pending"
+    elif outcome in terminal_outcomes:
+        order_status = "closed"
+    else:
+        return None
+
+    order_type = str(record.get("order_type") or "").strip().lower()
+    allowed_order_types = {"buy", "sell", "buy-stop", "sell-stop", "buy-limit", "sell-limit"}
+    if order_type not in allowed_order_types:
+        direction = str(record.get("direction") or "").strip().lower()
+        order_type = "sell" if direction == "short" else "buy"
+
+    entry = _first_record_value(record, ("entry", "entry_price", "entry_trigger_price"))
+    stoploss = _first_record_value(record, ("stoploss", "stoploss_price"))
+    takeprofit = _first_record_value(record, ("takeprofit", "take_profit_price"))
+    risk_reward = _first_record_value(record, ("trade_risk_reward", "risk_reward"))
+    if pnl_risk_reward is None:
+        if outcome == "take profit reached" or outcome in profit_outcomes:
+            pnl_risk_reward = risk_reward
+        elif outcome == "stoploss hit" or outcome in loss_outcomes:
+            pnl_risk_reward = -1
+        elif outcome in flat_outcomes:
+            pnl_risk_reward = 0
+
+    return {
+        "userid": int(record.get("userid") or 0),
+        "programmeid": int(record.get("programme_id") or 0),
+        "contract_id": int(contract_id),
+        "setup_group_id": int(setup_group_id),
+        "symbol": symbol,
+        "ordertype": order_type,
+        "orderstatus": order_status,
+        "timeframe": timeframe,
+        "entry": entry,
+        "stoploss": stoploss,
+        "takeprofit": takeprofit,
+        "trade_risk_reward": risk_reward,
+        "pnl": pnl,
+        "pnl_risk_reward": pnl_risk_reward,
+        "trade_status": order_status,
+        "live": live,
+        "trade_time": dt_text(trade_time) if trade_time is not None else None,
+        "order_request_status": record.get("order_request_status"),
+        "order_request_filled": 1 if as_int(record.get("order_request_filled"), 0) == 1 else 0,
+        "order_request_filled_failure_reason": record.get("order_request_filled_failure_reason"),
+        "identity_hash": identity_hash,
+        "chart_trade_id": chart_trade_id,
+        "root_id": root_id if root_id > 0 else None,
+        "confirmation_root_id": confirmation_db_id,
+        "family_number": family_number,
+        "family_signature": record.get("family_signature"),
+        "source_timeframe": record.get("source_timeframe"),
+        "entry_anchor_time": record.get("entry_anchor_time"),
+        "entry_trigger_time": record.get("entry_trigger_time"),
+        "outcome": str(record.get("outcome") or "") or None,
+    }
+
+
+def _canonical_trade_sync_value(column: str, value: Any) -> Any:
+    value = normalise_mysql_value(value)
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="replace")
+    if column in {"contract_id", "setup_group_id", "live"}:
+        parsed = as_int(value)
+        return parsed if parsed is not None else str(value).strip()
+    if column in {"entry", "stoploss", "takeprofit", "trade_risk_reward", "pnl", "pnl_risk_reward"}:
+        try:
+            number = Decimal(str(value).strip())
+            return number.normalize() if number.is_finite() else str(value).strip()
+        except (InvalidOperation, ValueError, TypeError):
+            return str(value).strip()
+    if column == "trade_time":
+        return dt_text(value) or str(value).strip()
+    if column in {"symbol", "timeframe", "ordertype", "orderstatus", "trade_status"}:
+        return str(value).strip().casefold()
+    return str(value)
+
+
+def programme_trade_row_matches(existing: Dict[str, Any], expected: Dict[str, Any]) -> bool:
+    """Avoid an UPDATE when the canonical programme-owned trade is already exact."""
+    columns = (
+        "contract_id", "setup_group_id", "symbol", "ordertype", "orderstatus", "timeframe",
+        "entry", "stoploss", "takeprofit", "trade_risk_reward", "pnl", "pnl_risk_reward",
+        "trade_status", "live", "trade_time",
+    )
+    return all(
+        _canonical_trade_sync_value(column, existing.get(column))
+        == _canonical_trade_sync_value(column, expected.get(column))
+        for column in columns
     )
 
 
+def programme_trade_identity_row_matches(existing: Dict[str, Any], expected: Dict[str, Any]) -> bool:
+    """Avoid rewriting an unchanged programme_trade_chart_identity mapping."""
+    columns = (
+        "contract_id", "identity_hash", "chart_trade_id", "root_id", "confirmation_root_id",
+        "family_number", "setup_group_id", "family_signature", "symbol", "timeframe",
+        "source_timeframe", "entry_anchor_time", "entry_trigger_time", "outcome",
+    )
+    integer_columns = {"contract_id", "root_id", "confirmation_root_id", "family_number", "setup_group_id"}
+    casefold_columns = {"symbol", "timeframe"}
+    for column in columns:
+        left = normalise_mysql_value(existing.get(column))
+        right = normalise_mysql_value(expected.get(column))
+        if column in integer_columns:
+            left = as_int(left) if left is not None else None
+            right = as_int(right) if right is not None else None
+        elif column in casefold_columns:
+            left = None if left is None else str(left).strip().casefold()
+            right = None if right is None else str(right).strip().casefold()
+        else:
+            left = None if left is None else str(left)
+            right = None if right is None else str(right)
+        if left != right:
+            return False
+    return True
+
+
+def _trade_identity_fallback_key(row: Dict[str, Any], prefix: str = "") -> Tuple[Any, ...]:
+    """Stable legacy family key used only when exactly one old mapping matches."""
+    def value(name: str) -> Any:
+        return normalise_mysql_value(row.get(prefix + name))
+
+    return (
+        as_int(value("root_id"), 0) or 0,
+        as_int(value("confirmation_root_id"), 0) or 0,
+        str(value("symbol") or "").strip().casefold(),
+        str(value("timeframe") or "").strip().casefold(),
+        None if value("source_timeframe") is None else str(value("source_timeframe")),
+        None if value("family_signature") is None else str(value("family_signature")),
+    )
+
+
+def _legacy_trade_core_matches(existing: Dict[str, Any], expected: Dict[str, Any]) -> bool:
+    """Only adopt a legacy, unlinked row when its full old core signature matches."""
+    columns = ("symbol", "timeframe", "entry", "stoploss", "takeprofit", "ordertype", "orderstatus")
+    return all(
+        _canonical_trade_sync_value(column, existing.get(column))
+        == _canonical_trade_sync_value(column, expected.get(column))
+        for column in columns
+    )
+
+
+def _chunks(items: Sequence[Any], size: int) -> Iterable[Sequence[Any]]:
+    for offset in range(0, len(items), size):
+        yield items[offset:offset + size]
+
+
+def _bulk_values_sql(rows: Sequence[Dict[str, Any]], columns: Sequence[str]) -> str:
+    """Build a safe multi-row VALUES list using the bridge's verified SQL literals."""
+    return ",".join(
+        "(" + ",".join(sql_literal(row.get(column)) for column in columns) + ")"
+        for row in rows
+    )
+
+
+def _bulk_case_update(
+    db: BridgeClient,
+    programme_id: int,
+    user_id: int,
+    rows: Sequence[Tuple[int, Dict[str, Any]]],
+    columns: Sequence[str],
+    batch_size: int = 250,
+) -> int:
+    """CASE-update batches; read back by primary key if the browser ACK is lost."""
+    affected = 0
+    for chunk in _chunks(list(rows), batch_size):
+        ids = [int(row_id) for row_id, _ in chunk]
+        assignments = []
+        for column in columns:
+            cases = " ".join(
+                f"WHEN {int(row_id)} THEN {sql_literal(values.get(column))}"
+                for row_id, values in chunk
+            )
+            assignments.append(f"`{column}`=CASE `id` {cases} ELSE `{column}` END")
+        sql = (
+            "UPDATE `programme_trades` SET " + ",".join(assignments)
+            + f" WHERE `userid`={int(user_id)} AND `programmeid`={int(programme_id)}"
+            + " AND `investor_id` IS NULL AND `id` IN ("
+            + ",".join(str(value) for value in ids) + ")"
+        )
+        try:
+            affected += db.execute(sql, timeout=240)
+        except Exception as write_exc:
+            select_columns = ",".join(f"`{column}`" for column in columns)
+            check_rows = db.fetch_all(
+                f"SELECT `id`,{select_columns} FROM `programme_trades` "
+                f"WHERE `userid`={int(user_id)} AND `programmeid`={int(programme_id)} "
+                "AND `investor_id` IS NULL AND `id` IN (" + ",".join(str(value) for value in ids) + ")",
+                timeout=120,
+            )
+            by_id = {as_int(row.get("id"), 0): row for row in check_rows}
+            all_applied = True
+            for row_id, expected_values in chunk:
+                actual = by_id.get(int(row_id))
+                if actual is None or any(
+                    _canonical_trade_sync_value(column, actual.get(column))
+                    != _canonical_trade_sync_value(column, expected_values.get(column))
+                    for column in columns
+                ):
+                    all_applied = False
+                    break
+            if not all_applied:
+                raise RuntimeError(
+                    f"programme_trades CASE UPDATE batch outcome is uncertain: Selenium/PHP "
+                    f"reported {write_exc}; read-back did not verify all {len(chunk)} target rows. "
+                    "The write was NOT replayed."
+                ) from write_exc
+            print(
+                f"  Verified programme_trades UPDATE batch ({len(chunk)} rows) from MySQL "
+                "after the Selenium response was lost; the UPDATE was not replayed."
+            )
+            affected += len(chunk)
+    return affected
+
+
+def _fetch_trade_rows_by_hashes(
+    db: BridgeClient, programme_id: int, user_id: int, hashes: Sequence[str]
+) -> Dict[str, Dict[str, Any]]:
+    if not hashes:
+        return {}
+    literals = ",".join(sql_literal(value) for value in hashes)
+    rows = db.fetch_all(
+        "SELECT `id`,`chart_identity_hash`,`contract_id`,`setup_group_id`,`symbol`,`ordertype`,"
+        "`orderstatus`,`timeframe`,`entry`,`stoploss`,`takeprofit`,`trade_risk_reward`,`pnl`,"
+        "`pnl_risk_reward`,`trade_status`,`live`,`trade_time` FROM `programme_trades` "
+        f"WHERE `userid`={int(user_id)} AND `programmeid`={int(programme_id)} "
+        "AND `investor_id` IS NULL AND `chart_identity_hash` IN (" + literals + ")",
+        timeout=150,
+    )
+    return {
+        str(row.get("chart_identity_hash")): row
+        for row in rows if row.get("chart_identity_hash") is not None
+    }
+
+
+def _fetch_trade_identity_rows(
+    db: BridgeClient, programme_id: int, user_id: int, hashes: Sequence[str]
+) -> Dict[str, Dict[str, Any]]:
+    if not hashes:
+        return {}
+    literals = ",".join(sql_literal(value) for value in hashes)
+    rows = db.fetch_all(
+        "SELECT `programme_trade_id`,`userid`,`programmeid`,`contract_id`,`identity_hash`,"
+        "`chart_trade_id`,`root_id`,`confirmation_root_id`,`family_number`,`setup_group_id`,"
+        "`family_signature`,`symbol`,`timeframe`,`source_timeframe`,`entry_anchor_time`,"
+        "`entry_trigger_time`,`outcome` FROM `programme_trade_chart_identity` "
+        f"WHERE `userid`={int(user_id)} AND `programmeid`={int(programme_id)} "
+        "AND `identity_hash` IN (" + literals + ")",
+        timeout=150,
+    )
+    return {
+        str(row.get("identity_hash")): row
+        for row in rows if row.get("identity_hash") is not None
+    }
+
+
+def sync_programme_trades_first(
+    db: BridgeClient,
+    programme_id: int,
+    user_id: int,
+    records: Sequence[Dict[str, Any]],
+    roots: Sequence[Dict[str, Any]],
+) -> Dict[str, int]:
+    """Synchronize canonical programme trades using bulk inserts and bulk updates.
+
+    The helper identity table remains authoritative for PHP/dashboard compatibility.
+    programme_trades.chart_identity_hash is an additive correlation key that lets
+    one multi-row INSERT be mapped back to its generated IDs without assuming that
+    auto-increment IDs are consecutive or relying on LAST_INSERT_ID() arithmetic.
+    Investor copies and broker trade IDs are never touched, and no trade rows are
+    deleted.
+    """
+    ensure_programme_trade_sync_schema(db)
+    contract_id = _latest_programme_contract_id(db, programme_id, user_id)
+
+    prepared: Dict[str, Dict[str, Any]] = {}
+    for source_record in records:
+        trade = _build_programme_trade_sync_row(source_record, roots, contract_id)
+        if trade is not None:
+            prepared[str(trade["identity_hash"])] = trade
+
+    counters = {
+        "inserted": 0, "updated": 0, "verified": 0, "skipped": 0,
+        "mapping_updated": 0, "batches": 0,
+    }
+    if not prepared:
+        print("  No configured trade rows were eligible for programme_trades synchronization.")
+        return counters
+
+    # Load all canonical programme-owned trades and their helper mappings in one read.
+    # This replaces several SELECT/INSERT/UPDATE requests for every single trade.
+    existing_rows = db.fetch_all(
+        "SELECT t.`id`,t.`contract_id`,t.`setup_group_id`,t.`symbol`,t.`ordertype`,t.`orderstatus`,"
+        "t.`timeframe`,t.`entry`,t.`stoploss`,t.`takeprofit`,t.`trade_risk_reward`,t.`pnl`,"
+        "t.`pnl_risk_reward`,t.`trade_status`,t.`live`,t.`trade_time`,t.`chart_identity_hash`,"
+        "ci.`identity_hash` AS `mapped_identity_hash`,ci.`contract_id` AS `mapped_contract_id`,"
+        "ci.`chart_trade_id` AS `mapped_chart_trade_id`,ci.`root_id` AS `mapped_root_id`,"
+        "ci.`confirmation_root_id` AS `mapped_confirmation_root_id`,"
+        "ci.`family_number` AS `mapped_family_number`,ci.`setup_group_id` AS `mapped_setup_group_id`,"
+        "ci.`family_signature` AS `mapped_family_signature`,ci.`symbol` AS `mapped_symbol`,"
+        "ci.`timeframe` AS `mapped_timeframe`,ci.`source_timeframe` AS `mapped_source_timeframe`,"
+        "ci.`entry_anchor_time` AS `mapped_entry_anchor_time`,"
+        "ci.`entry_trigger_time` AS `mapped_entry_trigger_time`,ci.`outcome` AS `mapped_outcome` "
+        "FROM `programme_trades` t LEFT JOIN `programme_trade_chart_identity` ci "
+        "ON ci.`programme_trade_id`=t.`id` AND ci.`userid`=t.`userid` "
+        "AND ci.`programmeid`=t.`programmeid` "
+        f"WHERE t.`userid`={int(user_id)} AND t.`programmeid`={int(programme_id)} "
+        "AND t.`investor_id` IS NULL ORDER BY t.`id` ASC",
+        timeout=180,
+    )
+
+    # The helper identity table is the authoritative identity source for an
+    # already-mapped trade. chart_identity_hash is only an auxiliary correlation
+    # column for bulk INSERT ID retrieval. Older runs can leave the two hashes
+    # different on the same row (for example, after an identity-hash migration).
+    # Indexing BOTH values as equal aliases lets one physical trade row match two
+    # current chart identities, which caused the "matched to more than one chart
+    # identity" abort. Prefer mapped_identity_hash, and only use chart_identity_hash
+    # for rows that do not yet have a helper mapping.
+    mapped_by_hash: Dict[str, Dict[str, Any]] = {}
+    chart_only_by_hash: Dict[str, Dict[str, Any]] = {}
+    fallback_by_signature: Dict[Tuple[Any, ...], List[Dict[str, Any]]] = {}
+    legacy_unlinked: List[Dict[str, Any]] = []
+    stale_chart_hash_rows: List[Tuple[int, Dict[str, Any]]] = []
+
+    def _add_unique_identity(
+        index: Dict[str, Dict[str, Any]], identity_hash: str,
+        row: Dict[str, Any], source_label: str,
+    ) -> None:
+        row_id = as_int(row.get("id"), 0) or 0
+        prior = index.get(identity_hash)
+        if prior is not None and as_int(prior.get("id"), 0) != row_id:
+            raise RuntimeError(
+                f"Duplicate canonical programme_trades {source_label} identity detected "
+                f"for identity_hash={identity_hash}: row IDs "
+                f"{as_int(prior.get('id'), 0)} and {row_id}. "
+                "No trade rows were inserted, updated, or deleted."
+            )
+        index[identity_hash] = row
+
+    for row in existing_rows:
+        row_id = as_int(row.get("id"), 0) or 0
+        if row_id <= 0:
+            continue
+        map_value = normalise_mysql_value(row.get("mapped_identity_hash"))
+        chart_value = normalise_mysql_value(row.get("chart_identity_hash"))
+        map_hash = str(map_value).strip() if map_value is not None else ""
+        chart_hash = str(chart_value).strip() if chart_value is not None else ""
+
+        if map_hash:
+            _add_unique_identity(mapped_by_hash, map_hash, row, "helper-mapped")
+            if chart_hash and chart_hash != map_hash:
+                # Do not treat this stale auxiliary value as a second identity.
+                # Clear it below so a genuinely new chart identity can be inserted
+                # without colliding with the old row's unique chart-hash index.
+                stale_chart_hash_rows.append((row_id, row))
+            key = _trade_identity_fallback_key(row, "mapped_")
+            if key[-1] is not None:
+                fallback_by_signature.setdefault(key, []).append(row)
+        elif chart_hash:
+            _add_unique_identity(chart_only_by_hash, chart_hash, row, "chart-only")
+        else:
+            legacy_unlinked.append(row)
+
+    # Repair stale auxiliary hashes before deciding which current identities are
+    # new. This changes no business trade fields and never deletes a trade row.
+    # The helper identity table remains authoritative for these rows.
+    if stale_chart_hash_rows:
+        stale_updates = [
+            (row_id, {"chart_identity_hash": None})
+            for row_id, _row in stale_chart_hash_rows
+        ]
+        repaired = _bulk_case_update(
+            db, programme_id, user_id, stale_updates,
+            ("chart_identity_hash",), batch_size=500,
+        )
+        for _row_id, row in stale_chart_hash_rows:
+            row["chart_identity_hash"] = None
+        print(
+            f"  Reconciled {len(stale_chart_hash_rows):,} stale programme_trades chart-hash "
+            "alias(es) using the authoritative programme_trade_chart_identity mapping."
+        )
+
+    # Mapped identities always win over a chart-only legacy row carrying the same
+    # hash. Such a legacy row is not silently adopted as a second copy.
+    existing_by_hash: Dict[str, Dict[str, Any]] = dict(mapped_by_hash)
+    for identity_hash, row in chart_only_by_hash.items():
+        existing_by_hash.setdefault(identity_hash, row)
+
+    used_trade_ids: set[int] = set()
+    resolved: Dict[str, Tuple[int, Dict[str, Any], Optional[Dict[str, Any]]]] = {}
+    changed_trade_updates: List[Tuple[int, Dict[str, Any]]] = []
+    hash_only_updates: List[Tuple[int, Dict[str, Any]]] = []
+    new_trades: List[Tuple[str, Dict[str, Any]]] = []
+
+    for identity_hash, trade in prepared.items():
+        existing = existing_by_hash.get(identity_hash)
+
+        # Preserve the older family-signature migration fallback, but only when unique.
+        if existing is None and trade.get("family_signature"):
+            key = _trade_identity_fallback_key(trade)
+            candidates = [
+                row for row in fallback_by_signature.get(key, [])
+                if (as_int(row.get("id"), 0) or 0) not in used_trade_ids
+            ]
+            if len(candidates) == 1:
+                existing = candidates[0]
+
+        # Preserve safe legacy adoption: only one unlinked programme-owned row
+        # with the full old core signature can be adopted.
+        if (
+            existing is None
+            and trade.get("chart_trade_id") is not None
+            and trade.get("entry") is not None
+        ):
+            candidates = [
+                row for row in legacy_unlinked
+                if (as_int(row.get("id"), 0) or 0) not in used_trade_ids
+                and _legacy_trade_core_matches(row, trade)
+            ]
+            if len(candidates) == 1:
+                existing = candidates[0]
+
+        if existing is None:
+            new_trades.append((identity_hash, trade))
+            continue
+
+        trade_id = as_int(existing.get("id"), 0) or 0
+        if trade_id <= 0 or trade_id in used_trade_ids:
+            raise RuntimeError(
+                "A canonical programme_trades row was matched to more than one chart identity; "
+                "refusing an ambiguous trade mapping."
+            )
+        used_trade_ids.add(trade_id)
+        map_hash = normalise_mysql_value(existing.get("mapped_identity_hash"))
+        map_meta = None
+        if map_hash is not None:
+            map_meta = {
+                "contract_id": existing.get("mapped_contract_id"),
+                "identity_hash": map_hash,
+                "chart_trade_id": existing.get("mapped_chart_trade_id"),
+                "root_id": existing.get("mapped_root_id"),
+                "confirmation_root_id": existing.get("mapped_confirmation_root_id"),
+                "family_number": existing.get("mapped_family_number"),
+                "setup_group_id": existing.get("mapped_setup_group_id"),
+                "family_signature": existing.get("mapped_family_signature"),
+                "symbol": existing.get("mapped_symbol"),
+                "timeframe": existing.get("mapped_timeframe"),
+                "source_timeframe": existing.get("mapped_source_timeframe"),
+                "entry_anchor_time": existing.get("mapped_entry_anchor_time"),
+                "entry_trigger_time": existing.get("mapped_entry_trigger_time"),
+                "outcome": existing.get("mapped_outcome"),
+            }
+
+        trade_changed = not programme_trade_row_matches(existing, trade)
+        stored_chart_hash = normalise_mysql_value(existing.get("chart_identity_hash"))
+        stored_map_hash = normalise_mysql_value(existing.get("mapped_identity_hash"))
+        update_values = dict(trade)
+        # When the helper mapping already owns this exact identity, preserve the
+        # auxiliary hash value after stale-alias cleanup (which may have set it
+        # to NULL). Do not recreate the conflicting alias during a business-field
+        # update. Legacy/fallback adoptions receive the current identity hash.
+        if stored_map_hash is not None and str(stored_map_hash).strip() == identity_hash:
+            update_values["chart_identity_hash"] = stored_chart_hash
+        else:
+            update_values["chart_identity_hash"] = identity_hash
+        if trade_changed:
+            changed_trade_updates.append((trade_id, update_values))
+            counters["updated"] += 1
+        elif stored_map_hash is not None and str(stored_map_hash).strip() == identity_hash:
+            # The helper mapping already owns this identity. Keep the auxiliary
+            # chart hash cleared when it was stale; do not reintroduce an alias.
+            counters["skipped"] += 1
+        elif stored_chart_hash is None or str(stored_chart_hash).strip() != identity_hash:
+            # Legacy/fallback adoption: attach the current hash only when this row
+            # did not already have this identity in the authoritative helper table.
+            hash_only_updates.append((trade_id, {"chart_identity_hash": identity_hash}))
+            counters["skipped"] += 1
+        else:
+            counters["skipped"] += 1
+
+        resolved[identity_hash] = (trade_id, trade, map_meta)
+
+    # Bulk changed-row update; unchanged business rows are not rewritten.
+    trade_update_columns = (
+        "contract_id", "setup_group_id", "symbol", "ordertype", "orderstatus", "timeframe",
+        "entry", "stoploss", "takeprofit", "trade_risk_reward", "pnl", "pnl_risk_reward",
+        "trade_status", "live", "trade_time", "chart_identity_hash",
+    )
+    for chunk in _chunks(changed_trade_updates, 250):
+        _bulk_case_update(db, programme_id, user_id, chunk, trade_update_columns, batch_size=250)
+        counters["batches"] += 1
+    for chunk in _chunks(hash_only_updates, 500):
+        _bulk_case_update(db, programme_id, user_id, chunk, ("chart_identity_hash",), batch_size=500)
+        counters["batches"] += 1
+
+    # Insert new canonical rows in multi-row INSERT statements. chart_identity_hash
+    # makes their generated IDs retrievable exactly, without unsafe ID arithmetic.
+    insert_columns = (
+        "userid", "programmeid", "contract_id", "setup_group_id", "investor_id", "tradeid",
+        "chart_identity_hash", "symbol", "ordertype", "orderstatus", "timeframe", "entry",
+        "stoploss", "takeprofit", "trade_risk_reward", "pnl", "pnl_risk_reward",
+        "trade_status", "live", "trade_time", "order_request_status", "order_request_filled",
+        "order_request_filled_failure_reason",
+    )
+    for chunk in _chunks(new_trades, 500):
+        insert_rows = []
+        for identity_hash, trade in chunk:
+            insert_rows.append({
+                "userid": user_id,
+                "programmeid": programme_id,
+                "contract_id": trade["contract_id"],
+                "setup_group_id": trade["setup_group_id"],
+                "investor_id": None,
+                "tradeid": None,
+                "chart_identity_hash": identity_hash,
+                "symbol": trade["symbol"],
+                "ordertype": trade["ordertype"],
+                "orderstatus": trade["orderstatus"],
+                "timeframe": trade["timeframe"],
+                "entry": trade.get("entry"),
+                "stoploss": trade.get("stoploss"),
+                "takeprofit": trade.get("takeprofit"),
+                "trade_risk_reward": trade.get("trade_risk_reward"),
+                "pnl": trade.get("pnl"),
+                "pnl_risk_reward": trade.get("pnl_risk_reward"),
+                "trade_status": trade["trade_status"],
+                "live": trade["live"],
+                "trade_time": trade.get("trade_time"),
+                "order_request_status": trade.get("order_request_status"),
+                "order_request_filled": trade.get("order_request_filled", 0),
+                "order_request_filled_failure_reason": trade.get("order_request_filled_failure_reason"),
+            })
+        sql = (
+            "INSERT INTO `programme_trades` ("
+            + ",".join(f"`{column}`" for column in insert_columns)
+            + ") VALUES " + _bulk_values_sql(insert_rows, insert_columns)
+        )
+        chunk_hashes = [identity_hash for identity_hash, _ in chunk]
+        try:
+            db.execute(sql, timeout=300)
+        except Exception as write_exc:
+            # A single InnoDB multi-row INSERT is atomic, but the browser can lose
+            # the response after MariaDB committed it. Read the durable identities;
+            # never blindly submit the batch a second time.
+            persisted = _fetch_trade_rows_by_hashes(db, programme_id, user_id, chunk_hashes)
+            fully_applied = len(persisted) == len(chunk)
+            if fully_applied:
+                for identity_hash, expected_trade in chunk:
+                    actual_trade = persisted.get(identity_hash)
+                    if actual_trade is None or not programme_trade_row_matches(actual_trade, expected_trade):
+                        fully_applied = False
+                        break
+            if not fully_applied:
+                raise RuntimeError(
+                    f"programme_trades multi-row INSERT response was lost; MySQL read-back "
+                    f"verified {len(persisted):,}/{len(chunk):,} inserted trades. "
+                    "The batch was NOT replayed to avoid duplicates. Original error: "
+                    f"{write_exc}"
+                ) from write_exc
+            print(
+                f"  Verified programme_trades INSERT batch ({len(chunk)} rows) from MySQL "
+                "after the Selenium response was lost; the INSERT was not replayed."
+            )
+        counters["inserted"] += len(chunk)
+        counters["batches"] += 1
+
+    # Read the generated IDs for all new trades by their unique correlation hashes.
+    new_hashes = [identity_hash for identity_hash, _ in new_trades]
+    for hash_chunk in _chunks(new_hashes, 500):
+        literals = ",".join(sql_literal(value) for value in hash_chunk)
+        rows = db.fetch_all(
+            "SELECT `id`,`chart_identity_hash` FROM `programme_trades` "
+            f"WHERE `userid`={int(user_id)} AND `programmeid`={int(programme_id)} "
+            "AND `investor_id` IS NULL AND `chart_identity_hash` IN (" + literals + ")",
+            timeout=120,
+        )
+        ids_by_hash = {
+            str(row.get("chart_identity_hash")): as_int(row.get("id"), 0) or 0
+            for row in rows
+        }
+        for identity_hash in hash_chunk:
+            trade_id = ids_by_hash.get(identity_hash, 0)
+            if trade_id <= 0:
+                raise RuntimeError(
+                    "Bulk programme_trades INSERT completed but its generated row could not be "
+                    f"retrieved by chart_identity_hash={identity_hash}. Analytics insertion is blocked."
+                )
+            trade = prepared[identity_hash]
+            resolved[identity_hash] = (trade_id, trade, None)
+
+    # Prepare and batch-upsert only missing or changed helper mappings.
+    identity_columns = (
+        "programme_trade_id", "userid", "programmeid", "contract_id", "identity_hash", "chart_trade_id",
+        "root_id", "confirmation_root_id", "family_number", "setup_group_id", "family_signature",
+        "symbol", "timeframe", "source_timeframe", "entry_anchor_time", "entry_trigger_time", "outcome",
+    )
+    identity_upserts: List[Dict[str, Any]] = []
+    for identity_hash, (trade_id, trade, existing_meta) in resolved.items():
+        identity_values = {
+            "programme_trade_id": trade_id,
+            "userid": user_id,
+            "programmeid": programme_id,
+            "contract_id": trade["contract_id"],
+            "identity_hash": identity_hash,
+            "chart_trade_id": trade.get("chart_trade_id"),
+            "root_id": trade.get("root_id"),
+            "confirmation_root_id": trade.get("confirmation_root_id"),
+            "family_number": trade.get("family_number"),
+            "setup_group_id": trade["setup_group_id"],
+            "family_signature": trade.get("family_signature"),
+            "symbol": trade["symbol"],
+            "timeframe": trade["timeframe"],
+            "source_timeframe": trade.get("source_timeframe"),
+            "entry_anchor_time": trade.get("entry_anchor_time"),
+            "entry_trigger_time": trade.get("entry_trigger_time"),
+            "outcome": trade.get("outcome"),
+        }
+        if existing_meta is None or not programme_trade_identity_row_matches(existing_meta, identity_values):
+            identity_upserts.append(identity_values)
+
+    for chunk in _chunks(identity_upserts, 500):
+        sql = (
+            "INSERT INTO `programme_trade_chart_identity` ("
+            + ",".join(f"`{column}`" for column in identity_columns)
+            + ") VALUES " + _bulk_values_sql(chunk, identity_columns)
+            + " ON DUPLICATE KEY UPDATE "
+            + ",".join(
+                f"`{column}`=VALUES(`{column}`)"
+                for column in identity_columns if column != "programme_trade_id"
+            )
+            + ",`programme_trade_id`=VALUES(`programme_trade_id`)"
+        )
+        chunk_hashes = [str(row["identity_hash"]) for row in chunk]
+        try:
+            db.execute(sql, timeout=300)
+        except Exception as write_exc:
+            persisted_mappings = _fetch_trade_identity_rows(db, programme_id, user_id, chunk_hashes)
+            fully_applied = len(persisted_mappings) == len(chunk)
+            if fully_applied:
+                for expected_values in chunk:
+                    identity_hash = str(expected_values["identity_hash"])
+                    actual_values = persisted_mappings.get(identity_hash)
+                    if actual_values is None:
+                        fully_applied = False
+                        break
+                    if (
+                        as_int(actual_values.get("programme_trade_id"), 0)
+                        != as_int(expected_values.get("programme_trade_id"), 0)
+                        or as_int(actual_values.get("userid"), 0) != user_id
+                        or as_int(actual_values.get("programmeid"), 0) != programme_id
+                        or not programme_trade_identity_row_matches(actual_values, expected_values)
+                    ):
+                        fully_applied = False
+                        break
+            if not fully_applied:
+                raise RuntimeError(
+                    f"programme_trade_chart_identity upsert response was lost; MySQL read-back "
+                    f"verified {len(persisted_mappings):,}/{len(chunk):,} mapping rows. "
+                    "The batch was NOT replayed. Original error: "
+                    f"{write_exc}"
+                ) from write_exc
+            print(
+                f"  Verified programme_trade_chart_identity upsert batch ({len(chunk)} rows) "
+                "after the Selenium response was lost; it was not replayed."
+            )
+        counters["mapping_updated"] += len(chunk)
+        counters["batches"] += 1
+
+    # Verify every expected trade hash in bounded IN lists, after all batches finish.
+    expected_hashes = list(prepared.keys())
+    verified_hashes = 0
+    for hash_chunk in _chunks(expected_hashes, 500):
+        literals = ",".join(sql_literal(value) for value in hash_chunk)
+        check = db.fetch_all(
+            "SELECT COUNT(DISTINCT ci.`identity_hash`) AS `verified_count` "
+            "FROM `programme_trade_chart_identity` ci "
+            "INNER JOIN `programme_trades` pt ON pt.`id`=ci.`programme_trade_id` "
+            "AND pt.`userid`=ci.`userid` AND pt.`programmeid`=ci.`programmeid` "
+            "WHERE ci.`userid`=" + str(int(user_id))
+            + " AND ci.`programmeid`=" + str(int(programme_id))
+            + " AND pt.`investor_id` IS NULL AND ci.`identity_hash` IN (" + literals + ")",
+            timeout=150,
+        )
+        verified_hashes += as_int(check[0].get("verified_count"), 0) if check else 0
+
+    counters["verified"] = verified_hashes
+    if counters["verified"] != len(expected_hashes):
+        raise RuntimeError(
+            "Programme Trades bulk verification failed: "
+            f"expected {len(expected_hashes):,} unique chart trades, verified {counters['verified']:,}. "
+            "The worker has stopped before programme_analytics writes; no programme_trades rows were deleted. "
+            "Inspect programme_trades.chart_identity_hash and programme_trade_chart_identity for this programme."
+        )
+
+    print(
+        "  Programme trades bulk sync: "
+        f"inserted={counters['inserted']:,} | updated={counters['updated']:,} | "
+        f"unchanged={counters['skipped']:,} | mapping rows written={counters['mapping_updated']:,} | "
+        f"SQL batches={counters['batches']:,} | verified={counters['verified']:,}"
+    )
+    return counters
+
 def print_persistent_analytics_summary(db: BridgeClient, programme_id: int, user_id: int) -> None:
     """Show what the PHP dashboard can already read before this scan writes anything."""
-    print("Persistent Programme Analytics already stored (read-only baseline):")
+    print("\nSTORED ANALYTICS BASELINE (before this scan; read-only)")
     try:
         rows = db.fetch_all(
             "SELECT `symbol`,`timeframe`,`root_id`,COALESCE(`confirmation_root_id`,0) AS `confirmation_root_id`, "
@@ -2919,12 +4928,14 @@ def print_persistent_analytics_summary(db: BridgeClient, programme_id: int, user
             [programme_id, user_id], timeout=90,
         )
     except Exception as exc:
-        print(f"  Could not read the pre-existing analytics baseline: {str(exc)[:800]}")
+        print(f"  Baseline could not be read: {str(exc).splitlines()[0][:300]}")
         return
     if not rows:
-        print("  No pre-existing programme_analytics rows for this programme/user.")
+        print("  No existing programme_analytics rows were found for this programme/user.")
         return
     total_rows = total_families = total_trades = 0
+    print("  Scope                         Rows     Families     Trades")
+    print("  -----------------------------------------------------------")
     for row in rows:
         count = as_int(row.get("analytics_rows"), 0) or 0
         families = as_int(row.get("matched_families"), 0) or 0
@@ -2933,17 +4944,13 @@ def print_persistent_analytics_summary(db: BridgeClient, programme_id: int, user
         total_families += families
         total_trades += trades
         confirmation_id = as_int(row.get("confirmation_root_id"), 0) or 0
-        scope_name = f"confirmation_root={confirmation_id}" if confirmation_id else "main_root"
-        print(
-            f"  {row.get('symbol')} {str(row.get('timeframe') or '').upper()} "
-            f"root={row.get('root_id')} {scope_name}: rows={count}, "
-            f"matched_families={families}, configured_trades={trades}"
-        )
-    print(
-        f"  STORED TOTALS: analytics_rows={total_rows}, "
-        f"matched_families={total_families}, configured_trades={total_trades}"
-    )
-    print("  These stored totals are what the PHP analytics page reads; they are not the current scan's match count.")
+        scope_name = f"confirmation #{confirmation_id}" if confirmation_id else "main root"
+        scope = f"{row.get('symbol')} {str(row.get('timeframe') or '').upper()} | root {row.get('root_id')} | {scope_name}"
+        print(f"  {scope:<43} {count:>5,} {families:>12,} {trades:>10,}")
+    print("  -----------------------------------------------------------")
+    print(f"  {'TOTAL':<43} {total_rows:>5,} {total_families:>12,} {total_trades:>10,}")
+    print("  Note: these are already-stored dashboard records, not matches from the current scan.")
+
 
 
 def _timeframe_order_key(tf: str) -> Tuple[int, str]:
@@ -2992,7 +4999,7 @@ def _deduplicate_records(records: Sequence[Dict[str, Any]]) -> List[Dict[str, An
     for record in records:
         identity = (
             record.get("root_id"), record.get("confirmation_root_id"),
-            record.get("source_timeframe"), record.get("family_number"),
+            record.get("source_timeframe"), record.get("setup_group_id"), record.get("family_number"),
         )
         deduplicated[identity] = record
     return list(deduplicated.values())
@@ -3023,42 +5030,91 @@ def apply_live_trade_policy(
     return live_pending_count, history_trade_count
 
 
-def process_programme(db: BridgeClient, programme: Dict[str, Any]) -> Dict[str, int]:
-    """Run the complete PHP-equivalent historical matching chain for one programme."""
+def process_programme(
+    db: BridgeClient,
+    programme: Dict[str, Any],
+    progress: Optional[Dict[str, Any]] = None,
+) -> Dict[str, int]:
+    """Run the complete PHP-equivalent historical matching chain for one programme.
+
+    `progress` is updated as each stage completes so the scan summary can still
+    report useful partial results when database persistence fails.
+    """
     programme_id = int(programme.get("id") or 0)
     user_id = int(programme.get("userid") or 0)
     programme_name = str(programme.get("program_name") or f"Programme {programme_id}")
+    progress = progress if progress is not None else {}
+    progress.update({
+        "programme_id": programme_id, "programme_name": programme_name,
+        "status": "RUNNING", "stage": "starting", "reason": "",
+        "pairs": 0, "families": 0, "trades": 0, "candles": 0,
+        "analytics_rows_deleted": 0, "analytics_rows_saved": 0,
+        "analytics_rows_inserted": 0, "analytics_rows_updated": 0,
+        "analytics_rows_unchanged": 0,
+        "programme_trade_rows_inserted": 0, "programme_trade_rows_updated": 0,
+        "programme_trade_rows_unchanged": 0, "programme_trade_rows_verified": 0,
+        "analytics_rows_before": 0, "analytics_groups_before": 0,
+    })
+
+    # Defence in depth: the only valid callers supply rows returned by the
+    # fail-closed VPS discovery query. Do not fetch candles or write analytics
+    # when this authorization marker is absent.
+    if as_int(programme.get("vps_associated"), 0) != 1 or not str(programme.get("vps_ip_address") or "").strip():
+        reason = "programme is not verified as associated with this VPS public IP"
+        progress.update({"status": "SKIPPED", "stage": "VPS/IP authorization", "reason": reason})
+        print(f"Programme {programme_name} (ID {programme_id}) skipped: {reason}.")
+        return {"pairs": 0, "families": 0, "trades": 0, "candles": 0, "analytics_rows_saved": 0}
 
     print("\n" + "=" * 82)
     print(f"PROGRAMME: {programme_name} (ID {programme_id})")
     print("=" * 82)
     print(f"Owner user ID: {user_id}")
+    print(
+        f"VPS IP: {programme.get('vps_ip_address') or 'unknown'} | "
+        f"VPS role: {programme.get('vps_role') or 'unknown'} | "
+        f"host owner programme IDs: {programme.get('vps_host_programme_ids') or []}"
+    )
+    progress["stage"] = "reading chart candle limit"
     try:
         chart_setting_rows = db.fetch_all(
             "SELECT `chart_total_candles` FROM `server_account` WHERE `id`=1 LIMIT 1",
             timeout=30,
         )
-        chart_total_candles = as_int(chart_setting_rows[0].get("chart_total_candles")) if chart_setting_rows else None
+        configured_chart_total_candles = as_int(chart_setting_rows[0].get("chart_total_candles")) if chart_setting_rows else None
+        # This database value is the one and only total-history ceiling used by
+        # the PHP chart, higher-timeframe projection and Python matcher.
+        chart_total_candles = configured_chart_total_candles
     except Exception as exc:
+        progress.update({"status": "FAILED", "reason": str(exc).splitlines()[0][:300]})
         log.error("%s: could not read server_account.chart_total_candles; skipping programme: %s", programme_name, exc)
-        return {"pairs": 0, "families": 0, "trades": 0, "candles": 0}
+        return {"pairs": 0, "families": 0, "trades": 0, "candles": 0, "analytics_rows_saved": 0}
     if chart_total_candles is None or chart_total_candles < 1:
-        print(f"{programme_name}: server_account.chart_total_candles is empty or invalid. Skipping candle fetch and analytics; no fallback is applied.")
-        return {"pairs": 0, "families": 0, "trades": 0, "candles": 0}
-    print(f"Chart Total Candles: {chart_total_candles:,} (server_account.chart_total_candles)")
+        reason = "server_account.chart_total_candles is empty or invalid"
+        progress.update({"status": "SKIPPED", "reason": reason, "stage": "chart setting validation"})
+        print(f"{programme_name}: {reason}. Skipping candle fetch and analytics; no fallback is applied.")
+        return {"pairs": 0, "families": 0, "trades": 0, "candles": 0, "analytics_rows_saved": 0}
+    print(
+        f"Candle window per configured symbol/timeframe: {chart_total_candles:,} "
+        "(server_account.chart_total_candles; no additional hardcoded history ceiling)"
+    )
+    setup_group_limit = load_trades_setup_per_group(db)
+    print(f"Trade setup group size: {setup_group_limit:,} setups per group (server_operational_settings.trades_setup_per_group)")
     begin_test_enabled = truthy(programme.get("begin_test_flag"), False)
     begin_status = str(programme.get("begin_test_status") or "not started").strip().lower()
     begin_started = programme.get("begin_test_started_at") or "not recorded"
     begin_interest_id = programme.get("begin_test_interest_id") or "none"
-    print(f"VPS IP: {programme.get('vps_ip_address') or 'unknown'} | VPS role: {programme.get('vps_role') or 'unknown'}")
     print(
         f"{programme_name} Begin Test = {'enabled' if begin_test_enabled else 'disabled'} "
         f"(interest #{begin_interest_id}, status={begin_status}, started_at={begin_started})"
     )
-    demoted = reset_programme_live_trades(db, programme_id, user_id)
-    print(f"Existing analytics reset to History before recalculation: {demoted} row(s)")
+    print(
+        "Refresh order: upsert/verify programme-owned programme_trades first; keep identical analytics "
+        "rows untouched; update changed identities; insert only missing identities; verify the complete "
+        "dataset; then delete only obsolete analytics rows. programme_trades rows are never deleted."
+    )
 
-    print("fetching saved programme training configuration..")
+    progress["stage"] = "loading saved programme configuration"
+    print("\nSAVED PROGRAMME CONFIGURATION")
     roots, confirmation_roots, parent_rows, confirmation_rows = load_programme_config(
         db, user_id, programme_id
     )
@@ -3068,20 +5124,34 @@ def process_programme(db: BridgeClient, programme: Dict[str, Any]) -> Dict[str, 
     # alternatives inherit that parent gate; a disabled parent contributes nothing.
     for root in roots:
         enabled = bool(root.get("applyToChart"))
-        print(f"{programme_name} | { _root_display_name(root) } apply to chart = {'yes' if enabled else 'no'}")
+        print(
+            f"{programme_name} | root_id={as_int(root.get('id'), 0) or 0} | "
+            f"{_root_display_name(root)} | apply_to_chart={'1' if enabled else '0'}"
+        )
     active_roots = [root for root in roots if bool(root.get("applyToChart"))]
+    print(
+        "Applied-to-chart root scope: "
+        + (", ".join(
+            f"{as_int(root.get('id'), 0) or 0}:{_root_display_name(root)}"
+            for root in active_roots
+        ) if active_roots else "NONE")
+    )
     if not active_roots:
-        print(f"{programme_name}: no roots have apply_to_chart enabled. Skipping candle fetch and analytics.")
-        return {"pairs": 0, "families": 0, "trades": 0, "candles": 0}
+        reason = "no roots have apply_to_chart enabled"
+        progress.update({"status": "SKIPPED", "reason": reason, "stage": "root eligibility"})
+        print(f"{programme_name}: {reason}. Skipping candle fetch and analytics.")
+        return {"pairs": 0, "families": 0, "trades": 0, "candles": 0, "analytics_rows_saved": 0}
 
-    print("Restored active-root configuration trace (identities below are the ones consumed by Python):")
+    print("\nRESTORED ACTIVE-ROOT CONFIGURATION (identities consumed by Python)")
     for active_root in active_roots:
         print_tree_configuration(active_root)
 
     symbols = sorted(set(parse_list(programme.get("selected_symbols"))), key=str.casefold)
     if not symbols:
-        print(f"{programme_name}: selected_symbols is empty. No candle pairs can be processed.")
-        return {"pairs": 0, "families": 0, "trades": 0, "candles": 0}
+        reason = "selected_symbols is empty"
+        progress.update({"status": "SKIPPED", "reason": reason, "stage": "symbol selection"})
+        print(f"{programme_name}: {reason}. No candle pairs can be processed.")
+        return {"pairs": 0, "families": 0, "trades": 0, "candles": 0, "analytics_rows_saved": 0}
 
     # Build only exact pairs requested by enabled parent roots and their confirmation
     # alternatives. programme.selected_timeframes is deliberately not a source of
@@ -3099,18 +5169,29 @@ def process_programme(db: BridgeClient, programme: Dict[str, Any]) -> Dict[str, 
                         required_pairs.add((symbol, child_tf))
 
     if not required_pairs:
-        print(f"{programme_name}: enabled roots have no configured parent or confirmation timeframes.")
-        return {"pairs": 0, "families": 0, "trades": 0, "candles": 0}
+        reason = "enabled roots have no configured parent or confirmation timeframes"
+        progress.update({"status": "SKIPPED", "reason": reason, "stage": "timeframe selection"})
+        print(f"{programme_name}: {reason}.")
+        return {"pairs": 0, "families": 0, "trades": 0, "candles": 0, "analytics_rows_saved": 0}
 
     required_pairs_ordered = sorted(
         required_pairs,
         key=lambda pair: (pair[0].casefold(), _timeframe_order_key(pair[1]))
     )
     print_persistent_analytics_summary(db, programme_id, user_id)
+    progress["stage"] = "capturing existing analytics group layout"
+    rebuild_state = prepare_analytics_rebuild_state(
+        db, programme_id, user_id, setup_group_limit
+    )
+    progress.update({
+        "analytics_rows_before": rebuild_state["existing_rows"],
+        "analytics_groups_before": len(rebuild_state["existing_groups"]),
+    })
     required_timeframes = sorted({tf for _symbol, tf in required_pairs}, key=_timeframe_order_key)
-    print("fetching candle records..")
-    print(f"Symbols: {', '.join(symbols)}")
-    print(f"Configured timeframes only: {', '.join(tf.upper() for tf in required_timeframes)}")
+    progress["stage"] = "fetching configured candle records"
+    print("\nCANDLE INPUTS")
+    print(f"  Symbols: {', '.join(symbols)}")
+    print(f"  Configured timeframes: {', '.join(tf.upper() for tf in required_timeframes)}")
 
     fetched_candles: Dict[str, Dict[str, List[Dict[str, Any]]]] = {symbol: {} for symbol in symbols}
     total_candles = 0
@@ -3119,19 +5200,21 @@ def process_programme(db: BridgeClient, programme: Dict[str, Any]) -> Dict[str, 
         fetched_candles.setdefault(symbol, {})[timeframe] = candles
         total_candles += len(candles)
         diag = candle_sequence_diagnostics(candles)
+        print(f"  {symbol} {timeframe.upper()}: {len(candles):,} candle(s)")
+        print(f"    Time range: {diag['oldest'] or 'n/a'}  ->  {diag['newest'] or 'n/a'}")
         print(
-            f"  {symbol} {timeframe.upper()}: fetched {len(candles):,} candle record(s); "
-            f"oldest={diag['oldest'] or 'n/a'}, newest={diag['newest'] or 'n/a'}, "
-            f"chronological={diag['chronological_non_decreasing']}, "
-            f"strict={diag['chronological_strict']}, duplicate_ids={diag['duplicate_ids']}, "
-            f"duplicate_times={diag['duplicate_timestamps']}, missing_OHLC={diag['missing_ohlc_rows']}, "
-            f"high_below_low={diag['high_below_low_rows']}"
+            f"    Validation: chronological={'yes' if diag['chronological_non_decreasing'] else 'NO'} | "
+            f"strict={'yes' if diag['chronological_strict'] else 'no'} | "
+            f"duplicate IDs={diag['duplicate_ids']} | duplicate times={diag['duplicate_timestamps']} | "
+            f"missing OHLC={diag['missing_ohlc_rows']} | high below low={diag['high_below_low_rows']}"
         )
         if diag["valid_timestamps"] != len(candles):
             print(f"    DATA WARNING: {len(candles) - diag['valid_timestamps']} candle(s) have no parseable time/open_time")
         if not diag["chronological_non_decreasing"]:
             print("    DATA WARNING: candle timestamps are not ascending; PHP chart matching receives oldest-to-newest candles")
 
+    progress["candles"] = total_candles
+    progress["stage"] = "loading trade and account-management rules"
     provider = load_provider_risk_reward(db, programme)
     account_rules = load_account_management_rules(db, programme)
     print(
@@ -3142,7 +5225,8 @@ def process_programme(db: BridgeClient, programme: Dict[str, Any]) -> Dict[str, 
         f"restricted_days={len(account_rules.get('restricted_days') or [])}, "
         f"breakeven_rules={len(account_rules.get('trades_breakeven') or [])}"
     )
-    print("converting and building into json")
+    progress["stage"] = "building runtime snapshot"
+    print("\nRUNTIME SNAPSHOT")
     snapshot_payload = {
         "schema": "programme_training_runtime_snapshot_v1",
         "programme": {
@@ -3155,8 +5239,10 @@ def process_programme(db: BridgeClient, programme: Dict[str, Any]) -> Dict[str, 
             "begin_test_flag": int(begin_test_enabled),
             "begin_test_status": programme.get("begin_test_status"),
             "begin_test_started_at": programme.get("begin_test_started_at"),
+            "vps_associated": int(programme.get("vps_associated") or 0),
             "vps_ip_address": programme.get("vps_ip_address"),
             "vps_role": programme.get("vps_role"),
+            "vps_host_programme_ids": programme.get("vps_host_programme_ids") or [],
         },
         "scope": {
             "programme_id": programme_id,
@@ -3165,9 +5251,14 @@ def process_programme(db: BridgeClient, programme: Dict[str, Any]) -> Dict[str, 
             "required_timeframes": required_timeframes,
             "chart_total_candles": chart_total_candles,
             "required_pairs": [{"symbol": symbol, "timeframe": tf} for symbol, tf in required_pairs_ordered],
-            "programme_filter": "programme_vps IP match (direct owner or active follower)",
+            "programme_filter": "only programme_vps rows matching the detected public VPS IP; direct owners plus active hosted followers; --programme-id can only narrow this authorized set",
+            "vps_ip_address": programme.get("vps_ip_address"),
+            "vps_role": programme.get("vps_role"),
+            "vps_host_programme_ids": programme.get("vps_host_programme_ids") or [],
             "begin_test_policy": "only pending_entry trade records are live when Begin Test is enabled",
-            "root_filter": "apply_to_chart = 1 only",
+            "root_filter": "only first saved root rows with apply_to_chart=1 (PHP ptDbBool semantics); confirmation roots inherit the parent root filter",
+            "applied_root_ids": [as_int(root.get("id"), 0) or 0 for root in active_roots],
+            "applied_root_names": [_root_display_name(root) for root in active_roots],
         },
         "configuration": {
             "roots": roots,
@@ -3186,8 +5277,8 @@ def process_programme(db: BridgeClient, programme: Dict[str, Any]) -> Dict[str, 
         snapshot_path = Path(temp_dir) / "programme_training_runtime.json"
         result_path = Path(temp_dir) / "programme_analytics_result.json"
         _snapshot_write(snapshot_path, snapshot_payload)
-        print(f"  Temporary runtime JSON created: {snapshot_path.name} ({snapshot_path.stat().st_size:,} bytes)")
-        print("  Reloading temporary JSON as the Python in-memory configuration and candle store..")
+        print(f"  Created: {snapshot_path.name} ({snapshot_path.stat().st_size:,} bytes)")
+        print("  Reloading the saved snapshot as the matching input.")
         with snapshot_path.open("r", encoding="utf-8") as handle:
             snapshot = json.load(handle)
 
@@ -3203,7 +5294,8 @@ def process_programme(db: BridgeClient, programme: Dict[str, Any]) -> Dict[str, 
             pair: [] for pair in required_pairs_ordered
         }
 
-        print("configuration matching engine at the background..")
+        progress["stage"] = "matching root families and confirmations"
+        print("\nMATCHING RESULTS")
         for root in runtime_roots:
             root_name = _root_display_name(root)
             parent_tfs = sorted(
@@ -3250,6 +5342,7 @@ def process_programme(db: BridgeClient, programme: Dict[str, Any]) -> Dict[str, 
                             programme_id, user_id, symbol, parent_tf,
                             root, family, parent_candles,
                             source_timeframe=parent_tf,
+                            setup_group_limit=setup_group_limit,
                         )
                         trade = None
                         if trade_for == "root" and root.get("useForTrades"):
@@ -3260,6 +5353,7 @@ def process_programme(db: BridgeClient, programme: Dict[str, Any]) -> Dict[str, 
                                 provider_rr_type=provider_rr_type,
                                 source_timeframe=parent_tf,
                                 account_rules=account_rule_data,
+                                setup_group_limit=setup_group_limit,
                             )
                         record = trade if trade else base
                         parent_records.append(record)
@@ -3468,19 +5562,34 @@ def process_programme(db: BridgeClient, programme: Dict[str, Any]) -> Dict[str, 
                         cr_id = int(cr.get("id") or 0)
                         trace = confirmation_trace.get(cr_id) or {}
                         matcher = trace.get("matcher") or {}
+                        print(f"  Confirmation diagnostics: {_root_display_name(cr, True)}")
                         print(
-                            f"  CONFIRMATION TRACE {_root_display_name(cr, True)}: "
-                            f"parent_families_checked={trace.get('parent_families_checked', 0)}, "
-                            f"anchor_mapped={trace.get('parent_family_anchor_mapped', 0)}, "
-                            f"invalid_parent_index={trace.get('invalid_parent_indices', 0)}, "
-                            f"no_projection_window={trace.get('projection_window_missing', 0)}, "
-                            f"bad_anchor_time={trace.get('anchor_timestamp_invalid', 0)}, "
-                            f"no_lower_anchor={trace.get('lower_anchor_not_found', 0)}, "
-                            f"matcher_calls={trace.get('matcher_calls', 0)}, "
-                            f"matcher_successes={trace.get('matcher_successes', 0)}, "
-                            f"matcher_detail={json.dumps(matcher, ensure_ascii=False, default=str)}, "
-                            f"setup_blockers={json.dumps(trace.get('setup_blockers', []), ensure_ascii=False)}"
+                            f"    Projection: parent checked={trace.get('parent_families_checked', 0):,} | "
+                            f"anchor mapped={trace.get('parent_family_anchor_mapped', 0):,} | "
+                            f"invalid parent index={trace.get('invalid_parent_indices', 0):,}"
                         )
+                        print(
+                            f"    Window/anchor: missing projection window={trace.get('projection_window_missing', 0):,} | "
+                            f"invalid anchor time={trace.get('anchor_timestamp_invalid', 0):,} | "
+                            f"lower anchor not found={trace.get('lower_anchor_not_found', 0):,}"
+                        )
+                        print(
+                            f"    Matcher: calls={trace.get('matcher_calls', 0):,} | "
+                            f"successful calls={trace.get('matcher_successes', 0):,} | "
+                            f"failed calls={matcher.get('failed_calls', 0):,}"
+                        )
+                        if matcher:
+                            print(
+                                f"    Candle checks: main type pass={matcher.get('main_type_passes', 0):,} | "
+                                f"reference checks={matcher.get('reference_candidate_checks', 0):,} | "
+                                f"reference type matches={matcher.get('reference_type_matches', 0):,} | "
+                                f"price matches={matcher.get('price_matches', 0):,} | "
+                                f"price rejected={matcher.get('price_rejections', 0):,}"
+                            )
+                            for reason, count in sorted((matcher.get('failure_reasons') or {}).items()):
+                                print(f"      Failure reason: {reason} ({count:,})")
+                        for blocker in (trace.get('setup_blockers') or []):
+                            print(f"    Setup blocker: {blocker}")
 
                     confirmation_records: Dict[int, List[Dict[str, Any]]] = {
                         int(cr.get("id") or 0): [] for _order, cr in configured_for_child
@@ -3501,6 +5610,7 @@ def process_programme(db: BridgeClient, programme: Dict[str, Any]) -> Dict[str, 
                             programme_id, user_id, symbol, child_tf, root, child_family,
                             lower_candles, int(winning_cr["id"]), cr_name,
                             source_timeframe=parent_tf,
+                            setup_group_limit=setup_group_limit,
                         )
                         trade = None
                         if trade_for == "root_confirmation" and winning_cr.get("useForTrades"):
@@ -3516,6 +5626,7 @@ def process_programme(db: BridgeClient, programme: Dict[str, Any]) -> Dict[str, 
                                 provider_rr_type=provider_rr_type,
                                 source_timeframe=parent_tf,
                                 account_rules=account_rule_data,
+                                setup_group_limit=setup_group_limit,
                             )
                         final_record = trade if trade else base
                         records_by_pair.setdefault((symbol, child_tf), []).append(final_record)
@@ -3540,11 +5651,10 @@ def process_programme(db: BridgeClient, programme: Dict[str, Any]) -> Dict[str, 
             records_by_pair, begin_test_enabled
         )
 
-        print(
-            f"Live/History policy: Begin Test={'ON' if begin_test_enabled else 'OFF'} | "
-            f"pending orders set Live={live_pending_count} | "
-            f"trade records set History={history_trade_count}"
-        )
+        print("\nLIVE / HISTORY POLICY")
+        print(f"  Begin Test: {'ON' if begin_test_enabled else 'OFF'}")
+        print(f"  Pending-entry orders marked Live: {live_pending_count:,}")
+        print(f"  Configured trade records marked History: {history_trade_count:,}")
 
         # Create a separate result JSON before writing to programme_analytics.
         result_rows = []
@@ -3563,52 +5673,289 @@ def process_programme(db: BridgeClient, programme: Dict[str, Any]) -> Dict[str, 
         with result_path.open("r", encoding="utf-8") as handle:
             result_from_json = json.load(handle)
 
-        print("updating analytics to programme analytics")
+        # Capture every calculated pair before the first DB write. This is
+        # important because a persistence error on the first pair must not hide
+        # matches already calculated for later pairs in the same programme.
+        for pair_result in result_from_json.get("results", []):
+            pair_records = pair_result.get("records") or []
+            if not pair_records:
+                continue
+            totals["pairs"] += 1
+            totals["families"] += sum(int(record.get("matched_family") or 0) for record in pair_records)
+            totals["trades"] += sum(int(record.get("trade_configured") or 0) for record in pair_records)
+        progress.update(totals)
+
+        print("\nCALCULATED ANALYTICS SUMMARY (before database writes)")
+        print("  Pair             Matched families    Configured trades")
+        print("  ------------------------------------------------------")
+        for pair_result in result_from_json.get("results", []):
+            pair_symbol = str(pair_result.get("symbol") or "")
+            pair_timeframe = str(pair_result.get("timeframe") or "").upper()
+            pair_records = pair_result.get("records") or []
+            if not pair_records:
+                continue
+            pair_families = sum(int(record.get("matched_family") or 0) for record in pair_records)
+            pair_trades = sum(int(record.get("trade_configured") or 0) for record in pair_records)
+            print(f"  {pair_symbol + ' ' + pair_timeframe:<16} {pair_families:>16,} {pair_trades:>20,}")
+        print("  ------------------------------------------------------")
+        print(f"  {'TOTAL':<16} {totals['families']:>16,} {totals['trades']:>20,}")
+        print(f"  Analytics pairs: {totals['pairs']:,}")
+
+        # PHP parity: synchronize canonical programme-owned chart trades FIRST.
+        # This stage may insert new rows or refresh existing investor_id IS NULL
+        # rows, but it never deletes programme_trades or alters investor copies.
+        all_calculated_records = [
+            record
+            for pair_result in result_from_json.get("results", [])
+            for record in (pair_result.get("records") or [])
+        ]
+        progress["stage"] = "syncing and verifying programme_trades before analytics insertion"
+        configured_trade_rows = sum(
+            1 for record in all_calculated_records
+            if as_int(record.get("trade_configured"), 0) == 1
+            and as_int(record.get("matched_family"), 1) != 0
+        )
+        print("\nPROGRAMME TRADES — FIRST DATABASE WRITE STAGE")
+        print(f"  Calculated analytics records supplied: {len(all_calculated_records):,}")
+        print(f"  Configured trade candidates: {configured_trade_rows:,}")
+        print("  Existing programme-owned trades: updated only when their stored fields changed; exact matches are skipped.")
+        print("  New programme-owned trades: multi-row INSERT batches of up to 500, correlated by chart_identity_hash.")
+        print("  Investor copies and broker trade IDs: preserved; no trade rows are deleted.")
+        trade_sync = sync_programme_trades_first(
+            db, programme_id, user_id, all_calculated_records, active_roots
+        )
+        totals["programme_trade_rows_inserted"] = trade_sync["inserted"]
+        totals["programme_trade_rows_updated"] = trade_sync["updated"]
+        totals["programme_trade_rows_verified"] = trade_sync["verified"]
+        totals["programme_trade_rows_unchanged"] = trade_sync["skipped"]
+        progress.update(totals)
+        print(
+            f"  Programme Trades verified: {trade_sync['verified']:,} | "
+            f"inserted={trade_sync['inserted']:,} | updated={trade_sync['updated']:,} | "
+            f"unchanged/skipped={trade_sync['skipped']:,}"
+        )
+        print("  FIRST STAGE COMPLETE — proceeding to Programme Analytics insertion.")
+
+        # Incremental analytics reconciliation. Existing exact matches remain in
+        # place and are not written again; changed identities update in place;
+        # only identities missing from the old snapshot are inserted.
+        expected_records: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
+        for pair_result in result_from_json.get("results", []):
+            symbol = str(pair_result.get("symbol") or "")
+            timeframe = str(pair_result.get("timeframe") or "").lower()
+            for record in _deduplicate_records(pair_result.get("records") or []):
+                prepared = {column: record.get(column) for column in ANALYTICS_COLUMNS}
+                prepared["programme_id"] = programme_id
+                prepared["userid"] = user_id
+                prepared["symbol"] = str(prepared.get("symbol") or symbol)
+                prepared["timeframe"] = str(prepared.get("timeframe") or timeframe).lower()
+                prepared["rebuild_batch_token"] = None
+                key = _analytics_identity_key(prepared)
+                if key in expected_records:
+                    raise RuntimeError(f"Duplicate calculated analytics identity across pairs: {key!r}")
+                expected_records[key] = prepared
+
+        expected_new_rows = len(expected_records)
+        if expected_new_rows == 0 and int(rebuild_state.get("existing_rows", 0)) > 0:
+            raise RuntimeError(
+                "Fresh calculation produced zero analytics identities while previous analytics exist. "
+                "The existing programme_analytics dataset is preserved; nothing will be deleted."
+            )
+
+        progress["stage"] = "incrementally reconciling programme_analytics"
+        print("\nANALYTICS INCREMENTAL RECONCILIATION")
+        print(f"  Existing rows captured: {rebuild_state['existing_rows']:,}")
+        print(f"  Newly calculated identities: {expected_new_rows:,}")
+        print("  Identical existing rows: retained without INSERT, UPDATE, or DELETE.")
+        print("  Changed existing rows: updated in place; new identities: inserted only once.")
+
         for pair_result in result_from_json.get("results", []):
             symbol = str(pair_result.get("symbol") or "")
             timeframe = str(pair_result.get("timeframe") or "").lower()
             records = pair_result.get("records") or []
             if not records:
-                print(f"  {symbol} {timeframe.upper()}: 0 analytics rows from this run; no new row inserted")
+                print(f"  {symbol} {timeframe.upper()}: no calculated records; no analytics writes needed")
                 continue
             pair_counts = _trade_outcome_counts(records)
-            print(
-                f"  {symbol} {timeframe.upper()}: calculated {pair_counts['trades']} trade(s) "
-                f"(TP={pair_counts['take_profit']}, BE-profit exits={pair_counts['breakeven_profit']}, "
-                f"SL={pair_counts['stoploss']}, BE-triggered={sum(1 for r in records if int(r.get('breakeven_triggered') or 0) == 1)}, "
-                f"BE-stop hits={pair_counts['breakeven_stop_hit']}, pending={pair_counts['pending']}, "
-                f"in_trade={pair_counts['in_trade']}, restricted_date={pair_counts['restricted_date']}, "
-                f"restricted_day={pair_counts['restricted_day']}, excluded={pair_counts['excluded']})"
+            family_count = sum(int(record.get("matched_family") or 0) for record in records)
+            trade_count = sum(int(record.get("trade_configured") or 0) for record in records)
+            print(f"  {symbol} {timeframe.upper()}: reconciling {len(_deduplicate_records(records)):,} family record(s)")
+            print(f"    Matched family records: {family_count:,} | configured trade records: {trade_count:,}")
+            progress["stage"] = f"incrementally reconciling analytics for {symbol} {timeframe.upper()}"
+            persistence = persist_pair(
+                db, programme_id, user_id, symbol, timeframe, records,
+                rebuild_state=rebuild_state,
+                setup_group_limit=setup_group_limit,
             )
-            persistence = persist_pair(db, programme_id, user_id, symbol, timeframe, records)
-            saved = sum(persistence.values())
-            totals["pairs"] += 1
-            totals["families"] += sum(int(record.get("matched_family") or 0) for record in records)
-            totals["trades"] += sum(int(record.get("trade_configured") or 0) for record in records)
+            totals["analytics_rows_inserted"] = totals.get("analytics_rows_inserted", 0) + persistence["inserted"]
+            totals["analytics_rows_updated"] = totals.get("analytics_rows_updated", 0) + persistence["updated"]
+            totals["analytics_rows_unchanged"] = totals.get("analytics_rows_unchanged", 0) + persistence["unchanged"]
+            totals["analytics_rows_saved"] = (
+                totals["analytics_rows_inserted"] + totals["analytics_rows_updated"] +
+                totals["analytics_rows_unchanged"]
+            )
+            progress.update(totals)
             print(
-                f"  {symbol} {timeframe.upper()}: analytics rows processed={saved} "
-                f"(inserted={persistence.get('inserted', 0)}, upserted={persistence.get('upserted', 0)}, "
-                f"updated={persistence.get('updated', 0)}, preserved={persistence.get('preserved', 0)})"
+                f"    Actions: inserted={persistence['inserted']:,} | "
+                f"updated={persistence['updated']:,} | "
+                f"unchanged/skipped={persistence['unchanged']:,} | deleted=0 (deletion deferred)"
             )
 
-    print("Temporary JSON files cleaned up")
+        # No old row is deleted until every expected identity and full payload
+        # has been read back successfully from MySQL Remote.
+        progress["stage"] = "verifying reconciled programme_analytics dataset"
+        verified_rows = verify_incremental_analytics_dataset(
+            db, programme_id, user_id, rebuild_state["desired_records"]
+        )
+        if verified_rows != expected_new_rows:
+            raise RuntimeError(
+                f"Analytics verification count mismatch: expected={expected_new_rows:,}, verified={verified_rows:,}. "
+                "Obsolete old rows were not deleted."
+            )
+
+        old_records = rebuild_state["existing_records"]
+        keep_old_ids = rebuild_state["kept_existing_ids"]
+        obsolete_count = sum(
+            1 for row in old_records
+            if (as_int(row.get("id"), 0) or 0) > 0
+            and (as_int(row.get("id"), 0) or 0) not in keep_old_ids
+        )
+        print("\nANALYTICS INCREMENTAL COMMIT")
+        print(f"  Current identities verified: {verified_rows:,}")
+        print(f"  Existing identical/updated rows retained: {len(keep_old_ids):,}")
+        print(f"  New rows inserted: {totals['analytics_rows_inserted']:,}")
+        print(f"  Changed existing rows updated: {totals['analytics_rows_updated']:,}")
+        print(f"  Obsolete captured rows eligible for deletion: {obsolete_count:,}")
+        progress["stage"] = "deleting obsolete analytics only after full verification"
+        deleted_rows = delete_obsolete_analytics_rows(
+            db, programme_id, user_id, old_records, keep_old_ids
+        )
+        totals["analytics_rows_deleted"] = deleted_rows
+        final_rows = verify_final_analytics_row_count(
+            db, programme_id, user_id, expected_new_rows
+        )
+        totals["analytics_rows_saved"] = final_rows
+        progress.update(totals)
+        print(
+            f"  Cleanup complete: deleted obsolete={deleted_rows:,}; "
+            f"unchanged preserved={totals['analytics_rows_unchanged']:,}; "
+            f"new inserted={totals['analytics_rows_inserted']:,}; "
+            f"changed updated={totals['analytics_rows_updated']:,}."
+        )
+        print("  programme_trades: first-stage upsert/verification completed; no trade rows were deleted.")
+
+    print("\nTemporary runtime/result JSON files cleaned up.")
+    progress.update(totals)
+    progress.update({"status": "COMPLETED", "stage": "complete", "reason": ""})
     print(
-        f"{programme_name} complete: {totals['pairs']} analytics pair(s), "
-        f"{totals['families']} matched family record(s), {totals['trades']} configured trade record(s), "
-        f"{totals['candles']:,} candles fetched"
+        f"{programme_name}: matching and persistence completed | "
+        f"pairs={totals['pairs']} | families={totals['families']:,} | "
+        f"trades={totals['trades']:,} | programme_trades inserted/updated/unchanged="
+        f"{totals.get('programme_trade_rows_inserted', 0):,}/{totals.get('programme_trade_rows_updated', 0):,}/"
+        f"{totals.get('programme_trade_rows_unchanged', 0):,} | "
+        f"analytics inserted/updated/unchanged="
+        f"{totals.get('analytics_rows_inserted', 0):,}/"
+        f"{totals.get('analytics_rows_updated', 0):,}/"
+        f"{totals.get('analytics_rows_unchanged', 0):,} | "
+        f"obsolete analytics deleted={totals.get('analytics_rows_deleted', 0):,} | "
+        f"final analytics rows={totals.get('analytics_rows_saved', 0):,} | candles={totals['candles']:,}"
     )
-    print("Analytics status: only pending-entry orders are Live when Begin Test is enabled; all others are History")
+    print("Analytics policy: pending-entry orders are Live only when Begin Test is enabled; all other records are History.")
     return totals
+
+def print_scan_summary(
+    scan_number: int,
+    elapsed_seconds: float,
+    status: str,
+    programmes_discovered: int,
+    totals: Dict[str, int],
+    programme_reports: Sequence[Dict[str, Any]],
+    failure: Optional[str] = None,
+    vps_ip: Optional[str] = None,
+) -> None:
+    """Always print a readable end-of-cycle summary, including failed cycles."""
+    print("\n" + "=" * 82, flush=True)
+    print(f"PROGRAMME TRAINING SCAN SUMMARY | scan={scan_number} | status={status}", flush=True)
+    print("-" * 82, flush=True)
+    print(f"Elapsed time                 : {elapsed_seconds:.1f}s", flush=True)
+    print(f"Programmes discovered        : {programmes_discovered}", flush=True)
+    print(f"Programmes attempted         : {totals.get('programmes_attempted', 0)}", flush=True)
+    print(f"Programmes completed         : {totals.get('programmes_completed', 0)}", flush=True)
+    print(f"Programmes skipped           : {totals.get('programmes_skipped', 0)}", flush=True)
+    print(f"Programmes failed/blocked    : {totals.get('programmes_failed', 0)}", flush=True)
+    print("", flush=True)
+    print("CALCULATED RESULTS", flush=True)
+    print(f"  Analytics pairs processed  : {totals.get('pairs', 0):,}", flush=True)
+    print(f"  Matched family records      : {totals.get('families', 0):,}", flush=True)
+    print(f"  Configured trade records    : {totals.get('trades', 0):,}", flush=True)
+    print(f"  Candle records fetched      : {totals.get('candles', 0):,}", flush=True)
+    print("", flush=True)
+    print("DATABASE REFRESH RESULTS", flush=True)
+    print(f"  New analytics rows inserted: {totals.get('analytics_rows_inserted', 0):,}", flush=True)
+    print(f"  Existing rows updated       : {totals.get('analytics_rows_updated', 0):,}", flush=True)
+    print(f"  Existing rows unchanged     : {totals.get('analytics_rows_unchanged', 0):,} (no DB write)", flush=True)
+    print(f"  Obsolete analytics deleted  : {totals.get('analytics_rows_deleted', 0):,} (after verification)", flush=True)
+    print(f"  Final analytics rows        : {totals.get('analytics_rows_saved', 0):,}", flush=True)
+    print(
+        "  programme_trades inserted  : "
+        f"{totals.get('programme_trade_rows_inserted', 0):,} | updated: "
+        f"{totals.get('programme_trade_rows_updated', 0):,} | unchanged: "
+        f"{totals.get('programme_trade_rows_unchanged', 0):,} | verified: "
+        f"{totals.get('programme_trade_rows_verified', 0):,} (no deletes)", flush=True
+    )
+    print("", flush=True)
+    if programme_reports:
+        print("PROGRAMME BREAKDOWN", flush=True)
+        for report in programme_reports:
+            name = report.get("programme_name") or f"Programme {report.get('programme_id', '?')}"
+            print(
+                f"  {name} (ID {report.get('programme_id', '?')}) | "
+                f"{report.get('status', 'UNKNOWN')} | stage: {report.get('stage', 'unknown')}",
+                flush=True,
+            )
+            print(
+                f"    pairs={report.get('pairs', 0):,} | "
+                f"families={report.get('families', 0):,} | "
+                f"trades={report.get('trades', 0):,} | "
+                f"candles={report.get('candles', 0):,} | "
+                f"inserted/updated/unchanged={report.get('analytics_rows_inserted', 0):,}/"
+                f"{report.get('analytics_rows_updated', 0):,}/{report.get('analytics_rows_unchanged', 0):,} | "
+                f"obsolete deleted={report.get('analytics_rows_deleted', 0):,} | "
+                f"final rows={report.get('analytics_rows_saved', 0):,}",
+                flush=True,
+            )
+            reason = report.get("reason") or report.get("error")
+            if reason:
+                first_line = str(reason).splitlines()[0]
+                print(f"    Note: {first_line[:300]}", flush=True)
+    if failure:
+        print("", flush=True)
+        print("SCAN BLOCKER", flush=True)
+        first_line = str(failure).splitlines()[0]
+        print(f"  {first_line[:500]}", flush=True)
+    print("-" * 82, flush=True)
+    print(
+        "Begin Test policy: only pending-entry orders can be Live while Begin Test is ON; "
+        "otherwise all trade records are History.",
+        flush=True,
+    )
+    print(
+        "Programme scope: verified VPS public-IP association | "
+        f"IP={vps_ip or 'unavailable; fail closed'} | direct owners + active hosted followers.",
+        flush=True,
+    )
+    print("=" * 82, flush=True)
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description='Programme Training: VPS-scoped chart matcher with Begin-Test pending-order status'
+        description='Programme Training Test: VPS-IP-scoped programme discovery with chart-applied root filtering'
     )
     parser.add_argument('--execution-type', choices=('loop', 'once'), default='loop', help='manager execution mode')
     parser.add_argument('--once', action='store_true', help='run one complete scan and exit (legacy alias)')
     parser.add_argument('--interval', type=int, default=10, help='seconds between complete scans (clamped to 5–10; default: 10)')
     parser.add_argument('--programme-id', type=int, default=None,
-                        help='optionally limit to one programme already assigned to this VPS IP')
+                        help='optionally narrow processing to one programme already assigned to this VPS IP')
     parser.add_argument('--vps-ip', default=None,
                         help='override detected public VPS IP (must match programme_vps.programme_vps_ip_address)')
     parser.add_argument('--bridge-host', default=BRIDGE_HOST)
@@ -3617,11 +5964,15 @@ def main() -> int:
     args.interval = min(10, max(5, int(args.interval)))
     run_as_loop = args.execution_type == 'loop' and not args.once
 
-    print(f'Programme Training starting | mode={"LOOP" if run_as_loop else "ONCE"} | interval={args.interval}s', flush=True)
-    print('Programme Training scope: programmes bound to this VPS IP (direct owner + active followers)', flush=True)
-    print('Begin Test policy: enabled = pending-entry orders Live; disabled = all trades History', flush=True)
-    print('Root filter: apply_to_chart = 1 only; disabled roots and their confirmations are skipped', flush=True)
-    print('Bridge recovery: safe read queries retry until available; ambiguous writes are never blindly replayed', flush=True)
+    print("\n" + "=" * 82, flush=True)
+    print(f"PROGRAMME TRAINING | MODE: {'LOOP' if run_as_loop else 'ONCE'} | SCAN INTERVAL: {args.interval}s", flush=True)
+    print("Scope: programmes assigned to this computer VPS public IP | direct owners + active hosted followers", flush=True)
+    print("Begin Test: only pending-entry orders are Live while enabled; otherwise History.", flush=True)
+    print("Root filter: apply_to_chart = 1 only; disabled roots and their confirmations are skipped.", flush=True)
+    print("Persistence order: programme_trades upsert + verify FIRST; then compare analytics, skip identical rows, insert missing/update changed, verify all, and delete only obsolete analytics.", flush=True)
+    print("programme_trades: bulk INSERT batches up to 500 rows; changed rows use CASE UPDATE batches; NEVER delete trade rows.", flush=True)
+    print("MySQL Remote: safe reads may retry; ambiguous writes are never replayed automatically.", flush=True)
+    print("=" * 82, flush=True)
 
     db = BridgeClient(args.bridge_host, args.bridge_port, BRIDGE_OWNER)
     stopping = False
@@ -3637,72 +5988,163 @@ def main() -> int:
     try:
         local_vps_ip = args.vps_ip or detect_vps_ip()
         if local_vps_ip:
-            print(f'Detected VPS public IP: {local_vps_ip}', flush=True)
+            try:
+                local_vps_ip = str(ipaddress.ip_address(str(local_vps_ip).strip()))
+            except ValueError:
+                log.error("Invalid public VPS IP %r; programme discovery will fail closed.", local_vps_ip)
+                local_vps_ip = None
+        if local_vps_ip:
+            print(f"Detected VPS public IP: {local_vps_ip}", flush=True)
         else:
-            print('VPS public IP could not be detected. Programme discovery will fail closed; no unscoped programmes will run.', flush=True)
+            print(
+                "VPS public IP could not be detected. Programme discovery will fail closed; "
+                "no unscoped programmes will run.",
+                flush=True,
+            )
+        if args.programme_id is not None:
+            print(f"Programme filter: only programme ID {args.programme_id}, after VPS authorization.", flush=True)
 
         scan_number = 0
         while not stopping:
             scan_number += 1
             started = time.monotonic()
-            print('\n' + '=' * 82, flush=True)
-            print(f'PROGRAMME TRAINING SCAN STARTED | cycle={int(started)} | scan={scan_number} | mode={"LOOP" if run_as_loop else "ONCE"}', flush=True)
-            print(f'Discovering programmes assigned to VPS IP {local_vps_ip or "(unavailable)"}...', flush=True)
+            programmes_discovered = 0
+            programme_reports: List[Dict[str, Any]] = []
+            scan_totals: Dict[str, int] = {
+                "programmes_attempted": 0, "programmes_completed": 0,
+                "programmes_skipped": 0, "programmes_failed": 0,
+                "pairs": 0, "families": 0, "trades": 0, "candles": 0,
+                "analytics_rows_deleted": 0, "analytics_rows_saved": 0,
+                "analytics_rows_inserted": 0, "analytics_rows_updated": 0,
+                "analytics_rows_unchanged": 0,
+                "programme_trade_rows_inserted": 0, "programme_trade_rows_updated": 0,
+                "programme_trade_rows_unchanged": 0, "programme_trade_rows_verified": 0,
+            }
+            scan_status = "COMPLETE"
+            scan_failure: Optional[str] = None
+
+            print("\n" + "#" * 82, flush=True)
+            print(f"SCAN {scan_number} START | local time: {datetime.now().astimezone().isoformat(timespec='seconds')}", flush=True)
+            print("#" * 82, flush=True)
             try:
-                programmes = discover_programmes(db, args.programme_id, local_vps_ip)
-                print(f'Programme discovery returned {len(programmes)} VPS-associated candidate programme(s).', flush=True)
-                totals = {'programmes': 0, 'pairs': 0, 'families': 0, 'trades': 0, 'candles': 0}
+                print("[1/3] Discovering programmes assigned to this computer VPS IP...", flush=True)
+                print(f"      VPS public IP scope: {local_vps_ip or '(unavailable; fail closed)'}", flush=True)
+                programmes = (
+                    discover_programmes(db, args.programme_id, local_vps_ip)
+                    if local_vps_ip else []
+                )
+                programmes_discovered = len(programmes)
+                print(
+                    f"      Found {programmes_discovered} VPS-associated programme row(s) "
+                    "for apply_to_chart evaluation.",
+                    flush=True,
+                )
+
                 if not programmes:
                     if not local_vps_ip:
-                        print('No scan performed because the VPS IP is unavailable; refusing to process programmes without an IP match.', flush=True)
+                        print(
+                            "      No scan performed because the VPS public IP is unavailable; "
+                            "refusing to process unassigned programmes.",
+                            flush=True,
+                        )
                     elif args.programme_id is None:
-                        print(f'No programmes are assigned to VPS IP {local_vps_ip}; nothing to scan.', flush=True)
+                        print(f"      No programmes are assigned to VPS IP {local_vps_ip}; nothing to process.", flush=True)
                     else:
-                        print(f'Programme {args.programme_id} is not assigned to VPS IP {local_vps_ip}; nothing to scan.', flush=True)
+                        print(
+                            f"      Programme {args.programme_id} is not assigned to VPS IP "
+                            f"{local_vps_ip}; nothing to process.",
+                            flush=True,
+                        )
 
+                print("[2/3] Processing enabled programme roots...", flush=True)
                 for programme in programmes:
                     if stopping:
+                        scan_status = "INTERRUPTED"
                         break
+                    report: Dict[str, Any] = {}
                     try:
-                        result = process_programme(db, programme)
-                        totals['programmes'] += 1
-                        for key in ('pairs', 'families', 'trades', 'candles'):
-                            totals[key] += int(result.get(key, 0))
-                    except BridgeError:
-                        # Stop this cycle at the first bridge failure. The next
-                        # cycle starts with a fresh channel and safe reads wait
-                        # for the bridge/PHP endpoint to recover.
-                        raise
-                    except Exception:
-                        log.error('Programme %s failed:\n%s', programme.get('id'), traceback.format_exc())
+                        process_programme(db, programme, report)
+                        if report.get("status") == "RUNNING":
+                            report["status"] = "COMPLETED"
+                            report["stage"] = "complete"
+                        elif report.get("status") == "FAILED":
+                            scan_status = "PARTIAL - PROGRAMME ERROR"
+                            if not scan_failure:
+                                scan_failure = str(report.get("reason") or "A programme stage failed.")
+                    except BridgeError as exc:
+                        report["status"] = "DATABASE BLOCKED"
+                        report["error"] = str(exc)
+                        scan_status = "INCOMPLETE - DATABASE ERROR"
+                        scan_failure = str(exc)
+                        log.error(
+                            "Database operation failed for programme %s during %s:\n%s",
+                            programme.get('id'), report.get('stage', 'unknown stage'), str(exc),
+                        )
+                    except Exception as exc:
+                        report["status"] = "FAILED"
+                        report["error"] = str(exc)
+                        scan_status = "PARTIAL - PROGRAMME ERROR"
+                        log.error(
+                            "Programme %s failed during %s:\n%s",
+                            programme.get('id'), report.get('stage', 'unknown stage'), traceback.format_exc(),
+                        )
+                    finally:
+                        scan_totals["programmes_attempted"] += 1
+                        if report.get("status") == "COMPLETED":
+                            scan_totals["programmes_completed"] += 1
+                        elif report.get("status") == "SKIPPED":
+                            scan_totals["programmes_skipped"] += 1
+                        else:
+                            scan_totals["programmes_failed"] += 1
+                        for key in (
+                            "pairs", "families", "trades", "candles",
+                            "analytics_rows_deleted", "analytics_rows_saved",
+                            "analytics_rows_inserted", "analytics_rows_updated", "analytics_rows_unchanged",
+                            "programme_trade_rows_inserted", "programme_trade_rows_updated",
+                            "programme_trade_rows_unchanged", "programme_trade_rows_verified",
+                        ):
+                            scan_totals[key] += int(report.get(key, 0) or 0)
+                        programme_reports.append(report.copy())
 
-                print('\n' + '-' * 82, flush=True)
-                print('PROGRAMME TRAINING SCAN COMPLETE', flush=True)
-                print(f"Programmes processed : {totals['programmes']}", flush=True)
-                print(f"Analytics pairs      : {totals['pairs']}", flush=True)
-                print(f"Matched families     : {totals['families']}", flush=True)
-                print(f"Trade records        : {totals['trades']}", flush=True)
-                print(f"Candles fetched      : {totals['candles']:,}", flush=True)
-                print('Live flag            : pending-entry orders only, and only when Begin Test is enabled', flush=True)
-                print(f"Programme scope      : VPS IP match ({local_vps_ip or 'unavailable'}); direct owner + active followers", flush=True)
-                print('-' * 82, flush=True)
+                    if report.get("status") == "DATABASE BLOCKED":
+                        # Do not continue issuing database writes after a SQL/bridge failure.
+                        break
+
+                print("[3/3] Preparing scan summary...", flush=True)
+
             except BridgeError as exc:
-                log.error('Database bridge/query unavailable; worker remains active: %s', str(exc)[:1800])
-                if not run_as_loop:
-                    return 2
-                db.close()
-                db = BridgeClient(args.bridge_host, args.bridge_port, BRIDGE_OWNER)
-                log.warning('Programme Training will retry database discovery on the next cycle; no process exit requested.')
-            except Exception:
-                log.error('Unexpected scan error; worker remains active:\n%s', traceback.format_exc())
-                if not run_as_loop:
-                    return 1
+                scan_status = "INCOMPLETE - DATABASE ERROR"
+                scan_failure = str(exc)
+                log.error("Programme discovery failed because MySQL Remote was unavailable:\n%s", str(exc))
+            except Exception as exc:
+                scan_status = "INCOMPLETE - UNEXPECTED ERROR"
+                scan_failure = str(exc)
+                log.error("Unexpected scan failure:\n%s", traceback.format_exc())
+            finally:
+                print_scan_summary(
+                    scan_number=scan_number,
+                    elapsed_seconds=time.monotonic() - started,
+                    status=scan_status,
+                    programmes_discovered=programmes_discovered,
+                    totals=scan_totals,
+                    programme_reports=programme_reports,
+                    failure=scan_failure,
+                    vps_ip=local_vps_ip,
+                )
 
             if not run_as_loop:
-                print('Programme Training one-shot scan finished; exiting.', flush=True)
+                print("One-shot scan finished.", flush=True)
+                if scan_status.startswith("INCOMPLETE") or scan_status.startswith("PARTIAL"):
+                    return 2
                 break
+
+            if scan_status.startswith("INCOMPLETE"):
+                db.close()
+                db = BridgeClient(args.bridge_host, args.bridge_port, BRIDGE_OWNER)
+                print("The worker remains active. It will retry on the next scan.", flush=True)
+
             sleep_for = args.interval
-            print(f'Next Programme Training scan in {sleep_for}s.', flush=True)
+            print(f"Next scan starts in {sleep_for} second(s).", flush=True)
             for _ in range(sleep_for):
                 if stopping:
                     break

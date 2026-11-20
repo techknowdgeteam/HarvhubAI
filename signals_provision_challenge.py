@@ -348,14 +348,20 @@ def ensure_monitor_schema(db: BridgeClient) -> bool:
         return False
 
 
-def load_server_config(db: BridgeClient) -> Dict[str, Any]:
-    if not table_exists(db, "server_account"):
+def load_server_operational_settings(db: BridgeClient) -> Dict[str, Any]:
+    """Load global challenge durations from the normalized operational settings row."""
+    if not table_exists(db, "server_operational_settings"):
+        log.error("Required configuration table server_operational_settings is missing")
         return {}
-    rows = db.fetch_all("SELECT * FROM `server_account` WHERE `id`=1 LIMIT 1", timeout=30)
+    rows = db.fetch_all(
+        "SELECT `day_challenge_duration`, `weekly_challenge_duration`, `monthly_challenge_duration` "
+        "FROM `server_operational_settings` WHERE `id`=1 LIMIT 1",
+        timeout=30,
+    )
     return rows[0] if rows else {}
 
 
-def duration_days(period: str, server_config: Dict[str, Any], interest: Dict[str, Any]) -> int:
+def duration_days(period: str, operational_settings: Dict[str, Any], interest: Dict[str, Any]) -> int:
     configured = _int(interest.get("challenge_duration_days"))
     if configured > 0:
         return configured
@@ -364,7 +370,7 @@ def duration_days(period: str, server_config: Dict[str, Any], interest: Dict[str
         "weekly": "weekly_challenge_duration",
         "monthly": "monthly_challenge_duration",
     }[period]
-    return max(0, _int(server_config.get(key)))
+    return max(0, _int(operational_settings.get(key)))
 
 
 # -----------------------------------------------------------------------------
@@ -1023,7 +1029,7 @@ def _saved_terminal_periods(interest: Dict[str, Any], period: str) -> List[Dict[
 def process_programme_challenge(
     db: BridgeClient,
     programme: Dict[str, Any],
-    server_config: Dict[str, Any],
+    operational_settings: Dict[str, Any],
 ) -> Dict[str, Any]:
     programme_id = _int(programme.get("id"))
     user_id = _int(programme.get("userid"))
@@ -1068,7 +1074,7 @@ def process_programme_challenge(
         log.error("Programme %s interest %s has begin_test=1 but no valid signal_testing_started_at; skipped", programme_id, interest.get("id"))
         return {"status": "invalid_start"}
 
-    configured_days = duration_days(period, server_config, interest)
+    configured_days = duration_days(period, operational_settings, interest)
     if configured_days <= 0:
         log.error("Programme %s challenge duration is not configured for %s provision", programme_id, period)
         return {"status": "duration_unconfigured"}
@@ -1192,7 +1198,7 @@ def run_scan(db: BridgeClient, vps_ip: Optional[str], programme_id: Optional[int
         log.info("No programmes are currently associated with this VPS")
         return totals
 
-    server_config = load_server_config(db)
+    operational_settings = load_server_operational_settings(db)
     for programme in programmes:
         pid = _int(programme.get("id"))
         status = _normalise_status(programme.get("begin_test_status"))
@@ -1205,7 +1211,7 @@ def run_scan(db: BridgeClient, vps_ip: Optional[str], programme_id: Optional[int
             totals["skipped"] += 1
             continue
         try:
-            result = process_programme_challenge(db, programme, server_config)
+            result = process_programme_challenge(db, programme, operational_settings)
             totals["checked"] += 1
             state = str(result.get("status") or "unknown")
             if state == "passed":

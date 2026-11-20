@@ -71,7 +71,7 @@ BUNDLED_PYTHON_FILES = [
     "brokerdetails.py",
     "brokercharts.py",
     "programme_training.py",
-    "programmesignals_trading.py",
+    "signals_trading.py",
     "signals_provision_challenge.py",
     "ip.py",
     "notification_email.py",
@@ -131,9 +131,9 @@ PROGRAMS = [
         "bridge": False,
     },
     {
-        "key": "programmesignals_trading",
-        "label": "Programme Signals Trading",
-        "filename": "programmesignals_trading.py",
+        "key": "signals_trading",
+        "label": "Signals Trading",
+        "filename": "signals_trading.py",
         "description": "Processes programme trade requests and the investor trading pipeline.",
         "icon": "↗",
         "args": [],
@@ -170,7 +170,7 @@ RUN_ALL_ORDER = [
     "brokerdetails",
     "brokercharts",
     "programme_training",
-    "programmesignals_trading",
+    "signals_trading",
     "signals_provision_challenge",
 ]
 
@@ -573,11 +573,9 @@ class HarvCoreManager:
         window_height = min(840, max(520, screen_height - 100))
         self.root.geometry(f"{window_width}x{window_height}")
         self.root.minsize(360, 520)
-        # HarvHub AI is deliberately the foreground, always-on-top desktop
-        # window. The app opens maximized instead of taking focus through a
-        # temporary command window.
+        # Open maximized, but do not keep HarvHub above other desktop apps.
+        # The one-time startup activation below briefly raises the new window.
         try:
-            self.root.attributes("-topmost", True)
             self.root.state("zoomed")
         except tk.TclError:
             pass
@@ -607,17 +605,25 @@ class HarvCoreManager:
             self.auto_setup_after_id = self.root.after(700, self._auto_start_setup)
 
     def _activate_main_window(self) -> None:
-        """Bring the maximized HarvHub window forward after Tk has mapped it."""
+        """Activate the newly launched manager once, then release topmost."""
         try:
             if not self.root.winfo_exists():
                 return
             self.root.deiconify()
             self.root.state("zoomed")
+            # Use topmost only during this one startup activation. Clearing it
+            # immediately means later clicks on other desktop apps keep focus.
             self.root.attributes("-topmost", True)
             self.root.lift()
             self.root.focus_force()
         except tk.TclError:
             pass
+        finally:
+            try:
+                if self.root.winfo_exists():
+                    self.root.attributes("-topmost", False)
+            except tk.TclError:
+                pass
 
     # ---------------------------- State and paths ----------------------------
     def _load_execution_config(self) -> dict:
@@ -647,6 +653,14 @@ class HarvCoreManager:
                             str(key): value for key, value in programs.items()
                             if value in ("loop", "once")
                         }
+                        # Preserve the saved Loop/Once choice from the previous
+                        # service key after its source file was renamed.
+                        legacy_signals_key = "programme" + "signals_trading"
+                        if legacy_signals_key in config["programs"]:
+                            config["programs"].setdefault(
+                                "signals_trading", config["programs"][legacy_signals_key]
+                            )
+                            del config["programs"][legacy_signals_key]
                 else:
                     # Previous manager releases persisted Once as the default,
                     # which made monitoring programs finish immediately. The
@@ -2826,7 +2840,7 @@ class HarvCoreManager:
     def run_all(self) -> None:
         execution_type = self.global_execution_type
         warning = (
-            "Programme Signals Trading can manage live MT5 positions, and Signals Provision Challenge can update programme publication and approval statuses.\n\n"
+            "Signals Trading can manage live MT5 positions, and Signals Provision Challenge can update programme publication and approval statuses.\n\n"
             f"Execution type: {execution_type.upper()}. MySQL Remote starts first as the shared database dependency; each other program is then started as a separate process with its own tab console.\n\n"
             "Continue?"
         )

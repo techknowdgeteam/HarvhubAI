@@ -32,7 +32,7 @@ REQUIRED_PAYLOAD_FILES = (
     "brokerdetails.py",
     "brokercharts.py",
     "programme_training.py",
-    "programmesignals_trading.py",
+    "signals_trading.py",
     "signals_provision_challenge.py",
     "ip.py",
     "notification_email.py",
@@ -265,10 +265,7 @@ class Builder:
         self.root.title("HarvHub AI")
         self.root.geometry("900x650")
         self.root.minsize(520, 500)
-        try:
-            self.root.attributes("-topmost", True)
-        except tk.TclError:
-            pass
+        # Do not pin the setup window above other desktop apps.
         self.root.configure(bg=PALETTE["bg"])
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self._build_ui()
@@ -277,6 +274,7 @@ class Builder:
         self.root.after(250, self.start)
 
     def _activate_builder_window(self):
+        """Raise the newly launched setup window once, then release topmost."""
         try:
             if self.root.winfo_exists():
                 self.root.attributes("-topmost", True)
@@ -284,6 +282,12 @@ class Builder:
                 self.root.focus_force()
         except tk.TclError:
             pass
+        finally:
+            try:
+                if self.root.winfo_exists():
+                    self.root.attributes("-topmost", False)
+            except tk.TclError:
+                pass
 
     def button(self, parent, text, command, primary=False):
         return tk.Button(
@@ -670,7 +674,7 @@ BUNDLED_SOURCE_FILES = (
     "brokerdetails.py",
     "brokercharts.py",
     "programme_training.py",
-    "programmesignals_trading.py",
+    "signals_trading.py",
     "signals_provision_challenge.py",
     "ip.py",
     "notification_email.py",
