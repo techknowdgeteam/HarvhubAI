@@ -38,53 +38,96 @@ REQUIRED_PAYLOAD_FILES = (
     "notification_email.py",
     "notification_service.py",
     "harvhub_ipc.py",
+    "harvcore_console_supervisor.py",
     "requirements-runtime.txt",
 )
-DEFAULT_RUNTIME_REQUIREMENTS = "\n".join((
+DEFAULT_RUNTIME_REQUIREMENTS = "# HarvHub AI runtime requirements\n" + "\n".join((
     "MetaTrader5", "pytz", "tzdata", "requests", "urllib3", "certifi",
     "selenium", "beautifulsoup4", "webdriver-manager",
 )) + "\n"
 
 
-def prepare_payload_sources() -> Path:
-    """Ensure the PyInstaller/deployment payload contains every required file.
+def copy_file_with_progress(source: Path, destination: Path, label: str, progress=None) -> None:
+    """Copy one payload file in chunks and report byte progress."""
+    if not source.is_file():
+        raise FileNotFoundError(f"Copy source for {label} is missing: {source}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    total = source.stat().st_size
+    copied = 0
+    last_report = time.monotonic()
+    if callable(progress):
+        progress(f"[COPY] {label}: starting {total:,}-byte copy to {destination}.")
+    with source.open("rb") as src, destination.open("wb") as dst:
+        while True:
+            chunk = src.read(1024 * 1024)
+            if not chunk:
+                break
+            dst.write(chunk)
+            copied += len(chunk)
+            now = time.monotonic()
+            if callable(progress) and (now - last_report >= 5 or copied == total):
+                progress(f"[COPY] {label}: {copied:,}/{total:,} bytes copied.")
+                last_report = now
+        dst.flush()
+        os.fsync(dst.fileno())
+    shutil.copystat(source, destination)
+    if destination.stat().st_size != total:
+        raise OSError(f"Copy size verification failed for {label}: expected {total:,} bytes, got {destination.stat().st_size:,} bytes.")
+    if callable(progress):
+        progress(f"[COPY] {label}: copy completed and size-verified.")
 
-    GitHub projects may keep the service modules beside the builder instead
-    of inside payload/. In that layout, stage them into payload/ here so both
-    the EXE bundle and the post-build source deployment use the same files.
+
+def prepare_payload_sources(progress=None) -> Path:
+    """Stage and verify every runtime source required by HarvHub AI.
+
+    A progress callback receives each package check/copy operation so setup
+    never silently stops while preparing the embedded payload.
     """
+    def report(message: str) -> None:
+        if callable(progress):
+            progress("[PAYLOAD] " + str(message))
+
     payload = APP_DIR / "payload"
     payload.mkdir(parents=True, exist_ok=True)
+    report(f"Preparing payload directory: {payload}")
 
-    for name in REQUIRED_PAYLOAD_FILES:
+    for index, name in enumerate(REQUIRED_PAYLOAD_FILES, start=1):
         target = payload / name
-
-        # Root-level files are the canonical source in the current repository.
-        # Always synchronize a changed root source into payload/. The previous
-        # size-only shortcut kept an older payload copy forever, meaning a
-        # service fix (including its console logging) could be omitted from
-        # the next EXE even after the root source had been replaced.
+        minimum_size = 1 if name == "requirements-runtime.txt" else 100
+        report(f"[{index}/{len(REQUIRED_PAYLOAD_FILES)}] locating {name}")
         root_source = APP_DIR / name
-        if root_source.is_file() and root_source.stat().st_size >= 100:
+        if root_source.is_file() and root_source.stat().st_size >= minimum_size:
             needs_copy = not target.is_file()
             if not needs_copy:
                 try:
                     needs_copy = (
                         root_source.stat().st_size != target.stat().st_size
-                        or hashlib.sha256(root_source.read_bytes()).digest()
-                        != hashlib.sha256(target.read_bytes()).digest()
+                        or sha256_file(root_source, progress, name + " root source") != sha256_file(target, progress, name + " payload copy")
                     )
-                except OSError:
+                except OSError as exc:
+                    report(f"Could not compare payload copy for {name}: {type(exc).__name__}: {exc}; recopying.")
                     needs_copy = True
             if needs_copy:
-                shutil.copy2(root_source, target)
+                report(f"Copying current project source into payload: {name}")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                temporary = target.with_name(target.name + ".staging")
+                try:
+                    copy_file_with_progress(root_source, temporary, name, progress)
+                    if sha256_file(root_source, progress, name + " source verify") != sha256_file(temporary, progress, name + " staged verify"):
+                        raise OSError(f"Payload staging SHA-256 mismatch for {name}.")
+                    temporary.replace(target)
+                finally:
+                    try:
+                        temporary.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+            report(f"Verified payload source: {name} ({target.stat().st_size:,} bytes)")
             continue
 
-        if target.is_file() and target.stat().st_size >= 100:
+        if target.is_file() and target.stat().st_size >= minimum_size:
+            report(f"Using existing payload copy: {name} ({target.stat().st_size:,} bytes)")
             continue
 
-        # A nested source folder is also supported, excluding generated build
-        # output and virtual environments to avoid copying stale artifacts.
         candidates = []
         for candidate in APP_DIR.rglob(name):
             if candidate == target or not candidate.is_file():
@@ -94,27 +137,43 @@ def prepare_payload_sources() -> Path:
                 continue
             if "payload" in relative_parts:
                 continue
-            if candidate.stat().st_size >= 100:
+            if candidate.stat().st_size >= minimum_size:
                 candidates.append(candidate)
         if candidates:
             candidates.sort(key=lambda item: (len(item.relative_to(APP_DIR).parts), str(item).lower()))
-            shutil.copy2(candidates[0], target)
+            report(f"Found {name} at {candidates[0]}; staging into payload.")
+            temporary = target.with_name(target.name + ".staging")
+            try:
+                copy_file_with_progress(candidates[0], temporary, name, progress)
+                if sha256_file(candidates[0], progress, name + " nested source verify") != sha256_file(temporary, progress, name + " staged verify"):
+                    raise OSError(f"Payload staging SHA-256 mismatch for {name}.")
+                temporary.replace(target)
+            finally:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            report(f"Verified payload source: {name} ({target.stat().st_size:,} bytes)")
             continue
 
         if name == "requirements-runtime.txt":
+            report("Runtime requirements file is absent; writing the documented default dependency list.")
             target.write_text(DEFAULT_RUNTIME_REQUIREMENTS, encoding="utf-8")
             continue
 
         raise FileNotFoundError(
-            f"Required HarvHub source '{name}' is missing. Expected it in "
-            f"'{payload}' or beside the project builder in '{APP_DIR}'."
+            f"Required HarvHub source '{name}' is missing. The GitHub bootstrap must download it into "
+            f"the project before building. Checked root '{APP_DIR}' and payload '{payload}'."
         )
 
-    # Fail before PyInstaller starts if any of the six console-managed services
-    # or their shared modules are absent from the staged payload.
-    missing = [name for name in REQUIRED_PAYLOAD_FILES if not (payload / name).is_file()]
+    missing = [
+        name for name in REQUIRED_PAYLOAD_FILES
+        if not (payload / name).is_file()
+        or (payload / name).stat().st_size < (1 if name == "requirements-runtime.txt" else 100)
+    ]
     if missing:
-        raise FileNotFoundError("Incomplete HarvHub AI payload: " + ", ".join(missing))
+        raise FileNotFoundError("Incomplete HarvHub AI payload after staging: " + ", ".join(missing))
+    report(f"Payload ready: all {len(REQUIRED_PAYLOAD_FILES)} required files are present and non-empty.")
     return payload
 
 
@@ -237,12 +296,24 @@ def shutil_which(name: str) -> str | None:
     return shutil.which(name)
 
 
-def sha256_file(path: Path) -> str:
-    """Return a lowercase SHA-256 digest for a file, streaming large files."""
+def sha256_file(path: Path, progress=None, label: str = "file") -> str:
+    """Return SHA-256 using bounded chunks and optional progress reporting."""
     digest = hashlib.sha256()
-    with Path(path).open("rb") as source:
-        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+    file_path = Path(path)
+    total = file_path.stat().st_size
+    processed = 0
+    last_report = time.monotonic()
+    with file_path.open("rb") as source:
+        while True:
+            chunk = source.read(1024 * 1024)
+            if not chunk:
+                break
             digest.update(chunk)
+            processed += len(chunk)
+            now = time.monotonic()
+            if callable(progress) and (now - last_report >= 5 or processed == total):
+                progress(f"[HASH] {label}: {processed:,}/{total:,} bytes hashed.")
+                last_report = now
     return digest.hexdigest().lower()
 
 
@@ -265,29 +336,45 @@ class Builder:
         self.root.title("HarvHub AI")
         self.root.geometry("900x650")
         self.root.minsize(520, 500)
-        # Do not pin the setup window above other desktop apps.
         self.root.configure(bg=PALETTE["bg"])
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.watchdog_stop = threading.Event()
+        self.cancel_event = threading.Event()
+        self.activity_lock = threading.RLock()
+        self.active_operation = "Builder startup"
+        self.last_activity_message = "Creating setup interface."
+        self.last_activity_at = time.monotonic()
+        self.last_watchdog_bucket = 0
+        self.stalled = False
+        self.watchdog_thread = None
         self._build_ui()
         self.root.after(100, self._poll)
-        self.root.after(120, self._activate_builder_window)
+        # Rely on Windows initial process activation; never reassert focus later.
         self.root.after(250, self.start)
 
-    def _activate_builder_window(self):
-        """Raise the newly launched setup window once, then release topmost."""
-        try:
-            if self.root.winfo_exists():
-                self.root.attributes("-topmost", True)
-                self.root.lift()
-                self.root.focus_force()
-        except tk.TclError:
-            pass
-        finally:
-            try:
-                if self.root.winfo_exists():
-                    self.root.attributes("-topmost", False)
-            except tk.TclError:
-                pass
+
+    def _watchdog_loop(self):
+        while not self.watchdog_stop.wait(10):
+            with self.activity_lock:
+                idle = max(0.0, time.monotonic() - self.last_activity_at)
+                operation = self.active_operation
+                detail = self.last_activity_message
+            if idle < 30:
+                continue
+            bucket = int(idle // 30)
+            if bucket <= self.last_watchdog_bucket:
+                continue
+            self.last_watchdog_bucket = bucket
+            message = (
+                f"[WATCHDOG] NO PROGRESS for {int(idle)} seconds. Current operation: {operation}. "
+                f"Last detail: {detail}. The operation has not emitted a new progress event."
+            )
+            self.log(message, activity=False)
+            if idle >= 600:
+                self.stalled = True
+                self.cancel_event.set()
+                self.events.put(("stalled", message + " The builder has requested cancellation after 10 minutes without verified progress. Any active child process will be terminated by the build runner."))
+                return
 
     def button(self, parent, text, command, primary=False):
         return tk.Button(
@@ -350,8 +437,12 @@ class Builder:
         footer = tk.Label(self.root, text="No command window or build button is required. The application is checked and built automatically.", bg=PALETTE["bg"], fg=PALETTE["muted"], font=("Segoe UI", 8))
         footer.pack(fill="x", padx=22, pady=(0, 12))
 
-    def log(self, message: str):
+    def log(self, message: str, *, activity: bool = True):
         text = str(message)
+        if activity:
+            with self.activity_lock:
+                self.last_activity_at = time.monotonic()
+                self.last_activity_message = text
         try:
             with self.log_lock:
                 with self.log_file_path.open("a", encoding="utf-8", errors="replace") as log_file:
@@ -361,20 +452,37 @@ class Builder:
         self.events.put(("log", text))
 
     def set_status(self, message: str):
+        with self.activity_lock:
+            self.active_operation = str(message)
+            self.last_activity_message = str(message)
+            self.last_activity_at = time.monotonic()
         self.events.put(("status", message))
 
     def set_stage(self, index: int, state: str):
+        with self.activity_lock:
+            stage_name = self.stage_labels[index].cget("text") if index < len(self.stage_labels) else f"Stage {index}"
+            self.active_operation = f"{stage_name} ({state})"
+            self.last_activity_message = self.active_operation
+            self.last_activity_at = time.monotonic()
         self.events.put(("stage", index, state))
 
     def _run(self, command: list[str], label: str, timeout: int = 2400):
+        self.log(f"[START] {label} | timeout={timeout}s")
         self.log("$ " + subprocess.list2cmdline(command))
-        process = subprocess.Popen(
-            command, cwd=str(APP_DIR), stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-            text=True, encoding="utf-8", errors="replace", bufsize=1,
-            creationflags=creation_flags(),
-        )
+        try:
+            process = subprocess.Popen(
+                command, cwd=str(APP_DIR), stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                text=True, encoding="utf-8", errors="replace", bufsize=1,
+                creationflags=creation_flags(),
+            )
+        except Exception as exc:
+            raise RuntimeError(f"Could not start {label}: {type(exc).__name__}: {exc}") from exc
         started = time.monotonic()
+        last_output_at = started
+        last_heartbeat = started
+        last_output = "(no output received)"
+        last_no_output_notice = 0
         output_queue: queue.Queue[str | None] = queue.Queue()
 
         def reader():
@@ -389,34 +497,113 @@ class Builder:
         thread.start()
         reader_done = False
         while process.poll() is None:
-            if time.monotonic() - started > timeout:
-                process.kill()
-                raise TimeoutError(f"Timed out while running {label}.")
+            now = time.monotonic()
+            elapsed = now - started
+            if self.cancel_event.is_set():
+                if os.name == "nt":
+                    try:
+                        subprocess.run(
+                            ["taskkill.exe", "/PID", str(process.pid), "/T", "/F"],
+                            capture_output=True, text=True, timeout=15,
+                            creationflags=creation_flags(),
+                        )
+                    except Exception as exc:
+                        self.log(f"[WARNING] Could not stop cancelled process tree for {label}: {exc}", activity=False)
+                try:
+                    process.kill()
+                    process.wait(timeout=10)
+                except Exception:
+                    pass
+                raise TimeoutError(
+                    f"{label} was stopped because the build watchdog detected 10 minutes without verified output/progress. "
+                    f"PID={process.pid}; elapsed={int(elapsed)}s; last output={last_output[:500]}"
+                )
+            no_output_idle = now - last_output_at
+            if no_output_idle >= 30:
+                notice_bucket = int(no_output_idle // 30)
+                if notice_bucket > last_no_output_notice:
+                    self.log(
+                        f"[NO PROGRESS] {label}: child PID={process.pid}; elapsed={int(elapsed)}s; "
+                        f"no new console output for {int(no_output_idle)}s; last output={last_output[:250]}",
+                        activity=False,
+                    )
+                    last_no_output_notice = notice_bucket
+            if elapsed > timeout:
+                if os.name == "nt":
+                    try:
+                        subprocess.run(
+                            ["taskkill.exe", "/PID", str(process.pid), "/T", "/F"],
+                            capture_output=True, text=True, timeout=15,
+                            creationflags=creation_flags(),
+                        )
+                    except Exception as exc:
+                        self.log(f"[WARNING] Could not stop timed-out process tree for {label}: {exc}")
+                try:
+                    process.kill()
+                    process.wait(timeout=10)
+                except Exception:
+                    pass
+                raise TimeoutError(
+                    f"{label} timed out after {int(elapsed)}s (PID {process.pid}). "
+                    f"Last output: {last_output}"
+                )
             try:
                 line = output_queue.get(timeout=0.2)
                 if line is None:
                     reader_done = True
                 else:
+                    last_output = line
+                    last_output_at = time.monotonic()
                     self.log(line)
             except queue.Empty:
                 pass
-        while not reader_done:
+            if now - last_heartbeat >= 15 and process.poll() is None:
+                silent = int(now - last_output_at)
+                self.log(
+                    f"[HEARTBEAT] {label} is still running (PID {process.pid}); "
+                    f"elapsed={int(elapsed)}s; no child output for {silent}s; "
+                    f"last output: {last_output[:250]}",
+                    activity=False,
+                )
+                if silent >= 60:
+                    self.log(f"[NO OUTPUT] {label} has produced no new console output for {silent}s. Waiting for process completion or the {timeout}s timeout.")
+                last_heartbeat = now
+        drain_deadline = time.monotonic() + 8
+        while not reader_done and time.monotonic() < drain_deadline:
             try:
                 line = output_queue.get(timeout=0.2)
                 if line is None:
                     reader_done = True
                 else:
+                    last_output = line
                     self.log(line)
             except queue.Empty:
                 if not thread.is_alive():
                     break
+        if not reader_done and thread.is_alive():
+            self.log(f"[WARNING] {label} exited, but inherited child handles kept its output pipe open. Stopped waiting after 8s; exit code={process.returncode}.")
+            try:
+                if process.stdout:
+                    process.stdout.close()
+            except Exception:
+                pass
         if process.returncode != 0:
-            raise RuntimeError(f"{label} failed (exit code {process.returncode}).")
+            raise RuntimeError(f"{label} failed (exit code {process.returncode}). Last output: {last_output}")
+        self.log(f"[DONE] {label} completed successfully in {int(time.monotonic() - started)}s (exit code 0).")
 
     def start(self):
         if self.running:
             return
         self.running = True
+        self.stalled = False
+        self.cancel_event.clear()
+        self.watchdog_stop.clear()
+        with self.activity_lock:
+            self.last_activity_at = time.monotonic()
+            self.active_operation = "Build startup"
+            self.last_activity_message = "Starting build worker."
+        self.watchdog_thread = threading.Thread(target=self._watchdog_loop, name="harvhub-builder-watchdog", daemon=True)
+        self.watchdog_thread.start()
         self.log_lines = []
         for label in self.stage_labels:
             text = label.cget("text").split("  ", 1)[-1]
@@ -457,7 +644,7 @@ class Builder:
             self.set_stage(2, "done")
 
             self.set_status("Checking and staging all HarvHub AI source files...")
-            self.log(f"Source payload ready: {prepare_payload_sources()}")
+            self.log(f"Source payload ready: {prepare_payload_sources(progress=self.log)}")
 
             self.set_status("Creating HarvHubAI.exe...")
             self.set_stage(3, "running")
@@ -480,7 +667,7 @@ class Builder:
 
             self.set_status("Installing HarvHub AI and creating shortcuts...")
             self.set_stage(4, "running")
-            installed_exe = install_current_release_files()
+            installed_exe = install_current_release_files(progress=self.log)
             self.log(f"INSTALLED: {installed_exe}")
             self.set_stage(4, "done")
             self.set_status("Opening HarvHub AI...")
@@ -515,7 +702,22 @@ class Builder:
                     color = PALETTE["green"] if state == "done" else PALETTE["gold"] if state == "running" else PALETTE["muted"]
                     text = self.stage_labels[index].cget("text").split("  ", 1)[-1]
                     self.stage_labels[index].configure(text=f"{prefix}  {text}", fg=color)
+                elif kind == "stalled":
+                    self.stalled = True
+                    self.progress.stop()
+                    self.running = False
+                    self.status.configure(text="Setup stalled — the exact operation is shown in the console below.")
+                    self.console_visible = True
+                    self.console.pack(fill="both", expand=True, pady=(14, 0))
+                    self.console.configure(state="normal")
+                    self.console.insert("end", str(event[1]) + "\n")
+                    self.console.see("end")
+                    self.console.configure(state="disabled")
+                    self.console_button.configure(text="Hide Build Details")
                 elif kind == "complete":
+                    if self.stalled:
+                        continue
+                    self.watchdog_stop.set()
                     self.progress.stop()
                     self.progress.configure(mode="determinate", value=100)
                     self.running = False
@@ -525,6 +727,7 @@ class Builder:
                     # turns into the HarvHub AI in the same window.
                     self.root.after(250, self.open_manager_in_same_window)
                 elif kind == "failed":
+                    self.watchdog_stop.set()
                     self.progress.stop()
                     self.progress.configure(mode="determinate", value=0)
                     self.running = False
@@ -629,8 +832,11 @@ class Builder:
             os.startfile(str(folder))
 
     def on_close(self):
-        if self.running and not messagebox.askyesno("Close builder?", "The build is still running. Close the builder window?", parent=self.root):
+        if self.running and not messagebox.askyesno("Close builder?", "The build is still running. Stop the active build process and close the builder?", parent=self.root):
             return
+        if self.running:
+            self.cancel_event.set()
+        self.watchdog_stop.set()
         self.root.destroy()
 
 
@@ -680,39 +886,84 @@ BUNDLED_SOURCE_FILES = (
     "notification_email.py",
     "notification_service.py",
     "harvhub_ipc.py",
+    "harvcore_console_supervisor.py",
     "requirements-runtime.txt",
 )
 
 
-def _backup_destination_file(destination: Path, backup_root: Path, relative_name: str) -> None:
+def _backup_destination_file(destination: Path, backup_root: Path, relative_name: str, progress=None) -> None:
     if not destination.is_file():
         return
     backup = backup_root / relative_name
     backup.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(destination, backup)
+    total = destination.stat().st_size
+    copied = 0
+    last_report = time.monotonic()
+    if callable(progress):
+        progress(f"[BACKUP] {relative_name}: backing up {total:,} bytes to {backup}.")
+    with destination.open("rb") as source, backup.open("wb") as target:
+        while True:
+            chunk = source.read(1024 * 1024)
+            if not chunk:
+                break
+            target.write(chunk)
+            copied += len(chunk)
+            now = time.monotonic()
+            if callable(progress) and (now - last_report >= 5 or copied == total):
+                progress(f"[BACKUP] {relative_name}: {copied:,}/{total:,} bytes copied.")
+                last_report = now
+        target.flush()
+        os.fsync(target.fileno())
+    shutil.copystat(destination, backup)
+    if backup.stat().st_size != total:
+        raise OSError(f"Backup size verification failed for {destination}: expected {total:,}, received {backup.stat().st_size:,}.")
 
 
-def _atomic_copy_latest(source: Path, destination: Path, backup_root: Path, relative_name: str, *, force: bool = False) -> bool:
-    """Atomically install a selected project's file, backing up replaced bytes."""
+def _atomic_copy_latest(source: Path, destination: Path, backup_root: Path, relative_name: str, *, force: bool = False, progress=None) -> bool:
+    """Atomically install one file, reporting each check/copy/verification step."""
+    def report(message: str) -> None:
+        if callable(progress):
+            progress(f"[DEPLOY] {relative_name}: {message}")
+
     if not source.is_file():
         raise FileNotFoundError(f"Latest HarvHub source file is missing: {source}")
     destination.parent.mkdir(parents=True, exist_ok=True)
+    report(f"checking source ({source.stat().st_size:,} bytes) and destination {destination}")
     same = False
     if destination.is_file():
         try:
-            same = sha256_file(destination) == sha256_file(source)
-        except OSError:
+            same = sha256_file(destination, progress, relative_name + " installed copy") == sha256_file(source, progress, relative_name + " source")
+        except OSError as exc:
+            report(f"hash comparison failed ({exc}); replacing the destination")
             same = False
     if same and not force:
+        report("already current (SHA-256 verified)")
         return False
     if destination.is_file():
-        _backup_destination_file(destination, backup_root, relative_name)
+        report("backing up existing file")
+        _backup_destination_file(destination, backup_root, relative_name, progress=progress)
     temporary = destination.with_name(destination.name + ".harvhub-new")
     try:
-        shutil.copy2(source, temporary)
-        if sha256_file(temporary) != sha256_file(source):
+        report("copying to temporary file")
+        with source.open("rb") as src, temporary.open("wb") as dst:
+            copied = 0
+            total = source.stat().st_size
+            while True:
+                chunk = src.read(1024 * 1024)
+                if not chunk:
+                    break
+                dst.write(chunk)
+                copied += len(chunk)
+                if callable(progress) and (copied == total or copied % (16 * 1024 * 1024) == 0):
+                    report(f"copied {copied:,}/{total:,} bytes")
+            dst.flush()
+            os.fsync(dst.fileno())
+        shutil.copystat(source, temporary)
+        report("verifying copied SHA-256")
+        if sha256_file(temporary, progress, relative_name + " temporary copy") != sha256_file(source, progress, relative_name + " source verification"):
             raise OSError(f"Copied file verification failed: {destination.name}")
         temporary.replace(destination)
+        report("installed and verified")
     finally:
         try:
             temporary.unlink(missing_ok=True)
@@ -721,7 +972,7 @@ def _atomic_copy_latest(source: Path, destination: Path, backup_root: Path, rela
     return True
 
 
-def install_current_release_files() -> Path:
+def install_current_release_files(progress=None) -> Path:
     """Always replace the installed EXE and deploy source from the selected latest project."""
     install_root = Path(os.environ.get("HARVHUBAI_ROOT", r"C:\xampp\htdocs\harvhubAI"))
     destination = install_root / "HarvHubAI.exe"
@@ -731,10 +982,12 @@ def install_current_release_files() -> Path:
 
     stamp = time.strftime("%Y%m%d-%H%M%S")
     backup_root = install_root / ".manager" / "backups" / stamp
+    if callable(progress):
+        progress(f"[DEPLOY] Preparing install root {install_root}; backup folder {backup_root}.")
 
     # The VBS launcher checks that the installed app/bootstrap is not running
     # before it starts this forced update, so replacing the EXE is safe.
-    _atomic_copy_latest(OUTPUT_EXE, destination, backup_root, "HarvHubAI.exe", force=True)
+    _atomic_copy_latest(OUTPUT_EXE, destination, backup_root, "HarvHubAI.exe", force=True, progress=progress)
     if not destination.is_file() or sha256_file(destination) != sha256_file(OUTPUT_EXE):
         raise RuntimeError("The installed HarvHubAI.exe did not pass SHA-256 verification.")
 
@@ -744,18 +997,20 @@ def install_current_release_files() -> Path:
     source_manifest = {}
     copied_count = 0
     unchanged_count = 0
-    for name in BUNDLED_SOURCE_FILES:
+    for index, name in enumerate(BUNDLED_SOURCE_FILES, start=1):
+        if callable(progress):
+            progress(f"[DEPLOY] [{index}/{len(BUNDLED_SOURCE_FILES)}] Installing runtime file {name}.")
         source = source_root / name
         target = python_root / name
-        changed = _atomic_copy_latest(source, target, backup_root, f"python/{name}")
+        changed = _atomic_copy_latest(source, target, backup_root, f"python/{name}", progress=progress)
         source_manifest[name] = sha256_file(source)
         if changed:
             copied_count += 1
         else:
             unchanged_count += 1
 
-    # Preserve the complete selected project under HarvHub AI. The installed
-    # shortcut points to this VBS, which searches Downloads again on every click.
+    # Preserve the complete selected project under HarvHub AI. The VBS remains
+    # available for explicit updates; installed desktop shortcuts open the EXE.
     manager_dir = install_root / ".manager"
     manager_dir.mkdir(parents=True, exist_ok=True)
     installed_source = manager_dir / "source"
@@ -771,14 +1026,14 @@ def install_current_release_files() -> Path:
     for name in project_files:
         _atomic_copy_latest(
             APP_DIR / name, installed_source / name, backup_root,
-            f".manager/source/{name}",
+            f".manager/source/{name}", progress=progress,
         )
     installed_payload = installed_source / "payload"
     installed_payload.mkdir(parents=True, exist_ok=True)
     for name in BUNDLED_SOURCE_FILES:
         _atomic_copy_latest(
             source_root / name, installed_payload / name, backup_root,
-            f".manager/source/payload/{name}",
+            f".manager/source/payload/{name}", progress=progress,
         )
 
     manifest = {
@@ -787,6 +1042,12 @@ def install_current_release_files() -> Path:
         "deployed_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "files": source_manifest,
     }
+    supervisor_target = python_root / "harvcore_console_supervisor.py"
+    if not supervisor_target.is_file() or supervisor_target.stat().st_size < 100:
+        raise FileNotFoundError(f"The required console supervisor was not installed: {supervisor_target}")
+    if callable(progress):
+        progress(f"[DEPLOY] Console supervisor verified at {supervisor_target}.")
+
     manifest_path = manager_dir / "source_manifest.json"
     manifest_tmp = manifest_path.with_suffix(".json.new")
     manifest_tmp.write_text(__import__("json").dumps(manifest, indent=2), encoding="utf-8")
@@ -796,8 +1057,8 @@ def install_current_release_files() -> Path:
     if not installed_launcher.is_file():
         raise RuntimeError(f"Installed HarvHub AI launcher is missing: {installed_launcher}")
 
-    # The Desktop and Start Menu shortcuts run the VBS updater, not a potentially
-    # stale EXE. The icon is taken from the installed EXE.
+    # Desktop and Start Menu shortcuts open the installed EXE directly. The
+    # explicit HarvHubAI.vbs file remains the separate GitHub update/setup path.
     shortcut_script = r"""
 $ErrorActionPreference = 'Stop'
 $target = $env:HARVHUB_SHORTCUT_TARGET
@@ -817,15 +1078,15 @@ foreach ($folder in $folders) {
     $shortcut.TargetPath = $target
     $shortcut.Arguments = $shortcutArgs
     $shortcut.WorkingDirectory = $work
-    $shortcut.Description = 'HarvHub AI — automatic latest-project updater'
+    $shortcut.Description = 'HarvHub AI — open installed application'
     $shortcut.IconLocation = "$icon,0"
     $shortcut.Save()
 }
 """
     env = os.environ.copy()
-    env["HARVHUB_SHORTCUT_TARGET"] = str(Path(os.environ.get("WINDIR", r"C:\Windows")) / "System32" / "wscript.exe")
-    env["HARVHUB_SHORTCUT_ARGS"] = f'"{installed_launcher}"'
-    env["HARVHUB_SHORTCUT_WORK"] = str(installed_source)
+    env["HARVHUB_SHORTCUT_TARGET"] = str(destination)
+    env["HARVHUB_SHORTCUT_ARGS"] = ""
+    env["HARVHUB_SHORTCUT_WORK"] = str(install_root)
     env["HARVHUB_SHORTCUT_ICON"] = str(destination)
     result = subprocess.run(
         ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", shortcut_script],
@@ -918,7 +1179,7 @@ def main():
 
 
 def _show_builder_startup_error(error_text: str) -> bool:
-    """Show unexpected builder startup failures in a topmost copyable window."""
+    """Show unexpected builder startup failures in a normal copyable window."""
     root = None
     try:
         root = tk.Tk()
@@ -926,7 +1187,6 @@ def _show_builder_startup_error(error_text: str) -> bool:
         root.geometry("1000x680")
         root.minsize(680, 460)
         root.configure(bg=PALETTE["bg"])
-        root.attributes("-topmost", True)
         panel = tk.Frame(root, bg=PALETTE["surface"], padx=22, pady=20)
         panel.pack(fill="both", expand=True, padx=18, pady=18)
         tk.Label(panel, text="HarvHub AI setup could not start", bg=PALETTE["surface"],
@@ -953,7 +1213,6 @@ def _show_builder_startup_error(error_text: str) -> bool:
                                 bg=PALETTE["gold"], fg="#fff", relief="flat",
                                 padx=16, pady=9, font=("Segoe UI", 9, "bold"))
         copy_button.pack(side="left")
-        root.after(120, lambda: (root.lift(), root.focus_force()))
         root.mainloop()
         return True
     except Exception:

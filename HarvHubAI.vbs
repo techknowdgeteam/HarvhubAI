@@ -21,15 +21,40 @@ clickedVbs = WScript.ScriptFullName
 
 ' Elevate before downloading so the visible installer is not restarted midway.
 If Not IsAdministrator() Then
+    On Error Resume Next
     shellApp.ShellExecute "wscript.exe", """" & WScript.ScriptFullName & """ /elevated", fso.GetParentFolderName(WScript.ScriptFullName), "runas", 1
+    If Err.Number <> 0 Then
+        diagnosticText = "Could not request administrator permission." & vbCrLf & _
+            "VBScript error " & Err.Number & ": " & Err.Description
+        Err.Clear
+        Call ShowDiagnosticWindow("HarvHub AI elevation request failed", diagnosticText)
+        WScript.Quit 22
+    End If
+    On Error GoTo 0
     WScript.Quit 0
 End If
 
 ' Enforce one active HarvHub setup/update session. Older HarvHub manager,
 ' bootstrap, builder, and service processes are stopped before files are touched.
 ' Unrelated Windows applications and system processes are never targeted.
+On Error Resume Next
 Call EnsureFolderTree(cacheRoot)
+If Err.Number <> 0 Then
+    diagnosticText = "Could not create the bootstrap folder: " & cacheRoot & vbCrLf & _
+        "VBScript error " & Err.Number & ": " & Err.Description
+    Err.Clear
+    Call ShowDiagnosticWindow("HarvHub AI bootstrap folder creation failed", diagnosticText)
+    WScript.Quit 14
+End If
 Call StopExistingHarvHubProcesses()
+If Err.Number <> 0 Then
+    diagnosticText = "The HarvHub process-cleanup stage failed before it could finish." & vbCrLf & _
+        "VBScript error " & Err.Number & ": " & Err.Description
+    Err.Clear
+    Call ShowDiagnosticWindow("HarvHub AI process cleanup failed", diagnosticText)
+    WScript.Quit 15
+End If
+On Error GoTo 0
 
 ' Open the Windows Forms installer visibly, but run its PowerShell host hidden.
 ' The installer itself remains a normal visible window. There is no CMD window to
@@ -37,11 +62,43 @@ Call StopExistingHarvHubProcesses()
 Set processEnv = sh.Environment("PROCESS")
 processEnv("HARVHUBAI_CLICKED_VBS") = clickedVbs
 
+On Error Resume Next
 Set psFile = fso.CreateTextFile(psScriptPath, True, False)
+If Err.Number <> 0 Then
+    diagnosticText = "Could not create the generated PowerShell bootstrap: " & psScriptPath & vbCrLf & _
+        "VBScript error " & Err.Number & ": " & Err.Description
+    Err.Clear
+    Call ShowDiagnosticWindow("HarvHub AI bootstrap script could not be created", diagnosticText)
+    WScript.Quit 16
+End If
 psFile.Write BootstrapPowerShell()
+If Err.Number <> 0 Then
+    diagnosticText = "Could not write the generated PowerShell bootstrap: " & psScriptPath & vbCrLf & _
+        "VBScript error " & Err.Number & ": " & Err.Description
+    Err.Clear
+    psFile.Close
+    Call ShowDiagnosticWindow("HarvHub AI bootstrap script could not be written", diagnosticText)
+    WScript.Quit 17
+End If
 psFile.Close
+If Err.Number <> 0 Then
+    diagnosticText = "Could not close the generated PowerShell bootstrap file: " & psScriptPath & vbCrLf & _
+        "VBScript error " & Err.Number & ": " & Err.Description
+    Err.Clear
+    Call ShowDiagnosticWindow("HarvHub AI bootstrap script could not be closed", diagnosticText)
+    WScript.Quit 18
+End If
 
 Set psProcess = sh.Exec("powershell.exe -NoLogo -NoProfile -STA -WindowStyle Hidden -ExecutionPolicy Bypass -File """ & psScriptPath & """")
+If Err.Number <> 0 Then
+    diagnosticText = "Could not launch the PowerShell bootstrap." & vbCrLf & _
+        "Command: powershell.exe -NoLogo -NoProfile -STA -WindowStyle Hidden -ExecutionPolicy Bypass -File " & psScriptPath & vbCrLf & _
+        "VBScript error " & Err.Number & ": " & Err.Description
+    Err.Clear
+    Call ShowDiagnosticWindow("HarvHub AI PowerShell process could not start", diagnosticText)
+    WScript.Quit 19
+End If
+On Error GoTo 0
 Do While psProcess.Status = 0
     WScript.Sleep 250
 Loop
@@ -56,24 +113,40 @@ On Error GoTo 0
 If psExit <> 0 Then
     diagnosticText = Trim(psStdErr & vbCrLf & psStdOut)
     If Len(diagnosticText) = 0 Then diagnosticText = ReadAllText(fso.BuildPath(cacheRoot, "bootstrap_error.txt"))
-    MsgBox "HarvHub AI installer startup failed with exit code " & psExit & "." & vbCrLf & vbCrLf & diagnosticText, vbCritical, "HarvHub AI bootstrap"
+    If Len(Trim(diagnosticText)) = 0 Then diagnosticText = "PowerShell exited without returning captured output. See the bootstrap log and generated script paths below."
+    diagnosticText = diagnosticText & vbCrLf & vbCrLf & "----- COMPLETE VISIBLE BOOTSTRAP LOG -----" & vbCrLf & _
+        ReadAllText(fso.BuildPath(cacheRoot, "visible_bootstrap.log"))
+    Call ShowDiagnosticWindow("HarvHub AI installer failed", "Installer PowerShell exit code: " & psExit & vbCrLf & _
+        "PowerShell script: " & psScriptPath & vbCrLf & _
+        "Bootstrap error file: " & fso.BuildPath(cacheRoot, "bootstrap_error.txt") & vbCrLf & vbCrLf & diagnosticText)
     WScript.Quit psExit
 End If
 
 projectRoot = Trim(ReadAllText(markerPath))
 pythonwPath = Trim(ReadAllText(pythonMarkerPath))
 If Len(projectRoot) = 0 Or Not fso.FolderExists(projectRoot) Then
-    MsgBox "The downloaded HarvHub AI source folder could not be found. Run HarvHubAI.vbs again.", vbCritical, "HarvHub AI bootstrap"
+    Call ShowDiagnosticWindow("HarvHub AI source validation failed", _
+        "The downloaded HarvHub AI source folder could not be found." & vbCrLf & _
+        "Expected project marker: " & markerPath & vbCrLf & _
+        "Marker contents: " & projectRoot & vbCrLf & _
+        "Bootstrap error: " & ReadAllText(fso.BuildPath(cacheRoot, "bootstrap_error.txt")))
     WScript.Quit 10
 End If
 If Len(pythonwPath) = 0 Or Not fso.FileExists(pythonwPath) Then
-    MsgBox "The Python GUI runtime could not be found after bootstrap.", vbCritical, "HarvHub AI bootstrap"
+    Call ShowDiagnosticWindow("HarvHub AI Python runtime missing", _
+        "The Python GUI runtime could not be found after bootstrap." & vbCrLf & _
+        "Python marker: " & pythonMarkerPath & vbCrLf & _
+        "Marker contents: " & pythonwPath & vbCrLf & _
+        "Bootstrap error: " & ReadAllText(fso.BuildPath(cacheRoot, "bootstrap_error.txt")))
     WScript.Quit 11
 End If
 
 builderScript = fso.BuildPath(projectRoot, "Build_HarvHubProgram.pyw")
 If Not fso.FileExists(builderScript) Then
-    MsgBox "The downloaded GitHub project is missing Build_HarvHubProgram.pyw.", vbCritical, "HarvHub AI bootstrap"
+    Call ShowDiagnosticWindow("HarvHub AI builder source missing", _
+        "The downloaded GitHub project is missing Build_HarvHubProgram.pyw." & vbCrLf & _
+        "Expected builder: " & builderScript & vbCrLf & _
+        "Project root: " & projectRoot)
     WScript.Quit 12
 End If
 
@@ -85,7 +158,7 @@ processEnv("HARVHUBAI_GITHUB_BOOTSTRAPPED") = "1"
 processEnv("HARVHUB_BUILDER_LOG") = builderLogPath
 
 ' Launch the builder with pythonw.exe directly. It creates its own visible,
-' topmost Tk window and captures build output in its in-window console/log file.
+' normal Tk window and captures build output in its in-window console/log file.
 ' No cmd.exe or PowerShell wrapper is created during a normal launch.
 builderCommand = Chr(34) & pythonwPath & Chr(34) & " " & Chr(34) & builderScript & Chr(34) & " --install --force-rebuild"
 ' Run the GUI-subsystem Python process directly. WindowStyle 0 prevents a
@@ -100,9 +173,14 @@ If Err.Number <> 0 Then
 End If
 On Error GoTo 0
 If builderExit <> 0 Then
-    diagnosticText = ReadAllText(builderLogPath)
+    diagnosticText = ReadAllTextUtf8(builderLogPath)
     If Len(Trim(diagnosticText)) = 0 Then diagnosticText = builderLaunchError
-    MsgBox "HarvHub AI build window exited with code " & builderExit & "." & vbCrLf & vbCrLf & diagnosticText, vbCritical, "HarvHub AI build"
+    If Len(Trim(diagnosticText)) = 0 Then diagnosticText = "The GUI builder exited without writing console output. Check that Python can start the builder and that the project sources are accessible."
+    Call ShowDiagnosticWindow("HarvHub AI build failed", _
+        "Builder process exit code: " & builderExit & vbCrLf & _
+        "Python runtime: " & pythonwPath & vbCrLf & _
+        "Builder script: " & builderScript & vbCrLf & _
+        "Builder log: " & builderLogPath & vbCrLf & vbCrLf & diagnosticText)
     WScript.Quit builderExit
 End If
 WScript.Quit 0
@@ -161,7 +239,9 @@ Function PSChunk01()
         "$script:markerPath = Join-Path $script:cacheRoot 'project_root.txt'", _
         "$script:pythonMarkerPath = Join-Path $script:cacheRoot 'pythonw_path.txt'", _
         "$script:errorPath = Join-Path $script:cacheRoot 'bootstrap_error.txt'", _
+        "$script:logPath = Join-Path $script:cacheRoot 'visible_bootstrap.log'", _
         "New-Item -ItemType Directory -Path $script:cacheRoot -Force | Out-Null", _
+        "[System.IO.File]::WriteAllText($script:logPath, '', [System.Text.Encoding]::Unicode)", _
         "$form = New-Object System.Windows.Forms.Form" _
     ), vbCrLf)
 End Function
@@ -177,6 +257,7 @@ Function PSChunk02()
         "$form.MinimizeBox = $false", _
         "$form.ControlBox = $false", _
         "$form.ShowInTaskbar = $true", _
+        "$form.TopMost = $false", _
         "$form.BackColor = [System.Drawing.Color]::FromArgb(250,247,239)", _
         "$form.ForeColor = [System.Drawing.Color]::FromArgb(48,39,24)", _
         "$form.Font = New-Object System.Drawing.Font('Segoe UI', 9)", _
@@ -295,6 +376,13 @@ Function PSChunk08()
         "$script:logBox.ForeColor = [System.Drawing.Color]::FromArgb(48,39,24)", _
         "$script:logBox.Font = New-Object System.Drawing.Font('Consolas', 8)", _
         "$card.Controls.Add($script:logBox)", _
+        "$script:copyButton = New-Object System.Windows.Forms.Button", _
+        "$script:copyButton.Text = 'Copy Error Details'", _
+        "$script:copyButton.Location = New-Object System.Drawing.Point(440, 390)", _
+        "$script:copyButton.Size = New-Object System.Drawing.Size(138, 28)", _
+        "$script:copyButton.Visible = $false", _
+        "$script:copyButton.Add_Click({ try { [System.Windows.Forms.Clipboard]::SetText($script:logBox.Text); $script:statusLabel.Text = 'Installer details copied to clipboard.' } catch { [System.Windows.Forms.MessageBox]::Show(('Could not copy details: ' + $_.Exception.Message), 'HarvHub AI') } })", _
+        "$card.Controls.Add($script:copyButton)", _
         "$script:closeButton = New-Object System.Windows.Forms.Button" _
     ), vbCrLf)
 End Function
@@ -316,7 +404,9 @@ Function PSChunk09()
         "    [System.Windows.Forms.Application]::DoEvents()", _
         "}", _
         "function Add-UiLog([string]$Message) {", _
-        "    $script:logBox.AppendText(('[' + (Get-Date -Format 'HH:mm:ss') + '] ' + $Message + [Environment]::NewLine))" _
+        "    $line = '[' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') + '] ' + $Message", _
+        "    try { [System.IO.File]::AppendAllText($script:logPath, $line + [Environment]::NewLine, [System.Text.Encoding]::Unicode) } catch { }", _
+        "    $script:logBox.AppendText($line + [Environment]::NewLine)" _
     ), vbCrLf)
 End Function
 
@@ -341,79 +431,84 @@ End Function
 
 Function PSChunk11()
     PSChunk11 = Join(Array( _
-        "            $script:stepLabels[$n].ForeColor = [System.Drawing.Color]::FromArgb(184,135,32)", _
-        "        } else {", _
-        "            $script:stepLabels[$n].Text = 'o  ' + $stepNames[$n]", _
-        "            $script:stepLabels[$n].ForeColor = [System.Drawing.Color]::FromArgb(130,116,93)", _
-        "        }", _
-        "    }", _
-        "    Pump-Ui", _
-        "}", _
-        "function Download-ToFile([string]$Url, [string]$Destination, [string]$Label) {", _
+        "function Download-ToFile([string]$Url, [string]$Destination, [string]$Label, [long]$ResumeOffset = 0) {", _
         "    Add-UiLog(('Downloading ' + $Label + '.'))", _
         "    $request = $null; $response = $null; $inputStream = $null; $outputStream = $null", _
         "    $phase = 'opening a connection to the download server'", _
         "    try {", _
         "        $request = [System.Net.HttpWebRequest]::Create($Url)", _
         "        $request.Method = 'GET'", _
-        "        $request.UserAgent = 'HarvHubAI-Installer/2.0'", _
+        "        $request.UserAgent = 'HarvHubAI-Installer/3.0'", _
         "        $request.Accept = 'application/zip, application/octet-stream;q=0.9, */*;q=0.8'", _
-        "        $request.Timeout = 90000", _
-        "        $request.ReadWriteTimeout = 90000", _
+        "        $request.Timeout = 180000", _
+        "        $request.ReadWriteTimeout = 300000", _
         "        $request.KeepAlive = $true", _
         "        $request.ProtocolVersion = [Version]'1.1'", _
         "        $request.ServicePoint.ConnectionLimit = 8", _
         "        $request.ServicePoint.UseNagleAlgorithm = $false", _
         "        $request.AllowAutoRedirect = $true", _
+        "        if ($ResumeOffset -gt 0) { $request.AddRange($ResumeOffset); Add-UiLog('Requesting HTTP range resume from byte ' + $ResumeOffset + '.') }", _
         "        $script:progress.Style = 'Blocks'", _
-        "        $script:statusLabel.Text = 'Connecting to download server... (90-second response limit)'", _
+        "        $script:statusLabel.Text = 'Connecting to download server... (180-second response limit)'", _
         "        Pump-Ui" _
     ), vbCrLf)
 End Function
 
 Function PSChunk12()
     PSChunk12 = Join(Array( _
-        "        $phase = 'waiting for the server response (90-second limit)'", _
+        "        $phase = 'waiting for the server response (180-second limit)'", _
         "        $responseTimer = [System.Diagnostics.Stopwatch]::StartNew()", _
         "        $asyncResponse = $request.BeginGetResponse($null, $null)", _
         "        $lastWaitNotice = 0", _
         "        while (!$asyncResponse.IsCompleted) {", _
         "            $waitSeconds = [int]$responseTimer.Elapsed.TotalSeconds", _
-        "            if ($waitSeconds -ge 90) { try { $request.Abort() } catch {}; throw ('Timed out after 90 seconds waiting for download response headers. Check internet access, DNS, firewall, proxy settings, and server availability. URL: ' + $Url) }", _
-        "            if ($waitSeconds -ge ($lastWaitNotice + 15)) { $lastWaitNotice = $waitSeconds; Add-UiLog('Still waiting for response headers: ' + $waitSeconds + '/90 seconds.'); $script:statusLabel.Text = 'Waiting for download server... ' + $waitSeconds + '/90 seconds' }", _
+        "            if ($waitSeconds -ge 180) { try { $request.Abort() } catch {}; throw ('Timed out after 180 seconds waiting for download response headers. Check internet access, DNS, firewall, proxy settings, and server availability. URL: ' + $Url) }", _
+        "            if ($waitSeconds -ge ($lastWaitNotice + 15)) { $lastWaitNotice = $waitSeconds; Add-UiLog('Still waiting for response headers: ' + $waitSeconds + '/180 seconds.'); $script:statusLabel.Text = 'Waiting for download server... ' + $waitSeconds + '/180 seconds' }", _
         "            Pump-Ui", _
         "            Start-Sleep -Milliseconds 100", _
         "        }", _
         "        $response = $request.EndGetResponse($asyncResponse)", _
-        "        $total = [long]$response.ContentLength", _
-        "        if ($total -gt 0) { Add-UiLog('Server responded. Download size: ' + [Math]::Round($total / 1MB, 2) + ' MB.') } else { Add-UiLog('Server did not provide a download size; the fixed progress bar will advance using received bytes.') }", _
+        "        $appendResponse = $false", _
+        "        if ($ResumeOffset -gt 0 -and $response.StatusCode -eq [System.Net.HttpStatusCode]::PartialContent) {", _
+        "            $contentRange = [string]$response.Headers['Content-Range']", _
+        "            if ($contentRange -notmatch ('^bytes\s+' + [regex]::Escape([string]$ResumeOffset) + '-')) { throw ('The server returned an unexpected Content-Range while resuming at byte ' + $ResumeOffset + ': ' + $contentRange) }", _
+        "            $appendResponse = $true", _
+        "            Add-UiLog('Server accepted range resume at byte ' + $ResumeOffset + '.')", _
+        "        } elseif ($ResumeOffset -gt 0) {", _
+        "            Add-UiLog('Server did not honor HTTP range resume (status ' + [int]$response.StatusCode + '). Restarting this route from byte zero safely.')", _
+        "            $ResumeOffset = 0", _
+        "        }", _
+        "        $responseLength = [long]$response.ContentLength", _
+        "        $total = if ($responseLength -gt 0) { $responseLength + $ResumeOffset } else { -1 }", _
+        "        if ($total -gt 0) { Add-UiLog('Server responded. Total archive size: ' + [Math]::Round($total / 1MB, 2) + ' MB.') } else { Add-UiLog('Server did not provide a download size; progress will be measured using received bytes.') }", _
         "        $phase = 'opening the download response stream'", _
         "        $inputStream = $response.GetResponseStream()", _
         "        if (!$inputStream) { throw 'The download server returned an empty response stream.' }", _
-        "        $outputStream = [System.IO.File]::Open($Destination, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)", _
+        "        $fileMode = if ($appendResponse) { [System.IO.FileMode]::Append } else { [System.IO.FileMode]::Create }", _
+        "        $outputStream = [System.IO.File]::Open($Destination, $fileMode, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)", _
         "        $downloadTimer = [System.Diagnostics.Stopwatch]::StartNew()", _
         "        $speedSampleTimer = [System.Diagnostics.Stopwatch]::StartNew()", _
-        "        [long]$received = 0", _
+        "        [long]$received = $ResumeOffset", _
+        "        [long]$receivedThisAttempt = 0", _
         "        [long]$speedSampleBytes = 0", _
-        "        [int]$slowSpeedWindows = 0", _
         "        $lastProgressNotice = 0" _
     ), vbCrLf)
 End Function
 
 Function PSChunk13()
     PSChunk13 = Join(Array( _
-        "        $phase = 'downloading the archive (20-minute total limit; 90-second idle limit)'", _
+        "        $phase = 'downloading the archive (20-minute attempt limit; 2-hour route limit; 5-minute idle limit; slow connections are allowed)'", _
         "        $buffer = New-Object byte[] 262144", _
         "        while ($true) {", _
-        "            if ($downloadTimer.Elapsed.TotalSeconds -ge 1200) { try { $request.Abort() } catch {}; throw 'Download exceeded the 20-minute overall limit. The connection was stopped.' }", _
+        "            if ($downloadTimer.Elapsed.TotalSeconds -ge 1200) { try { $request.Abort() } catch {}; throw 'This download attempt exceeded the 20-minute limit. Its partial archive is being retained for a resume attempt.' }", _
         "            $readTimer = [System.Diagnostics.Stopwatch]::StartNew()", _
         "            $asyncRead = $inputStream.BeginRead($buffer, 0, $buffer.Length, $null, $null)", _
         "            $lastIdleNotice = 0", _
         "            while (!$asyncRead.IsCompleted) {", _
         "                $idleSeconds = [int]$readTimer.Elapsed.TotalSeconds", _
-        "                if ($downloadTimer.Elapsed.TotalSeconds -ge 1200) { try { $request.Abort() } catch {}; throw 'Download exceeded the 20-minute overall limit. The connection was stopped.' }", _
-        "                if ($idleSeconds -ge 90) { try { $request.Abort() } catch {}; throw ('No archive data arrived for 90 seconds. The connection appears stalled. Received so far: ' + [Math]::Round($received / 1MB, 2) + ' MB. URL: ' + $Url) }", _
-        "                if ($idleSeconds -ge ($lastIdleNotice + 15)) { $lastIdleNotice = $idleSeconds; Add-UiLog('Connected, but no archive data has arrived for ' + $idleSeconds + ' seconds. Received: ' + [Math]::Round($received / 1MB, 2) + ' MB.') }", _
+        "                if ($downloadTimer.Elapsed.TotalSeconds -ge 1200) { try { $request.Abort() } catch {}; throw 'This download attempt exceeded the 20-minute limit. Its partial archive is being retained for a resume attempt.' }", _
+        "                if ($idleSeconds -ge 300) { try { $request.Abort() } catch {}; throw ('No archive data arrived for 300 seconds. The connection appears stalled. Partial data received: ' + [Math]::Round($received / 1MB, 2) + ' MB. URL: ' + $Url) }", _
+        "                if ($idleSeconds -ge ($lastIdleNotice + 30)) { $lastIdleNotice = $idleSeconds; Add-UiLog('Connected, but no archive data has arrived for ' + $idleSeconds + ' seconds. Partial data received: ' + [Math]::Round($received / 1MB, 2) + ' MB.') }", _
         "                Pump-Ui", _
         "                Start-Sleep -Milliseconds 100", _
         "            }", _
@@ -421,9 +516,10 @@ Function PSChunk13()
         "            if ($count -le 0) { break }", _
         "            $outputStream.Write($buffer, 0, $count)", _
         "            $received += $count", _
+        "            $receivedThisAttempt += $count", _
         "            $speedSampleBytes += $count", _
         "            $elapsedSeconds = [Math]::Max(0.1, $downloadTimer.Elapsed.TotalSeconds)", _
-        "            $averageKBps = $received / $elapsedSeconds / 1KB", _
+        "            $averageKBps = $receivedThisAttempt / $elapsedSeconds / 1KB", _
         "            if ($total -gt 0) {", _
         "                $percent = [int][Math]::Min(100, [Math]::Floor($received * 100.0 / $total))", _
         "                $script:progress.Value = [Math]::Max($script:progress.Value, [Math]::Min(100, $percent))", _
@@ -435,9 +531,7 @@ Function PSChunk13()
         "            }", _
         "            if ($speedSampleTimer.Elapsed.TotalSeconds -ge 30) {", _
         "                $sampleKBps = $speedSampleBytes / [Math]::Max(1, $speedSampleTimer.Elapsed.TotalSeconds) / 1KB", _
-        "                Add-UiLog('Current download speed: ' + [Math]::Round($sampleKBps, 1) + ' KB/s; average: ' + [Math]::Round($averageKBps, 1) + ' KB/s.')", _
-        "                if ($Label -like '*Codeload direct*' -and $downloadTimer.Elapsed.TotalSeconds -ge 45 -and $sampleKBps -lt 24) { $slowSpeedWindows++ } else { $slowSpeedWindows = 0 }", _
-        "                if ($slowSpeedWindows -ge 2) { try { $request.Abort() } catch {}; throw ('HARVHUB_SLOW_ROUTE: Download route averaged less than 24 KB/s across two consecutive 30-second samples. Received: ' + [Math]::Round($received / 1MB, 2) + ' MB. Switching to the alternate GitHub route.') }", _
+        "                Add-UiLog('Current download speed: ' + [Math]::Round($sampleKBps, 1) + ' KB/s; attempt average: ' + [Math]::Round($averageKBps, 1) + ' KB/s. Slow speeds are permitted; the installer will continue while bytes arrive.')", _
         "                $speedSampleBytes = 0", _
         "                $speedSampleTimer.Restart()", _
         "            }", _
@@ -459,10 +553,10 @@ Function PSChunk14()
         "        if (!(Test-Path -LiteralPath $Destination)) { throw 'The download file was not created.' }", _
         "        $actualSize = (Get-Item -LiteralPath $Destination).Length", _
         "        if ($actualSize -lt 10240) { throw ('The downloaded ZIP is too small or incomplete: ' + $actualSize + ' bytes.') }", _
-        "        if ($total -gt 0 -and $received -ne $total) { throw ('The downloaded ZIP is incomplete. Server declared ' + $total + ' bytes but only ' + $received + ' bytes were received.') }", _
+        "        if ($total -gt 0 -and $received -ne $total) { throw ('The downloaded ZIP is incomplete. Expected ' + $total + ' bytes but the file currently contains ' + $received + ' bytes. The partial file will be resumed.') }", _
         "        $script:progress.Style = 'Blocks'", _
         "        $script:progress.Value = 100", _
-        "        Add-UiLog($Label + ' download completed: ' + [Math]::Round($actualSize / 1MB, 2) + ' MB.')" _
+        "        Add-UiLog($Label + ' transfer completed: ' + [Math]::Round($actualSize / 1MB, 2) + ' MB. Checking ZIP integrity before accepting it.')" _
     ), vbCrLf)
 End Function
 
@@ -473,13 +567,15 @@ Function PSChunk15()
         "        $detail = $exception.Message", _
         "        $networkDetail = ''", _
         "        if ($exception -is [System.Net.WebException]) { $networkDetail = ' Network status: ' + $exception.Status + '.'; try { if ($exception.Response) { $networkDetail += ' HTTP response: ' + $exception.Response.StatusCode + ' ' + $exception.Response.StatusDescription + '.' } } catch { } }", _
-        "        try { if ($outputStream) { $outputStream.Dispose(); $outputStream = $null } } catch { }", _
+        "        try { if ($outputStream) { $outputStream.Flush(); $outputStream.Dispose(); $outputStream = $null } } catch { }", _
         "        try { if ($inputStream) { $inputStream.Dispose(); $inputStream = $null } } catch { }", _
         "        try { if ($response) { $response.Dispose(); $response = $null } } catch { }", _
         "        try { if ($request) { $request.Abort() } } catch { }", _
-        "        try { Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue } catch { }", _
+        "        $partialSize = 0", _
+        "        try { if (Test-Path -LiteralPath $Destination) { $partialSize = (Get-Item -LiteralPath $Destination).Length } } catch { }", _
+        "        if ($partialSize -ge 10240) { Add-UiLog('Keeping ' + [Math]::Round($partialSize / 1MB, 2) + ' MB of partial archive data for an HTTP range-resume attempt.') } else { try { Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue } catch { } }", _
         "        $failure = $Label + ' download failed while ' + $phase + '. URL: ' + $Url + '. Cause: ' + $detail + $networkDetail", _
-        "        Add-UiLog('DOWNLOAD FAILED: ' + $failure)", _
+        "        Add-UiLog('DOWNLOAD ATTEMPT FAILED: ' + $failure)", _
         "        throw $failure", _
         "    } finally {", _
         "        if ($outputStream) { try { $outputStream.Dispose() } catch { } }", _
@@ -487,22 +583,92 @@ Function PSChunk15()
         "        if ($response) { try { $response.Dispose() } catch { } }", _
         "    }", _
         "}", _
+        "function Download-ToFileWithRetry([string]$Url, [string]$Destination, [string]$Label, [int]$MaxSeconds = 7200) {", _
+        "    $retryTimer = [System.Diagnostics.Stopwatch]::StartNew()", _
+        "    $attempt = 0", _
+        "    $errors = @()", _
+        "    while ($attempt -lt 8 -and $retryTimer.Elapsed.TotalSeconds -lt $MaxSeconds) {", _
+        "        $attempt++", _
+        "        $resumeOffset = 0", _
+        "        if (Test-Path -LiteralPath $Destination) {", _
+        "            try { $resumeOffset = [long](Get-Item -LiteralPath $Destination).Length } catch { $resumeOffset = 0 }", _
+        "            if ($resumeOffset -lt 10240) { Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue; $resumeOffset = 0 }", _
+        "        }", _
+        "        try {", _
+        "            Add-UiLog('Download attempt ' + $attempt + '/8 for ' + $Label + '; elapsed=' + [int]$retryTimer.Elapsed.TotalSeconds + 's.')", _
+        "            Download-ToFile $Url $Destination $Label $resumeOffset", _
+        "            return", _
+        "        } catch {", _
+        "            $caught = $_", _
+        "            $message = ($caught | Out-String).Trim()", _
+        "            $errors += $message", _
+        "            if ($message -match 'Content-Range') { Add-UiLog('The server returned an invalid resume range. Discarding this partial file and restarting the download from byte zero.'); Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue }", _
+        "            $rangeStatus = 0", _
+        "            try { if ($caught.Exception.Response) { $rangeStatus = [int]$caught.Exception.Response.StatusCode } } catch { }", _
+        "            if ($rangeStatus -eq 416 -and (Test-Path -LiteralPath $Destination) -and (Get-Item -LiteralPath $Destination).Length -ge 10240) { Add-UiLog('The server reports there are no bytes beyond the retained file. Continuing to downstream integrity/size verification.'); return }", _
+        "            if ($attempt -lt 8 -and $retryTimer.Elapsed.TotalSeconds -lt $MaxSeconds) {", _
+        "                $delay = [Math]::Min(30, 5 * $attempt)", _
+        "                Add-UiLog($Label + ' failed: ' + $message + ' Retrying in ' + $delay + ' seconds; usable partial data will be resumed.')", _
+        "                for ($wait = 0; $wait -lt $delay; $wait++) { Pump-Ui; Start-Sleep -Seconds 1 }", _
+        "            }", _
+        "        }", _
+        "    }", _
+        "    throw ('Download retries/time limit exhausted for ' + $Label + '. ' + ($errors -join ' || '))", _
+        "}", _
+        "function Test-RepositoryZip([string]$Path) {", _
+        "    Add-Type -AssemblyName System.IO.Compression.FileSystem", _
+        "    $archive = [System.IO.Compression.ZipFile]::OpenRead($Path)", _
+        "    try {", _
+        "        $entryCount = $archive.Entries.Count", _
+        "        if ($entryCount -lt 5) { throw ('Repository ZIP contains too few entries: ' + $entryCount) }", _
+        "        return $entryCount", _
+        "    } finally { $archive.Dispose() }", _
+        "}", _
         "function Download-GitHubRepository([string]$Destination) {", _
         "    $routes = @(@{ Name = 'GitHub Codeload direct'; Url = 'https://codeload.github.com/techknowdgeteam/HarvhubAI/zip/refs/heads/main' }, @{ Name = 'GitHub archive fallback'; Url = 'https://github.com/techknowdgeteam/HarvhubAI/archive/refs/heads/main.zip' })", _
         "    $routeErrors = @()", _
         "    foreach ($route in $routes) {", _
-        "        try {", _
-        "            if (Test-Path -LiteralPath $Destination) { Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue }", _
-        "            Add-UiLog('Trying download route: ' + $route.Name + '.')", _
-        "            Download-ToFile $route.Url $Destination ($route.Name + ' repository ZIP')", _
-        "            return", _
-        "        } catch {", _
-        "            $routeMessage = ($_ | Out-String).Trim()", _
-        "            $routeErrors += ($route.Name + ': ' + $routeMessage)", _
-        "            Add-UiLog($route.Name + ' failed. Trying the alternate GitHub route.')", _
+        "        $routeTimer = [System.Diagnostics.Stopwatch]::StartNew()", _
+        "        $attempt = 0", _
+        "        while ($attempt -lt 8 -and $routeTimer.Elapsed.TotalSeconds -lt 7200) {", _
+        "            $attempt++", _
+        "            $resumeOffset = 0", _
+        "            if (Test-Path -LiteralPath $Destination) {", _
+        "                try { $resumeOffset = [long](Get-Item -LiteralPath $Destination).Length } catch { $resumeOffset = 0 }", _
+        "                if ($resumeOffset -lt 10240) { Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue; $resumeOffset = 0 }", _
+        "            }", _
+        "            try {", _
+        "                Add-UiLog('Trying download route: ' + $route.Name + ' | attempt ' + $attempt + '/8 | elapsed=' + [int]$routeTimer.Elapsed.TotalSeconds + 's.')", _
+        "                if ($resumeOffset -gt 0) { Add-UiLog('Resuming the existing partial archive at byte ' + $resumeOffset + '; no already-received bytes will be intentionally discarded.') }", _
+        "                Download-ToFile $route.Url $Destination ($route.Name + ' repository ZIP') $resumeOffset", _
+        "                $entryCount = Test-RepositoryZip $Destination", _
+        "                Add-UiLog('GitHub repository ZIP passed integrity validation with ' + $entryCount + ' entries.')", _
+        "                return", _
+        "            } catch {", _
+        "                $caught = $_", _
+        "                $routeMessage = ($caught | Out-String).Trim()", _
+        "                $routeErrors += ($route.Name + ' attempt ' + $attempt + ': ' + $routeMessage)", _
+        "                if ($routeMessage -match 'central directory|invalid|not a valid zip|zip archive') { Add-UiLog('The downloaded bytes did not yet form a valid ZIP. Keeping the partial file so the next attempt can request the remaining byte range.') }", _
+        "                if ($routeMessage -match 'Content-Range') { Add-UiLog('The server returned an invalid resume range. Restarting this route from byte zero.'); Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue }", _
+        "                $rangeStatus = 0", _
+        "                try { if ($caught.Exception.Response) { $rangeStatus = [int]$caught.Exception.Response.StatusCode } } catch { }", _
+        "                if ($rangeStatus -eq 416 -and (Test-Path -LiteralPath $Destination)) {", _
+        "                    try { $entryCount = Test-RepositoryZip $Destination; Add-UiLog('The server rejected a resume because the retained file is already complete; ZIP integrity passed with ' + $entryCount + ' entries.'); return } catch { Add-UiLog('Retained partial archive is not complete; restarting this route from byte zero.'); Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue }", _
+        "                }", _
+        "                Add-UiLog($route.Name + ' attempt ' + $attempt + ' failed: ' + $routeMessage)", _
+        "                if ($attempt -lt 8 -and $routeTimer.Elapsed.TotalSeconds -lt 7200) {", _
+        "                    $delay = [Math]::Min(30, 5 * $attempt)", _
+        "                    Add-UiLog('Retrying the same GitHub route in ' + $delay + ' seconds. Any usable partial archive will be resumed; low bandwidth alone is not a failure.')", _
+        "                    for ($wait = 0; $wait -lt $delay; $wait++) { Pump-Ui; Start-Sleep -Seconds 1 }", _
+        "                } else {", _
+        "                    Add-UiLog($route.Name + ' retry/time limit reached after ' + [int]$routeTimer.Elapsed.TotalSeconds + ' seconds.')", _
+        "                }", _
+        "            }", _
         "        }", _
+        "        if (Test-Path -LiteralPath $Destination) { Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue }", _
+        "        Add-UiLog('Download route exhausted. Trying the next GitHub route.')", _
         "    }", _
-        "    throw ('All GitHub download routes failed. ' + ($routeErrors -join ' || '))", _
+        "    throw ('All GitHub download routes failed after resumable retries. ' + ($routeErrors -join ' || '))", _
         "}", _
         "function Find-CompatiblePython {", _
         "    $roots = @((Join-Path $env:LOCALAPPDATA 'Programs\Python'), $env:ProgramFiles)", _
@@ -537,11 +703,32 @@ Function PSChunk17()
         "function Wait-WithUi($Process, [string]$Message) {", _
         "    $script:progress.Style = 'Blocks'", _
         "    $script:statusLabel.Text = $Message", _
+        "    $watch = [System.Diagnostics.Stopwatch]::StartNew()", _
+        "    $lastReport = -15", _
+        "    $lastCpuSeconds = 0.0", _
+        "    $lastWorkingSet = 0", _
+        "    Add-UiLog('[START] ' + $Message + ' PID=' + $Process.Id + '; maximum wait=1200 seconds.')", _
         "    while (!$Process.HasExited) {", _
         "        Pump-Ui", _
-        "        Start-Sleep -Milliseconds 120", _
+        "        Start-Sleep -Milliseconds 250", _
         "        $Process.Refresh()", _
+        "        if ($watch.Elapsed.TotalSeconds -ge ($lastReport + 15)) {", _
+        "            $cpuSeconds = 0.0", _
+        "            $workingSet = 0", _
+        "            try { $cpuSeconds = $Process.TotalProcessorTime.TotalSeconds; $workingSet = $Process.WorkingSet64 } catch { }", _
+        "            $cpuDelta = [math]::Round(($cpuSeconds - $lastCpuSeconds), 2)", _
+        "            Add-UiLog('[HEARTBEAT] ' + $Message + ' still running; PID=' + $Process.Id + '; elapsed=' + [int]$watch.Elapsed.TotalSeconds + 's; CPU used in last interval=' + $cpuDelta + 's; working set=' + $workingSet + ' bytes. The installer does not expose its internal progress stream.')", _
+        "            $lastCpuSeconds = $cpuSeconds", _
+        "            $lastWorkingSet = $workingSet", _
+        "            $lastReport = [int]$watch.Elapsed.TotalSeconds", _
+        "        }", _
+        "        if ($watch.Elapsed.TotalSeconds -ge 1200) {", _
+        "            Add-UiLog('[TIMEOUT] ' + $Message + ' exceeded 1200 seconds. PID=' + $Process.Id + '; last CPU=' + $lastCpuSeconds + 's; last working set=' + $lastWorkingSet + ' bytes.')", _
+        "            try { Stop-Process -Id $Process.Id -Force -ErrorAction Stop } catch { Add-UiLog('[WARNING] Could not terminate installer PID=' + $Process.Id + ': ' + $_.Exception.Message) }", _
+        "            throw ($Message + ' timed out after 1200 seconds. Process PID=' + $Process.Id + '. Last CPU=' + $lastCpuSeconds + 's; working set=' + $lastWorkingSet + ' bytes.')", _
+        "        }", _
         "    }", _
+        "    Add-UiLog('[EXIT] ' + $Message + ' finished with exit code ' + $Process.ExitCode + ' after ' + [int]$watch.Elapsed.TotalSeconds + ' seconds.')", _
         "    $script:progress.Style = 'Blocks'", _
         "    $script:progress.Value = 100", _
         "    if ($Process.ExitCode -ne 0 -and $Process.ExitCode -ne 3010) {", _
@@ -571,17 +758,23 @@ Function PSChunk19()
     PSChunk19 = Join(Array( _
         "    Set-UiStage 1 'Extracting and validating the downloaded HarvHub AI files...' 0", _
         "    Add-Type -AssemblyName System.IO.Compression.FileSystem", _
+        "    Add-UiLog('Validating downloaded GitHub archive: ' + $script:zipPath)", _
         "    $archive = [System.IO.Compression.ZipFile]::OpenRead($script:zipPath)", _
         "    try {", _
+        "        Add-UiLog('GitHub archive contains ' + $archive.Entries.Count + ' entries; size=' + (Get-Item -LiteralPath $script:zipPath).Length + ' bytes.')", _
         "        if ($archive.Entries.Count -lt 5) { throw 'GitHub archive contains too few files.' }", _
         "    } finally { $archive.Dispose() }", _
+        "    Add-UiLog('Extracting GitHub archive into: ' + $script:extractRoot)", _
         "    [System.IO.Compression.ZipFile]::ExtractToDirectory($script:zipPath, $script:extractRoot)", _
+        "    Add-UiLog('GitHub archive extraction completed. Locating the project builder and required runtime files.')", _
         "    Remove-Item -LiteralPath $script:zipPath -Force -ErrorAction SilentlyContinue", _
         "    $builderFile = Get-ChildItem -LiteralPath $script:extractRoot -Recurse -File -Filter 'Build_HarvHubProgram.pyw' | Select-Object -First 1", _
         "    if (!$builderFile) { throw 'GitHub repository is missing Build_HarvHubProgram.pyw.' }", _
         "    $project = $builderFile.Directory.FullName", _
         "    $managerFile = Join-Path $project 'harvcore_manager.py'", _
         "    if (!(Test-Path -LiteralPath $managerFile)) { throw 'GitHub repository is missing harvcore_manager.py beside the builder.' }", _
+        "    Add-UiLog('Selected project root: ' + $project)", _
+        "    Add-UiLog('Manager source found: ' + $managerFile)", _
         "    $payload = Join-Path $project 'payload'", _
         "    New-Item -ItemType Directory -Path $payload -Force | Out-Null" _
     ), vbCrLf)
@@ -589,8 +782,9 @@ End Function
 
 Function PSChunk20()
     PSChunk20 = Join(Array( _
-        "    $sourceNames = @('mysqlremote.py','brokerdetails.py','brokercharts.py','programme_training.py','signals_trading.py','signals_provision_challenge.py','ip.py','notification_email.py','notification_service.py','harvhub_ipc.py')", _
+        "    $sourceNames = @('mysqlremote.py','brokerdetails.py','brokercharts.py','programme_training.py','signals_trading.py','signals_provision_challenge.py','ip.py','notification_email.py','notification_service.py','harvhub_ipc.py','harvcore_console_supervisor.py')", _
         "    foreach ($name in $sourceNames) {", _
+        "        Add-UiLog('Checking and staging required source: ' + $name)", _
         "        $target = Join-Path $payload $name", _
         "        $baseName = [System.IO.Path]::GetFileNameWithoutExtension($name)", _
         "        $ext = [System.IO.Path]::GetExtension($name)", _
@@ -610,12 +804,19 @@ Function PSChunk21()
     PSChunk21 = Join(Array( _
         "                $_.FullName -notmatch '\\(build|release|dist|\.build-venv|\.git)\\'", _
         "            } | Sort-Object @{Expression={ if ($_.Name -ieq $name) { 0 } else { 1 } }}, FullName | Select-Object -First 1", _
-        "            if (!$found) { throw ('Required Python source is missing: ' + $name) }", _
-        "            Copy-Item -LiteralPath $found.FullName -Destination $target -Force", _
+        "            if (!$found) {", _
+        "                $rawUrl = 'https://raw.githubusercontent.com/techknowdgeteam/HarvhubAI/main/' + $name", _
+        "                Add-UiLog('Required source was not in the archive extraction. Downloading individual GitHub fallback: ' + $name)", _
+        "                Download-ToFileWithRetry $rawUrl $target ('GitHub source fallback: ' + $name) 7200", _
+        "            } else {", _
+        "                Add-UiLog('Found nested source file: ' + $found.FullName + '; copying into payload.')", _
+        "                Copy-Item -LiteralPath $found.FullName -Destination $target -Force", _
+        "            }", _
         "        }", _
         "        if (!(Test-Path -LiteralPath $target) -or (Get-Item -LiteralPath $target).Length -lt 100) {", _
         "            throw ('Python source is missing or incomplete: ' + $name)", _
         "        }", _
+        "        Add-UiLog('Validated source: ' + $name + ' (' + (Get-Item -LiteralPath $target).Length + ' bytes)')", _
         "    }", _
         "    $requirements = Join-Path $payload 'requirements-runtime.txt'", _
         "    if (!(Test-Path -LiteralPath $requirements)) {", _
@@ -632,11 +833,11 @@ Function PSChunk22()
         "    Copy-Item -LiteralPath $clickedVbs -Destination (Join-Path $project 'HarvHubAI.vbs') -Force", _
         "    Copy-Item -LiteralPath $clickedVbs -Destination (Join-Path $project 'Build_HarvHubProgram.vbs') -Force", _
         "    $localProjectFolder = Split-Path -Parent $clickedVbs", _
-        "    foreach ($overrideName in @('Build_HarvHubProgram.pyw','harvcore_manager.py')) {", _
+        "    foreach ($overrideName in @('Build_HarvHubProgram.pyw','harvcore_manager.py','signals_trading.py','harvcore_console_supervisor.py')) {", _
         "        $localOverride = Join-Path $localProjectFolder $overrideName", _
         "        if (Test-Path -LiteralPath $localOverride -PathType Leaf) {", _
         "            Copy-Item -LiteralPath $localOverride -Destination (Join-Path $project $overrideName) -Force", _
-        "            Add-UiLog ('Applied local startup fix: ' + $overrideName)", _
+        "            Add-UiLog ('Applied local source override: ' + $overrideName)", _
         "        }", _
         "    }", _
         "    foreach ($required in @('Build_HarvHubProgram.pyw','harvcore_manager.py','HarvHubAI.vbs','Build_HarvHubProgram.vbs')) {", _
@@ -655,7 +856,7 @@ End Function
 Function PSChunk23()
     PSChunk23 = Join(Array( _
         "        $pythonUrl = 'https://www.python.org/ftp/python/3.13.17/python-3.13.17-amd64.exe'", _
-        "        Download-ToFile $pythonUrl $pythonInstaller 'Python 3.13.17 x64 installer'", _
+        "        Download-ToFileWithRetry $pythonUrl $pythonInstaller 'Python 3.13.17 x64 installer' 7200", _
         "        $expectedHash = '5da012101ba2e17113a9a1cd901e9ce1441086f2b7ecb5de06ec94163899a190'", _
         "        $actualHash = (Get-FileHash -LiteralPath $pythonInstaller -Algorithm SHA256).Hash.ToLowerInvariant()", _
         "        if ($actualHash -ne $expectedHash) { throw 'Python installer SHA-256 verification failed.' }", _
@@ -694,16 +895,26 @@ Function PSChunk25()
     PSChunk25 = Join(Array( _
         "    exit 0", _
         "} catch {", _
-        "    $message = ($_ | Out-String).Trim()", _
+        "    $errorRecord = $_", _
+        "    $message = @(", _
+        "        'HARVHUB AI INSTALLER FAILURE',", _
+        "        ('Timestamp: ' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff')) ,", _
+        "        ('Message: ' + $errorRecord.Exception.Message),", _
+        "        ('Category: ' + $errorRecord.CategoryInfo),", _
+        "        ('FullyQualifiedErrorId: ' + $errorRecord.FullyQualifiedErrorId),", _
+        "        ('ScriptStackTrace: ' + $errorRecord.ScriptStackTrace),", _
+        "        'Source position:',", _
+        "        ($errorRecord.InvocationInfo.PositionMessage),", _
+        "        'Complete PowerShell error record:',", _
+        "        ($errorRecord | Format-List * -Force | Out-String),", _
+        "        'Exception details:',", _
+        "        ($errorRecord.Exception.ToString())", _
+        "    ) -join [Environment]::NewLine", _
         "    try { [System.IO.File]::WriteAllText($script:errorPath, $message, [System.Text.Encoding]::Unicode) } catch { }", _
-        "    Add-UiLog('ERROR: ' + $message)", _
-        "    $script:statusLabel.Text = 'Setup stopped. Read the error above, then close this window.'", _
-        "    $script:statusLabel.ForeColor = [System.Drawing.Color]::FromArgb(185,55,45)", _
-        "    $script:progress.Style = 'Blocks'", _
-        "    $script:progress.Value = 0", _
-        "    $form.ControlBox = $true", _
-        "    $script:closeButton.Visible = $true", _
-        "    $script:closeButton.Enabled = $true", _
+        "    try { Add-UiLog('ERROR: ' + $errorRecord.Exception.Message); $script:logBox.AppendText([Environment]::NewLine + $message + [Environment]::NewLine); $script:logBox.SelectionStart = $script:logBox.TextLength; $script:logBox.ScrollToCaret() } catch { }", _
+        "    try { $script:statusLabel.Text = 'Setup stopped. Copy the full error details or read the report file.'; $script:statusLabel.ForeColor = [System.Drawing.Color]::FromArgb(185,55,45) } catch { }", _
+        "    try { $script:progress.Style = 'Blocks'; $script:progress.Value = 0; $form.ControlBox = $true } catch { }", _
+        "    try { $script:copyButton.Visible = $true; $script:copyButton.Enabled = $true; $script:closeButton.Visible = $true; $script:closeButton.Enabled = $true } catch { }", _
         "    while ($form.Visible) {", _
         "        Pump-Ui" _
     ), vbCrLf)
@@ -721,6 +932,7 @@ End Function
 
 Sub StopExistingHarvHubProcesses()
     Dim helperPath, helperFile, helperScript, cleanupExit, cleanupError
+    On Error Resume Next
     helperPath = fso.BuildPath(cacheRoot, "cleanup_" & Replace(fso.GetTempName(), ".tmp", "") & ".ps1")
 
     helperScript = Join(Array( _
@@ -742,7 +954,6 @@ Sub StopExistingHarvHubProcesses()
         "    [void]$protectedIds.Add($launcherPid)", _
         "    $launcherParent = $all | Where-Object { [int]$_.ProcessId -eq [int]$launcher.ParentProcessId } | Select-Object -First 1", _
         "    if ($launcherParent -and ([string]$launcherParent.Name -match '^(wscript|cscript)\.exe$')) { [void]$protectedIds.Add([int]$launcherParent.ProcessId) }", _
-        "    $legacySignalsTradingName = 'programme' + 'signals_trading.py'", _
         "    $processById = @{}", _
         "    foreach ($proc in $all) { $processById[[int]$proc.ProcessId] = $proc }", _
         "    $rootIds = New-Object 'System.Collections.Generic.HashSet[int]'", _
@@ -756,7 +967,7 @@ Sub StopExistingHarvHubProcesses()
         "        elseif (($name -eq 'wscript.exe' -or $name -eq 'cscript.exe') -and $cmd -match '(?i)(HarvHubAI|Build_HarvHubProgram)\.vbs') { $isHarvHub = $true }", _
         "        elseif ($name -eq 'powershell.exe' -and $cmd -match '(?i)(visible_bootstrap\.ps1|visible_builder_launch\.ps1|console_first_bootstrap\.ps1|cleanup_[^\\]*\.ps1)') { $isHarvHub = $true }", _
         "        elseif ($name -eq 'cmd.exe' -and $cmd -match '(?i)(HarvHubAI_First_Time_Setup\.cmd|HarvHubAI_Visible_(Installer|Build)\.cmd|cleanup_[^\\]*\.cmd)') { $isHarvHub = $true }", _
-        "        elseif (($name -eq 'python.exe' -or $name -eq 'pythonw.exe') -and (($cmd -match '(?i)(Build_HarvHubProgram\.pyw|mysqlremote\.py|brokerdetails\.py|brokercharts\.py|programme_training\.py|signals_trading\.py|signals_provision_challenge\.py)') -or $cmd -match ('(?i)' + [regex]::Escape($legacySignalsTradingName)))) { $isHarvHub = $true }", _
+        "        elseif (($name -eq 'python.exe' -or $name -eq 'pythonw.exe') -and $cmd -match '(?i)(Build_HarvHubProgram\.pyw|mysqlremote\.py|brokerdetails\.py|brokercharts\.py|programme_training\.py|signals_trading\.py|signals_provision_challenge\.py)') { $isHarvHub = $true }", _
         "        elseif ($name -match '^python-3\..*-amd64\.exe$' -and $cmd -match '(?i)HarvHubAI\\Bootstrap') { $isHarvHub = $true }", _
         "        if (!$isHarvHub) { continue }", _
         "        $older = $false", _
@@ -831,11 +1042,18 @@ Sub StopExistingHarvHubProcesses()
     Set helperFile = fso.CreateTextFile(helperPath, True, False)
     helperFile.Write helperScript
     helperFile.Close
+    If Err.Number <> 0 Then
+        diagnosticText = "Could not prepare the HarvHub process-cleanup helper: " & helperPath & vbCrLf & _
+            "VBScript error " & Err.Number & ": " & Err.Description
+        Err.Clear
+        Call ShowDiagnosticWindow("HarvHub AI cleanup helper could not be created", diagnosticText)
+        WScript.Quit 24
+    End If
 
     ' Run process cleanup without opening a command window. PowerShell records
     ' its own diagnostic details in process_cleanup.log when an error occurs.
     cleanupError = ""
-    On Error Resume Next
+    Err.Clear
     cleanupExit = sh.Run("powershell.exe -NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File """ & helperPath & """", 0, True)
     If Err.Number <> 0 Then
         cleanupError = Err.Description
@@ -848,7 +1066,11 @@ Sub StopExistingHarvHubProcesses()
     If cleanupExit <> 0 Then
         diagnosticText = ReadAllText(fso.BuildPath(cacheRoot, "process_cleanup.log"))
         If Len(Trim(diagnosticText)) = 0 Then diagnosticText = cleanupError
-        MsgBox "HarvHub AI could not stop all earlier HarvHub setup, manager, build, or service processes. Setup has been stopped to prevent two instances from using the same files." & vbCrLf & vbCrLf & diagnosticText, vbCritical, "HarvHub AI process cleanup"
+        Call ShowDiagnosticWindow("HarvHub AI process cleanup failed", _
+            "HarvHub AI could not stop all earlier HarvHub setup, manager, build, or service processes. Setup was stopped to prevent two instances from using the same files." & vbCrLf & vbCrLf & _
+            "Cleanup helper: " & helperPath & vbCrLf & _
+            "Cleanup log: " & fso.BuildPath(cacheRoot, "process_cleanup.log") & vbCrLf & vbCrLf & _
+            ReadAllTextUtf8(fso.BuildPath(cacheRoot, "process_cleanup.log")) & vbCrLf & vbCrLf & diagnosticText)
         WScript.Quit 13
     End If
 End Sub
@@ -863,9 +1085,7 @@ End Function
 Function IsInstalledHarvHubRunning(ByVal targetPath)
     Dim wmi, processes, proc, executablePath, commandLine, processName, workerNames, workerName
     IsInstalledHarvHubRunning = False
-    workerNames = Array("build_harvhubprogram.pyw", "mysqlremote.py", "brokerdetails.py", "brokercharts.py", "programme_training.py", "signals_trading.py", "signals_provision_challenge.py")
-    ReDim Preserve workerNames(UBound(workerNames) + 1)
-    workerNames(UBound(workerNames)) = "programme" & "signals_trading.py"
+    workerNames = Array("build_harvhubprogram.pyw", "mysqlremote.py", "brokerdetails.py", "brokercharts.py", "programme_training.py", "signals_trading.py", "signals_provision_challenge.py", "harvcore_console_supervisor.py")
     On Error Resume Next
     Set wmi = GetObject("winmgmts:\\.\root\cimv2")
     Set processes = wmi.ExecQuery("SELECT Name,ExecutablePath,CommandLine FROM Win32_Process WHERE Name='HarvHubAI.exe' OR Name='pythonw.exe' OR Name='python.exe'")
@@ -897,6 +1117,73 @@ Function IsInstalledHarvHubRunning(ByVal targetPath)
     On Error GoTo 0
 End Function
 
+Sub ShowDiagnosticWindow(ByVal heading, ByVal detailText)
+    Dim reportPath, commandPath, reportText, stream, commandFile, comSpec, launchLine, errText
+    On Error Resume Next
+    reportPath = fso.BuildPath(sh.ExpandEnvironmentStrings("%TEMP%"), "HarvHubAI_last_error.txt")
+    commandPath = fso.BuildPath(sh.ExpandEnvironmentStrings("%TEMP%"), "HarvHubAI_show_error.cmd")
+    reportText = "HARVHUB AI - INSTALLER ERROR REPORT" & vbCrLf & _
+        "====================================" & vbCrLf & _
+        "Time: " & Now & vbCrLf & _
+        "Computer: " & sh.ExpandEnvironmentStrings("%COMPUTERNAME%") & vbCrLf & _
+        "User: " & sh.ExpandEnvironmentStrings("%USERDOMAIN%\%USERNAME%") & vbCrLf & _
+        "Launcher: " & clickedVbs & vbCrLf & _
+        "Bootstrap PowerShell: " & psScriptPath & vbCrLf & _
+        "Bootstrap log: " & fso.BuildPath(cacheRoot, "visible_bootstrap.log") & vbCrLf & _
+        "Report file: " & reportPath & vbCrLf & vbCrLf & _
+        CStr(heading) & vbCrLf & String(70, "-") & vbCrLf & CStr(detailText) & vbCrLf
+
+    ' UTF-8 report is easy to open, select and copy in Notepad.
+    Err.Clear
+    Set stream = CreateObject("ADODB.Stream")
+    If Err.Number = 0 Then
+        stream.Type = 2
+        stream.Charset = "utf-8"
+        stream.Open
+        stream.WriteText reportText
+        stream.SaveToFile reportPath, 2
+        stream.Close
+    End If
+    If Err.Number <> 0 Or Not fso.FileExists(reportPath) Then
+        Err.Clear
+        Set stream = Nothing
+        Set stream = fso.CreateTextFile(reportPath, True, True)
+        stream.Write reportText
+        stream.Close
+    End If
+
+    ' Keep a visible CMD window open with the complete report, even after WSH exits.
+    Err.Clear
+    Set commandFile = fso.CreateTextFile(commandPath, True, False)
+    commandFile.WriteLine "@echo off"
+    commandFile.WriteLine "title HarvHub AI - Installer Error Report"
+    commandFile.WriteLine "color 0C"
+    commandFile.WriteLine "chcp 65001 >nul"
+    commandFile.WriteLine "echo HARVHUB AI INSTALLER FAILED"
+    commandFile.WriteLine "echo Full diagnostic report follows."
+    commandFile.WriteLine "echo."
+    commandFile.WriteLine "type ""%TEMP%\HarvHubAI_last_error.txt"""
+    commandFile.WriteLine "echo."
+    commandFile.WriteLine "echo This report is also saved at:"
+    commandFile.WriteLine "echo %TEMP%\HarvHubAI_last_error.txt"
+    commandFile.WriteLine "echo."
+    commandFile.WriteLine "echo Select text with the mouse and press Enter or right-click to copy."
+    commandFile.WriteLine "echo Press any key to close this CMD window."
+    commandFile.WriteLine "pause >nul"
+    commandFile.Close
+
+    Err.Clear
+    comSpec = sh.ExpandEnvironmentStrings("%ComSpec%")
+    launchLine = Chr(34) & comSpec & Chr(34) & " /k " & Chr(34) & Chr(34) & commandPath & Chr(34) & Chr(34)
+    sh.Run launchLine, 1, False
+
+    ' Also open Notepad so the whole report can be copied with Ctrl+A, Ctrl+C.
+    Err.Clear
+    sh.Run "notepad.exe " & Chr(34) & reportPath & Chr(34), 1, False
+    Err.Clear
+    On Error GoTo 0
+End Sub
+
 Function ReadAllText(ByVal filePath)
     Dim stream
     ReadAllText = ""
@@ -909,10 +1196,35 @@ Function ReadAllText(ByVal filePath)
     On Error GoTo 0
 End Function
 
+Function ReadAllTextUtf8(ByVal filePath)
+    Dim stream
+    ReadAllTextUtf8 = ""
+    On Error Resume Next
+    If fso.FileExists(filePath) Then
+        Set stream = CreateObject("ADODB.Stream")
+        stream.Type = 2
+        stream.Charset = "utf-8"
+        stream.Open
+        stream.LoadFromFile filePath
+        ReadAllTextUtf8 = stream.ReadText
+        stream.Close
+    End If
+    On Error GoTo 0
+End Function
+
 Sub EnsureFolderTree(ByVal folderPath)
-    Dim parentPath
+    Dim parentPath, folderError
+    On Error Resume Next
     If fso.FolderExists(folderPath) Then Exit Sub
     parentPath = fso.GetParentFolderName(folderPath)
     If Len(parentPath) > 0 And Not fso.FolderExists(parentPath) Then EnsureFolderTree parentPath
     If Not fso.FolderExists(folderPath) Then fso.CreateFolder folderPath
+    If Err.Number <> 0 Then
+        folderError = "Could not create required folder: " & folderPath & vbCrLf & _
+            "VBScript error " & Err.Number & ": " & Err.Description
+        Err.Clear
+        Call ShowDiagnosticWindow("HarvHub AI folder creation failed", folderError)
+        WScript.Quit 20
+    End If
+    On Error GoTo 0
 End Sub

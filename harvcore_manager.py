@@ -49,6 +49,13 @@ CONTROL_PORT = 5601
 DEFAULT_LOOP_INTERVAL = 5
 MAX_BRIDGE_CHANNELS = 32
 
+# Setup must never appear frozen without a diagnostic. Long operations emit
+# heartbeats; the watchdog reports the exact last operation if those stop.
+SETUP_WATCHDOG_INTERVAL_SECONDS = 10
+SETUP_STALL_WARNING_SECONDS = 30
+SETUP_STALL_ABORT_SECONDS = 600
+SETUP_FILE_CHUNK_BYTES = 1024 * 1024
+
 # The deployed HarvHub AI root is also the permanent desktop-app installation
 # directory. The VBS launcher installs/updates HarvHubAI.exe here.
 HARVHUBAI_ROOT = Path(os.environ.get(
@@ -545,6 +552,15 @@ class HarvCoreManager:
         self.setup_started = False
         self.setup_view_active = False
         self.setup_cancel_event = threading.Event()
+        self.setup_watchdog_stop = threading.Event()
+        self.setup_progress_lock = threading.RLock()
+        self.setup_progress_action = "Setup startup"
+        self.setup_progress_detail = "Waiting for setup worker."
+        self.setup_progress_at = time.monotonic()
+        self.setup_last_watchdog_notice = 0
+        self.setup_stall_marked = False
+        self.setup_worker_thread: Optional[threading.Thread] = None
+        self.setup_watchdog_thread: Optional[threading.Thread] = None
         self.auto_setup_after_id = None
         self.global_run_all_button: Optional[tk.Button] = None
         self.global_stop_all_button: Optional[tk.Button] = None
@@ -573,8 +589,8 @@ class HarvCoreManager:
         window_height = min(840, max(520, screen_height - 100))
         self.root.geometry(f"{window_width}x{window_height}")
         self.root.minsize(360, 520)
-        # Open maximized, but do not keep HarvHub above other desktop apps.
-        # The one-time startup activation below briefly raises the new window.
+        # Do not force foreground or topmost state. Windows activates a newly
+        # launched app normally; a later user-selected desktop app keeps focus.
         try:
             self.root.state("zoomed")
         except tk.TclError:
@@ -587,7 +603,8 @@ class HarvCoreManager:
         threading.Thread(target=self._control_server_loop, name="harvhub-manager-ipc", daemon=True).start()
         self.root.bind("<Configure>", self._on_root_configure, add="+")
         self.root.after(120, self._poll_events)
-        self.root.after(160, self._activate_main_window)
+        # No delayed foreground/topmost callback: Windows gives the newly
+        # launched app its initial activation; later user-selected apps keep focus.
 
         if not is_windows():
             self._show_platform_error()
@@ -604,26 +621,6 @@ class HarvCoreManager:
             self._show_setup()
             self.auto_setup_after_id = self.root.after(700, self._auto_start_setup)
 
-    def _activate_main_window(self) -> None:
-        """Activate the newly launched manager once, then release topmost."""
-        try:
-            if not self.root.winfo_exists():
-                return
-            self.root.deiconify()
-            self.root.state("zoomed")
-            # Use topmost only during this one startup activation. Clearing it
-            # immediately means later clicks on other desktop apps keep focus.
-            self.root.attributes("-topmost", True)
-            self.root.lift()
-            self.root.focus_force()
-        except tk.TclError:
-            pass
-        finally:
-            try:
-                if self.root.winfo_exists():
-                    self.root.attributes("-topmost", False)
-            except tk.TclError:
-                pass
 
     # ---------------------------- State and paths ----------------------------
     def _load_execution_config(self) -> dict:
@@ -653,14 +650,10 @@ class HarvCoreManager:
                             str(key): value for key, value in programs.items()
                             if value in ("loop", "once")
                         }
-                        # Preserve the saved Loop/Once choice from the previous
-                        # service key after its source file was renamed.
-                        legacy_signals_key = "programme" + "signals_trading"
-                        if legacy_signals_key in config["programs"]:
-                            config["programs"].setdefault(
-                                "signals_trading", config["programs"][legacy_signals_key]
-                            )
-                            del config["programs"][legacy_signals_key]
+                        # Preserve the saved Loop/Once selection across the
+                        # programmesignals_trading.py -> signals_trading.py rename.
+                        if "signals_trading" not in config["programs"] and "programmesignals_trading" in config["programs"]:
+                            config["programs"]["signals_trading"] = config["programs"].pop("programmesignals_trading")
                 else:
                     # Previous manager releases persisted Once as the default,
                     # which made monitoring programs finish immediately. The
@@ -1089,6 +1082,13 @@ class HarvCoreManager:
         if self.setup_started or not self.setup_view_active:
             return
         self.setup_cancel_event.clear()
+        self.setup_watchdog_stop.clear()
+        self.setup_stall_marked = False
+        self.setup_last_watchdog_notice = 0
+        with self.setup_progress_lock:
+            self.setup_progress_action = "Setup startup"
+            self.setup_progress_detail = "Starting diagnostics and preflight checks."
+            self.setup_progress_at = time.monotonic()
         self.setup_started = True
         self.setup_raw_lines = []
         setup_console = getattr(self, "setup_console_widget", None)
@@ -1106,12 +1106,149 @@ class HarvCoreManager:
         if hasattr(self, "setup_action"):
             self.setup_action.configure(state="disabled", text="Installing...")
         thread = threading.Thread(target=self._setup_worker, name="harvcore-setup", daemon=True)
+        self.setup_worker_thread = thread
         thread.start()
 
     def _setup_emit(self, event: str, *data) -> None:
         self.events.put((event, data))
 
+    def _setup_progress(self, action: str, detail: str = "", *, log: bool = True) -> None:
+        """Record real setup activity and expose the current operation to the UI."""
+        now = time.monotonic()
+        with self.setup_progress_lock:
+            changed = action != self.setup_progress_action
+            self.setup_progress_action = str(action)
+            if detail:
+                self.setup_progress_detail = str(detail)
+            self.setup_progress_at = now
+        if log and (changed or detail):
+            message = f"[SETUP] {action}" + (f" — {detail}" if detail else "")
+            self._setup_emit("setup_log", message)
+            self._setup_emit("setup_activity", action, detail)
+
+    def _setup_heartbeat(self, action: str, detail: str) -> None:
+        """Report that a process is alive without treating silence as real progress."""
+        with self.setup_progress_lock:
+            self.setup_progress_action = str(action)
+            self.setup_progress_detail = str(detail)
+        self._setup_emit("setup_log", f"[HEARTBEAT] {action} — {detail}")
+        self._setup_emit("setup_activity", action, detail)
+
+    def _setup_watchdog_loop(self) -> None:
+        """Report blocked operations, then cancel them after a bounded no-progress window."""
+        while not self.setup_watchdog_stop.wait(SETUP_WATCHDOG_INTERVAL_SECONDS):
+            with self.setup_progress_lock:
+                action = self.setup_progress_action
+                detail = self.setup_progress_detail
+                last_progress = self.setup_progress_at
+            idle = max(0.0, time.monotonic() - last_progress)
+            if idle < SETUP_STALL_WARNING_SECONDS:
+                continue
+            bucket = int(idle // SETUP_STALL_WARNING_SECONDS)
+            if bucket <= self.setup_last_watchdog_notice:
+                continue
+            self.setup_last_watchdog_notice = bucket
+            severity = (
+                "STALLED" if idle >= SETUP_STALL_ABORT_SECONDS
+                else "PROLONGED NO-PROGRESS" if idle >= 180
+                else "NO PROGRESS"
+            )
+            line = (
+                f"[SETUP WATCHDOG] {severity}: no verified progress for {int(idle)} seconds. "
+                f"Current operation: {action}. Last operation detail: {detail or '(none)'}. "
+                "For external installers, the process ID, elapsed time and last console output are included "
+                "in the heartbeat messages where available. A process can be alive without making progress."
+            )
+            self._write_manager_log(line)
+            self._setup_emit("setup_log", line)
+            self._setup_emit("setup_watchdog_status", line)
+            if idle >= SETUP_STALL_ABORT_SECONDS:
+                self.setup_stall_marked = True
+                self.setup_cancel_event.set()
+                failure = (
+                    line + " Setup cancellation has been requested after the 10-minute no-progress limit. "
+                    "A running child installer will be terminated by the setup worker. If a Windows file-system "
+                    "call itself is blocked and cannot return, save this report and restart HarvHub AI."
+                )
+                self._write_manager_log(failure)
+                self._setup_emit("setup_log", failure)
+                self._setup_emit("setup_stalled", failure)
+                return
+
+    def _start_setup_watchdog(self) -> None:
+        self.setup_watchdog_stop.clear()
+        self._setup_progress("Setup startup", "Watchdog armed; every setup operation will report progress.")
+        self.setup_watchdog_thread = threading.Thread(
+            target=self._setup_watchdog_loop,
+            name="harvhub-setup-watchdog",
+            daemon=True,
+        )
+        self.setup_watchdog_thread.start()
+
+    def _setup_hash_file(self, path: Path, label: str) -> str:
+        """Hash a file in chunks, reporting bytes and keeping the watchdog alive."""
+        if not path.is_file():
+            raise FileNotFoundError(f"Cannot hash missing file for {label}: {path}")
+        total = path.stat().st_size
+        self._setup_progress("Verifying file", f"{label}: {path} ({total:,} bytes).")
+        digest = hashlib.sha256()
+        processed = 0
+        last_report = time.monotonic()
+        with path.open("rb") as source:
+            while True:
+                self._check_setup_cancelled()
+                chunk = source.read(SETUP_FILE_CHUNK_BYTES)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                processed += len(chunk)
+                now = time.monotonic()
+                if now - last_report >= 5:
+                    self._setup_progress(
+                        "Verifying file",
+                        f"{label}: {processed:,}/{total:,} bytes hashed ({(processed * 100 / total) if total else 100:.1f}%).",
+                    )
+                    last_report = now
+        result = digest.hexdigest().lower()
+        self._setup_progress("File verification complete", f"{label}: SHA-256 {result}.")
+        return result
+
+    def _setup_copy_file(self, source_path: Path, destination_path: Path, label: str) -> None:
+        """Copy with visible byte progress so large/blocked copies are diagnosable."""
+        if not source_path.is_file():
+            raise FileNotFoundError(f"Copy source for {label} is missing: {source_path}")
+        total = source_path.stat().st_size
+        destination_path.parent.mkdir(parents=True, exist_ok=True)
+        copied = 0
+        last_report = time.monotonic()
+        self._setup_progress("Copying file", f"{label}: 0/{total:,} bytes to {destination_path}.")
+        with source_path.open("rb") as source, destination_path.open("wb") as target:
+            while True:
+                self._check_setup_cancelled()
+                chunk = source.read(SETUP_FILE_CHUNK_BYTES)
+                if not chunk:
+                    break
+                target.write(chunk)
+                copied += len(chunk)
+                now = time.monotonic()
+                if now - last_report >= 5:
+                    self._setup_progress(
+                        "Copying file",
+                        f"{label}: {copied:,}/{total:,} bytes copied ({(copied * 100 / total) if total else 100:.1f}%).",
+                    )
+                    last_report = now
+            target.flush()
+            os.fsync(target.fileno())
+        shutil.copystat(source_path, destination_path)
+        actual_size = destination_path.stat().st_size
+        if actual_size != total:
+            raise OSError(f"Copy verification failed for {label}: expected {total:,} bytes, received {actual_size:,} bytes.")
+        self._setup_progress("File copy complete", f"{label}: {actual_size:,} bytes copied and size-verified.")
+
     def _setup_worker(self) -> None:
+        self._start_setup_watchdog()
+        self._setup_progress("Setup report started", f"HarvHub AI setup started at {time.strftime('%Y-%m-%d %H:%M:%S')}. All operations will be logged to {LOG_DIR / 'setup.hclog'}.")
+        self._setup_progress("Setup preflight", "Checking Windows version, administrator privileges, architecture and installation folders.")
         try:
             self._check_setup_cancelled()
             if not is_windows():
@@ -1126,7 +1263,10 @@ class HarvCoreManager:
             self._setup_step("system", "done", "Windows x64 and HarvHub AI folders are ready.")
             self._check_setup_cancelled()
 
+            self._setup_progress("Python runtime discovery", "Searching supported per-user and machine-wide Python 3.13 x64 locations.")
             python_exe = locate_python()
+            if python_exe is not None:
+                self._setup_progress("Python runtime located", f"Compatible interpreter found: {python_exe}")
             if python_exe is None:
                 self._setup_step("python", "running", "Downloading Python 3.13.17 x64 from python.org.")
                 installer = DOWNLOAD_DIR / f"python-{PYTHON_VERSION}-amd64.exe"
@@ -1191,8 +1331,10 @@ class HarvCoreManager:
             self._check_setup_cancelled()
 
             self._setup_step("sources", "running", "Updating the HarvHub AI program files and desktop app.")
+            self._setup_progress("Runtime source deployment", f"Starting embedded payload preflight and file deployment from {resource_directory()} to {PYTHON_DIR}.")
             self._deploy_sources()
             self._check_setup_cancelled()
+            self._setup_progress("Desktop application deployment", f"Installing or verifying HarvHubAI.exe and its shortcuts under {HARVHUBAI_ROOT}.")
             self._deploy_manager_executable()
             self._setup_step("sources", "done", f"Current HarvHub AI files deployed under {HARVHUBAI_ROOT}")
 
@@ -1200,6 +1342,7 @@ class HarvCoreManager:
             self._check_setup_cancelled()
             self._verify_runtime()
             self._setup_step("verify", "done", "All required components passed verification.")
+            self._setup_progress("Saving installation state", f"Writing verified installation state to {STATE_FILE}.")
             self._save_state(
                 setup_complete=True,
                 python_executable=str(self.python_exe),
@@ -1207,19 +1350,32 @@ class HarvCoreManager:
                 mt5_template=str(MT5_TEMPLATE),
                 python_directory=str(PYTHON_DIR),
             )
+            self._setup_progress("Setup complete", "Every required source file, runtime package, Chrome and MT5 terminal passed verification.")
             self._setup_emit("setup_done")
         except SetupCancelled:
-            self._write_manager_log("SETUP CANCELLED by user. Already completed components remain installed and can be repaired later.")
+            if self.setup_stall_marked:
+                self._write_manager_log("SETUP STOPPED after the progress watchdog detected an operation that stopped responding. Completed components remain installed; restart HarvHub AI before retrying.")
+                self._setup_emit("setup_log", "SETUP STOPPED by watchdog cancellation. Completed components remain installed.")
+            else:
+                self._write_manager_log("SETUP CANCELLED by user. Already completed components remain installed and can be repaired later.")
             self._setup_emit("setup_cancelled")
         except Exception as exc:
+            with self.setup_progress_lock:
+                failed_operation = self.setup_progress_action
+                failed_detail = self.setup_progress_detail
             diagnostic = traceback.format_exc().strip()
-            self._write_manager_log(f"SETUP ERROR: {diagnostic}")
+            self._setup_emit("setup_log", f"[FAILED OPERATION] {failed_operation}: {failed_detail}")
+            self._write_manager_log(f"SETUP ERROR during {failed_operation}: {diagnostic}")
             self._setup_emit("setup_log", f"SETUP ERROR: {type(exc).__name__}: {exc}")
             for diagnostic_line in diagnostic.splitlines():
                 self._setup_emit("setup_log", diagnostic_line)
             self._setup_emit("setup_error", str(exc))
+        finally:
+            self.setup_watchdog_stop.set()
+            self._write_manager_log("SETUP WORKER EXITED; setup watchdog stopped.")
 
     def _setup_step(self, key: str, status: str, detail: str = "") -> None:
+        self._setup_progress(f"{key.upper()} stage", f"{status}: {detail or 'No additional detail.'}")
         self._setup_emit("setup_step", key, status, detail)
         if detail:
             self._write_manager_log(f"{key}: {detail}")
@@ -1264,9 +1420,13 @@ class HarvCoreManager:
     def _download(self, url: str, destination: Path, label: str, expected_sha256: Optional[str] = None) -> None:
         self._check_setup_cancelled()
         destination.parent.mkdir(parents=True, exist_ok=True)
+        started = time.monotonic()
+        last_heartbeat = started
+        total_timeout = 1800
         if destination.is_file() and destination.stat().st_size > 1024:
-            self._setup_emit("setup_log", f"{label} already downloaded; reusing cached file.")
+            self._setup_progress("Download cache check", f"{label}: cached file found at {destination}; validating it.")
         else:
+            self._setup_progress("Downloading component", f"{label}: connecting to {url} (45-second socket timeout; 30-minute total limit).")
             request = urllib.request.Request(
                 url,
                 headers={"User-Agent": "HarvHubAI/1.0", "Accept": "*/*"},
@@ -1276,9 +1436,14 @@ class HarvCoreManager:
                 with urllib.request.urlopen(request, timeout=45, context=self._download_ssl_context()) as response, temp_path.open("wb") as output:
                     total = int(response.headers.get("Content-Length", "0") or "0")
                     downloaded = 0
+                    self._setup_progress("Downloading component", f"{label}: server connected; expected size {total:,} bytes." if total else f"{label}: server connected; size not supplied.")
                     while True:
                         self._check_setup_cancelled()
+                        now = time.monotonic()
+                        if now - started > total_timeout:
+                            raise TimeoutError(f"{label} exceeded the {total_timeout}-second download limit. Received {downloaded:,} bytes from {url}.")
                         chunk = response.read(1024 * 1024)
+                        now = time.monotonic()
                         if not chunk:
                             break
                         output.write(chunk)
@@ -1286,46 +1451,63 @@ class HarvCoreManager:
                         if total:
                             percent = min(100, int(downloaded * 100 / total))
                             self._setup_emit("setup_download_progress", label, percent, downloaded, total)
+                        if now - last_heartbeat >= 10:
+                            denominator = total if total else max(downloaded, 1)
+                            percent_text = f"{min(100, downloaded * 100 / denominator):.1f}%" if total else "size unknown"
+                            self._setup_progress("Downloading component", f"{label}: {downloaded:,} bytes received ({percent_text}).")
+                            last_heartbeat = now
+                    output.flush()
+                    os.fsync(output.fileno())
+                if total and downloaded != total:
+                    raise IOError(f"{label} download was incomplete: server declared {total:,} bytes; received {downloaded:,} bytes.")
                 temp_path.replace(destination)
-            except Exception:
+                self._setup_progress("Download complete", f"{label}: {downloaded:,} bytes saved to {destination}.")
+            except Exception as exc:
                 try:
                     temp_path.unlink(missing_ok=True)
                 except Exception:
                     pass
-                raise
+                raise RuntimeError(f"Could not download {label} from {url}: {type(exc).__name__}: {exc}") from exc
         self._check_setup_cancelled()
         if expected_sha256:
-            actual = sha256_file(destination)
+            actual = self._setup_hash_file(destination, f"{label} installer")
             if actual.lower() != expected_sha256.lower():
                 destination.unlink(missing_ok=True)
                 raise RuntimeError(f"{label} SHA-256 verification failed. Expected {expected_sha256}, received {actual}.")
             self._setup_emit("setup_log", f"{label} SHA-256 verified.")
-        self._setup_emit("setup_log", f"Downloaded {label}: {destination}")
+        self._setup_emit("setup_log", f"Downloaded/verified {label}: {destination}")
 
     def _require_signer(self, path: Path, expected_fragments: tuple[str, ...]) -> None:
+        self._setup_progress("Authenticode verification", f"Checking the digital signature and publisher for {path}.")
         valid, subject = powershell_signature(path)
         if not valid:
             raise RuntimeError(f"Digital signature check failed for {path.name}: {subject}")
         lowered = subject.lower()
         if not any(fragment in lowered for fragment in expected_fragments):
             raise RuntimeError(f"Unexpected publisher for {path.name}: {subject}")
+        self._setup_progress("Authenticode verified", f"{path.name} is signed by {subject}.")
         self._setup_emit("setup_log", f"Publisher verified: {subject}")
 
     def _run_command(self, command: list[str], label: str, timeout: int = 900) -> None:
         self._check_setup_cancelled()
-        self._setup_emit("setup_log", f"Running: {label}")
+        self._setup_progress("Launching setup command", f"{label}; timeout={timeout}s; command={subprocess.list2cmdline(command)}")
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        process = subprocess.Popen(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
-            creationflags=flags,
-        )
-        output_queue: queue.Queue[str] = queue.Queue()
+        try:
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                creationflags=flags,
+            )
+        except Exception as exc:
+            raise RuntimeError(f"Could not start {label}: {type(exc).__name__}: {exc}") from exc
+        self._setup_emit("setup_log", f"Running: {label} (PID {process.pid}).")
+        output_queue: queue.Queue[str | None] = queue.Queue()
 
         def collect_output() -> None:
             try:
@@ -1338,8 +1520,12 @@ class HarvCoreManager:
         reader = threading.Thread(target=collect_output, name=f"{label}-output", daemon=True)
         reader.start()
         started = time.monotonic()
+        last_output_at = started
+        last_heartbeat = started
         reader_finished = False
+        last_output = "(no console output received)"
         while process.poll() is None:
+            now = time.monotonic()
             if self.setup_cancel_event.is_set():
                 if is_windows():
                     try:
@@ -1348,15 +1534,16 @@ class HarvCoreManager:
                             capture_output=True, text=True, timeout=15,
                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                         )
-                    except Exception:
-                        pass
+                    except Exception as kill_exc:
+                        self._setup_emit("setup_log", f"Could not taskkill {label} process tree: {kill_exc}")
                 try:
                     process.kill()
                     process.wait(timeout=10)
                 except Exception:
                     pass
-                raise SetupCancelled("Setup was cancelled while an installer command was running.")
-            if time.monotonic() - started > timeout:
+                raise SetupCancelled(f"Setup was cancelled while {label} was running (PID {process.pid}).")
+            elapsed = now - started
+            if elapsed > timeout:
                 if is_windows():
                     try:
                         subprocess.run(
@@ -1364,35 +1551,60 @@ class HarvCoreManager:
                             capture_output=True, text=True, timeout=15,
                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                         )
-                    except Exception:
-                        pass
+                    except Exception as kill_exc:
+                        self._setup_emit("setup_log", f"Could not taskkill timed-out {label} process tree: {kill_exc}")
                 try:
                     process.kill()
+                    process.wait(timeout=10)
                 except Exception:
                     pass
-                raise TimeoutError(f"Timed out while running: {label}")
-            try:
-                line = output_queue.get(timeout=0.15)
-                if line is None:
-                    reader_finished = True
-                else:
-                    self._setup_emit("setup_log", line)
-            except queue.Empty:
-                pass
-        # Drain anything the reader collected as the process exited.
-        while not reader_finished:
+                raise TimeoutError(
+                    f"{label} timed out after {int(elapsed)} seconds (PID {process.pid}). "
+                    f"Last output: {last_output}"
+                )
+            if now - last_heartbeat >= 15:
+                silent = int(now - last_output_at)
+                heartbeat = (
+                    f"{label} is still running (PID {process.pid}); elapsed {int(elapsed)}s; "
+                    f"no console output for {silent}s; last output: {last_output[:300]}"
+                )
+                self._setup_heartbeat("Waiting for setup command", heartbeat)
+                last_heartbeat = now
             try:
                 line = output_queue.get(timeout=0.2)
                 if line is None:
                     reader_finished = True
                 else:
-                    self._setup_emit("setup_log", line)
+                    last_output = line
+                    last_output_at = time.monotonic()
+                    self._setup_progress(f"{label} output", line)
+            except queue.Empty:
+                pass
+        # Do not wait indefinitely for inherited stdout handles held by a
+        # child process after the installer itself has exited.
+        drain_deadline = time.monotonic() + 8
+        while not reader_finished and time.monotonic() < drain_deadline:
+            try:
+                line = output_queue.get(timeout=0.2)
+                if line is None:
+                    reader_finished = True
+                else:
+                    last_output = line
+                    self._setup_progress(f"{label} output", line)
             except queue.Empty:
                 if not reader.is_alive():
                     break
+        if not reader_finished and reader.is_alive():
+            warning = f"{label} exited, but its output pipe did not close within 8 seconds; continuing with exit code {process.returncode}."
+            self._setup_emit("setup_log", warning)
+            try:
+                if process.stdout:
+                    process.stdout.close()
+            except Exception:
+                pass
         if process.returncode not in (0, 3010):
-            raise RuntimeError(f"{label} failed with exit code {process.returncode}.")
-        self._setup_emit("setup_log", f"{label} completed (exit code {process.returncode}).")
+            raise RuntimeError(f"{label} failed with exit code {process.returncode}. Last output: {last_output}")
+        self._setup_progress("Setup command completed", f"{label} completed (exit code {process.returncode}; elapsed {int(time.monotonic() - started)}s).")
 
     def _mt5_terminal_ready(self, terminal_exe: Path) -> bool:
         try:
@@ -1402,12 +1614,21 @@ class HarvCoreManager:
 
     def _wait_for_mt5_terminal(self, terminal_exe: Path, timeout: int) -> bool:
         started = time.monotonic()
+        last_heartbeat = started
+        self._setup_progress("Waiting for MetaTrader 5", f"Checking for terminal64.exe at {terminal_exe}; timeout={timeout}s.")
         while time.monotonic() - started < timeout:
             self._check_setup_cancelled()
             if self._mt5_terminal_ready(terminal_exe):
+                self._setup_progress("MetaTrader 5 detected", f"Verified terminal64.exe at {terminal_exe}.")
                 return True
+            now = time.monotonic()
+            if now - last_heartbeat >= 15:
+                self._setup_progress("Waiting for MetaTrader 5", f"terminal64.exe has not appeared yet; elapsed {int(now - started)}s; expected path: {terminal_exe}.")
+                last_heartbeat = now
             time.sleep(1)
-        return self._mt5_terminal_ready(terminal_exe)
+        ready = self._mt5_terminal_ready(terminal_exe)
+        self._setup_progress("MetaTrader 5 wait finished", f"terminal ready={ready}; elapsed limit={timeout}s; expected path: {terminal_exe}.")
+        return ready
 
     def _show_mt5_manual_fallback_prompt(self) -> None:
         """Show the manual-installer instructions on Tk's owning UI thread."""
@@ -1461,10 +1682,31 @@ class HarvCoreManager:
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
             started = time.monotonic()
+            last_heartbeat = started
             terminal_seen_since: Optional[float] = None
             while process.poll() is None:
-                self._check_setup_cancelled()
+                try:
+                    self._check_setup_cancelled()
+                except SetupCancelled:
+                    self._setup_emit("setup_log", f"Stopping MetaTrader 5 installer process tree (PID {process.pid}) because setup cancellation was requested.")
+                    if is_windows():
+                        try:
+                            subprocess.run(
+                                ["taskkill.exe", "/PID", str(process.pid), "/T", "/F"],
+                                capture_output=True, text=True, timeout=15,
+                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                            )
+                        except Exception as kill_exc:
+                            self._setup_emit("setup_log", f"Could not stop the MT5 installer process tree: {kill_exc}")
+                    try:
+                        process.kill()
+                    except Exception:
+                        pass
+                    raise
                 now = time.monotonic()
+                if now - last_heartbeat >= 15:
+                    self._setup_heartbeat("Waiting for MetaTrader 5 installer", f"Installer PID {process.pid} remains active; elapsed {int(now - started)}s; expected terminal file: {terminal_exe}; terminal currently {'present' if terminal_exe.is_file() else 'not present'}.")
+                    last_heartbeat = now
                 if self._mt5_terminal_ready(terminal_exe):
                     if terminal_seen_since is None:
                         terminal_seen_since = now
@@ -1533,51 +1775,92 @@ class HarvCoreManager:
         self._setup_emit("setup_log", "MetaTrader 5 interactive installation completed; terminal64.exe was verified.")
 
     def _deploy_sources(self) -> None:
-        """Deploy every bundled HarvHub AI file, updating older copies safely."""
+        """Deploy every bundled source with preflight, byte progress and verification."""
         source_root = resource_directory()
+        self._setup_progress("Source deployment preflight", f"Checking embedded package directory: {source_root}")
         if not source_root.is_dir():
-            raise RuntimeError(f"Bundled HarvHub AI Python payload folder is missing: {source_root}")
+            raise RuntimeError(f"Bundled HarvHub AI Python payload folder is missing: {source_root}. Rebuild the installer with the complete payload.")
         PYTHON_DIR.mkdir(parents=True, exist_ok=True)
+        required_names = list(BUNDLED_PYTHON_FILES) + ["requirements-runtime.txt"]
+        missing = []
+        for index, name in enumerate(required_names, start=1):
+            self._check_setup_cancelled()
+            candidate = source_root / name
+            self._setup_progress("Checking embedded payload", f"[{index}/{len(required_names)}] {candidate}")
+            minimum_size = 1 if name == "requirements-runtime.txt" else 100
+            if not candidate.is_file() or candidate.stat().st_size < minimum_size:
+                missing.append(name)
+        if missing:
+            raise RuntimeError(
+                "The installer package is incomplete. These required files were not embedded: "
+                + ", ".join(missing)
+                + f". Expected them under {source_root}. The GitHub bootstrap/build payload must download and bundle them before setup can continue."
+            )
+
         backup_root = MANAGER_DIR / "backups" / time.strftime("%Y%m%d-%H%M%S")
         copied = 0
         updated = 0
-        for name in BUNDLED_PYTHON_FILES:
+        total_files = len(required_names)
+        self._setup_progress("Source deployment", f"All {total_files} required source files are present. Deploying to {PYTHON_DIR}.")
+        for index, name in enumerate(BUNDLED_PYTHON_FILES, start=1):
             self._check_setup_cancelled()
             source = source_root / name
-            if not source.is_file():
-                raise RuntimeError(f"Bundled Python file is missing: {name}")
             destination = PYTHON_DIR / name
-            if destination.is_file() and sha256_file(destination) == sha256_file(source):
-                self._setup_emit("setup_log", f"{name}: already current.")
-                continue
+            self._setup_progress("Deploying source file", f"[{index}/{total_files}] Checking {name}.")
+            source_hash = self._setup_hash_file(source, f"embedded {name}")
             if destination.is_file():
-                backup_root.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(destination, backup_root / name)
+                destination_hash = self._setup_hash_file(destination, f"installed {name}")
+                if destination_hash == source_hash:
+                    self._setup_emit("setup_log", f"{name}: already current (SHA-256 verified).")
+                    continue
+                backup_path = backup_root / name
+                backup_path.parent.mkdir(parents=True, exist_ok=True)
+                self._setup_copy_file(destination, backup_path, f"backup existing {name}")
                 updated += 1
             else:
                 copied += 1
-            temporary = destination.with_suffix(destination.suffix + ".new")
-            shutil.copy2(source, temporary)
-            temporary.replace(destination)
-            self._setup_emit("setup_log", f"Deployed latest bundled file: {name}")
+            temporary = destination.with_name(destination.name + ".new")
+            try:
+                self._setup_copy_file(source, temporary, f"install {name}")
+                copied_hash = self._setup_hash_file(temporary, f"copied {name}")
+                if copied_hash != source_hash:
+                    raise IOError(f"SHA-256 mismatch after copying {name}; source={source_hash}; copied={copied_hash}.")
+                temporary.replace(destination)
+            except Exception:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                raise
+            self._setup_emit("setup_log", f"Deployed and verified latest bundled file: {name}")
 
         requirements_src = source_root / "requirements-runtime.txt"
-        if requirements_src.is_file():
-            target = PYTHON_DIR / "requirements-runtime.txt"
-            if not target.is_file() or sha256_file(target) != sha256_file(requirements_src):
-                shutil.copy2(requirements_src, target)
-        self._setup_emit("setup_log", f"Deployment finished. New files: {copied}; updated files: {updated}.")
+        requirements_target = PYTHON_DIR / "requirements-runtime.txt"
+        source_hash = self._setup_hash_file(requirements_src, "embedded requirements-runtime.txt")
+        same = requirements_target.is_file() and self._setup_hash_file(requirements_target, "installed requirements-runtime.txt") == source_hash
+        if not same:
+            temp_requirements = requirements_target.with_name(requirements_target.name + ".new")
+            self._setup_copy_file(requirements_src, temp_requirements, "install requirements-runtime.txt")
+            copied_hash = self._setup_hash_file(temp_requirements, "copied requirements-runtime.txt")
+            if copied_hash != source_hash:
+                raise IOError("requirements-runtime.txt failed SHA-256 verification after deployment.")
+            temp_requirements.replace(requirements_target)
+        else:
+            self._setup_emit("setup_log", "requirements-runtime.txt: already current (SHA-256 verified).")
+
+        self._setup_emit("setup_log", f"Deployment finished. New files: {copied}; updated files: {updated}; total required files verified: {total_files}.")
         if backup_root.exists():
             self._setup_emit("setup_log", f"Previous files were backed up under {backup_root}.")
 
     def _deploy_manager_executable(self) -> None:
-        """Install/update HarvHub AI under the HarvHub AI root and create shortcuts."""
+        """Install/update HarvHub AI with progress-aware copy and shortcut checks."""
+        self._setup_progress("Desktop application deployment", "Locating the currently running HarvHub AI executable.")
         if getattr(sys, "frozen", False):
             running_exe = Path(sys.executable).resolve()
         else:
             source_release_exe = Path(__file__).resolve().parent / "release" / APP_EXE_NAME
             if not source_release_exe.is_file():
-                self._setup_emit("setup_log", f"Source-mode run detected; {APP_EXE_NAME} is not in the release folder yet.")
+                self._setup_emit("setup_log", f"Source-mode run detected; {APP_EXE_NAME} is not in the release folder yet. Source deployment is complete; no EXE copy is required in this run.")
                 return
             running_exe = source_release_exe.resolve()
 
@@ -1586,76 +1869,89 @@ class HarvCoreManager:
             already_running_from_target = destination.is_file() and running_exe == destination.resolve()
             same_installed_binary = False
             if destination.is_file() and running_exe.is_file():
-                try:
-                    same_installed_binary = sha256_file(destination) == sha256_file(running_exe)
-                except OSError:
-                    same_installed_binary = False
+                self._setup_progress("Checking installed desktop app", f"Comparing {running_exe} with {destination}.")
+                same_installed_binary = self._setup_hash_file(destination, "installed HarvHubAI.exe") == self._setup_hash_file(running_exe, "running HarvHubAI.exe")
             if not already_running_from_target and not same_installed_binary:
                 if destination.is_file():
                     backup_root = MANAGER_DIR / "backups" / time.strftime("%Y%m%d-%H%M%S")
                     backup_root.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(destination, backup_root / destination.name)
-                temporary = destination.with_suffix(".exe.new")
-                shutil.copy2(running_exe, temporary)
-                temporary.replace(destination)
-                self._setup_emit("setup_log", f"HarvHub AI installed: {destination}")
+                    self._setup_copy_file(destination, backup_root / destination.name, "backup existing HarvHubAI.exe")
+                temporary = destination.with_name(destination.name + ".new")
+                try:
+                    self._setup_copy_file(running_exe, temporary, "install HarvHubAI.exe")
+                    source_hash = self._setup_hash_file(running_exe, "running HarvHubAI.exe")
+                    copied_hash = self._setup_hash_file(temporary, "copied HarvHubAI.exe")
+                    if source_hash != copied_hash:
+                        raise IOError(f"HarvHubAI.exe copy hash mismatch: source={source_hash}; copied={copied_hash}.")
+                    temporary.replace(destination)
+                except Exception:
+                    try:
+                        temporary.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                    raise
+                self._setup_emit("setup_log", f"HarvHub AI executable installed and SHA-256 verified: {destination}")
             else:
-                self._setup_emit("setup_log", "HarvHub AI is already installed at the current version.")
+                self._setup_emit("setup_log", "HarvHub AI is already installed at the current version (binary identity verified).")
 
             desktop = Path(os.environ.get("USERPROFILE", str(Path.home()))) / "Desktop"
             start_menu = Path(os.environ.get("APPDATA", str(Path.home()))) / "Microsoft" / "Windows" / "Start Menu" / "Programs"
-            desktop.mkdir(parents=True, exist_ok=True)
-            start_menu.mkdir(parents=True, exist_ok=True)
+            for folder in (desktop, start_menu):
+                self._setup_progress("Preparing shortcut folder", str(folder))
+                folder.mkdir(parents=True, exist_ok=True)
             shortcuts = [desktop / "HarvHub AI.lnk", start_menu / "HarvHub AI.lnk"]
-            for shortcut in shortcuts:
+            for index, shortcut in enumerate(shortcuts, start=1):
+                self._check_setup_cancelled()
+                self._setup_progress("Creating desktop shortcut", f"[{index}/{len(shortcuts)}] {shortcut}")
                 ps_path = str(shortcut).replace("'", "''")
                 ps_target = str(destination).replace("'", "''")
                 ps_work = str(HARVHUBAI_ROOT).replace("'", "''")
                 powershell = (
-                    "$w=New-Object -ComObject WScript.Shell; "
+                    "$ErrorActionPreference='Stop'; $w=New-Object -ComObject WScript.Shell; "
                     f"$s=$w.CreateShortcut('{ps_path}'); "
                     f"$s.TargetPath='{ps_target}'; "
                     f"$s.WorkingDirectory='{ps_work}'; "
-                    "$s.Description='HarvHub AI'; $s.Save()"
+                    "$s.Description='HarvHub AI'; $s.Save(); "
+                    f"if (!(Test-Path -LiteralPath '{ps_path}')) {{ throw 'Shortcut file was not created.' }}"
                 )
-                result = subprocess.run(
+                self._run_command(
                     ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", powershell],
-                    capture_output=True, text=True, timeout=30,
-                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    f"Create shortcut {shortcut.name}", timeout=60,
                 )
-                if result.returncode != 0:
-                    self._setup_emit("setup_log", f"Shortcut could not be created: {shortcut}")
-                else:
-                    self._setup_emit("setup_log", f"Shortcut created: {shortcut}")
+                if not shortcut.is_file():
+                    raise RuntimeError(f"PowerShell returned successfully, but the shortcut is missing: {shortcut}")
+                self._setup_emit("setup_log", f"Shortcut created and verified: {shortcut}")
         except Exception as exc:
-            raise RuntimeError(f"Could not install HarvHub AI: {exc}") from exc
+            raise RuntimeError(f"Could not install/update HarvHub AI desktop app: {type(exc).__name__}: {exc}") from exc
 
     def _verify_runtime(self) -> None:
+        self._setup_progress("Runtime verification", f"Checking supported Python interpreter: {self.python_exe}")
         if not self.python_exe or not candidate_python_is_compatible(self.python_exe):
-            raise RuntimeError("The selected Python interpreter failed the Python 3.13 x64 check.")
+            raise RuntimeError("The selected Python interpreter failed the Python 3.13 x64 check. Verify its executable path and architecture.")
         import_check = (
             "import MetaTrader5, pytz, tzdata, requests, urllib3, selenium, bs4, webdriver_manager; "
             "print('IMPORTS_OK')"
         )
-        result = subprocess.run(
+        self._run_command(
             [str(self.python_exe), "-c", import_check],
-            capture_output=True,
-            text=True,
-            timeout=90,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            "Verify HarvHub AI Python package imports", timeout=90,
         )
-        if result.returncode != 0 or "IMPORTS_OK" not in (result.stdout or ""):
-            raise RuntimeError("Python package import verification failed: " + (result.stderr or result.stdout or "unknown import error")[-1200:])
-        required = [PYTHON_DIR / name for name in BUNDLED_PYTHON_FILES]
-        missing = [str(path) for path in required if not path.is_file()]
+        required = [PYTHON_DIR / name for name in BUNDLED_PYTHON_FILES] + [PYTHON_DIR / "requirements-runtime.txt"]
+        missing = []
+        for index, path in enumerate(required, start=1):
+            self._setup_progress("Verifying installed source files", f"[{index}/{len(required)}] {path}")
+            minimum_size = 1 if path.name == "requirements-runtime.txt" else 100
+            if not path.is_file() or path.stat().st_size < minimum_size:
+                missing.append(str(path))
         if missing:
-            raise RuntimeError("The following Python source files are missing: " + ", ".join(missing))
+            raise RuntimeError("The following required Python source files are missing or incomplete after deployment: " + ", ".join(missing))
         if not (MT5_TEMPLATE / "terminal64.exe").is_file():
-            raise RuntimeError("MT5 terminal64.exe was not found in the HarvHub AI template folder.")
+            raise RuntimeError("MT5 terminal64.exe was not found in the HarvHub AI template folder after installation.")
         chrome = Path(r"C:\Program Files\Google\Chrome\Application\chrome.exe")
         if not chrome.is_file():
             raise RuntimeError(f"Google Chrome was not found at the path required by mysqlremote.py: {chrome}")
         self._setup_emit("setup_log", f"Python verified: {self.python_exe}")
+        self._setup_emit("setup_log", f"All {len(required)} Python source/requirements files verified under: {PYTHON_DIR}")
         self._setup_emit("setup_log", f"MT5 verified: {MT5_TEMPLATE / 'terminal64.exe'}")
         self._setup_emit("setup_log", f"Chrome verified: {chrome}")
 
@@ -3591,6 +3887,28 @@ Write-Output $count
                         self._append_setup_log(str(data[0]))
                     elif event == "setup_step":
                         self._set_setup_step(data[0], data[1], data[2])
+                    elif event == "setup_activity":
+                        action, detail = data
+                        if hasattr(self, "setup_subtitle"):
+                            subtitle = str(action)
+                            if detail:
+                                subtitle += ": " + str(detail)
+                            self.setup_subtitle.configure(text=subtitle[:220])
+                    elif event == "setup_watchdog_status":
+                        if hasattr(self, "setup_subtitle"):
+                            self.setup_subtitle.configure(text=str(data[0])[:220])
+                    elif event == "setup_stalled":
+                        message = str(data[0])
+                        self.setup_stall_marked = True
+                        self._append_setup_log("SETUP STALL DETECTED: " + message)
+                        if hasattr(self, "setup_title"):
+                            self.setup_title.configure(text="Setup stalled — diagnostic available")
+                        if hasattr(self, "setup_subtitle"):
+                            self.setup_subtitle.configure(text="No progress was detected. The exact operation and last detail are shown in the setup console.")
+                        if hasattr(self, "setup_status_label"):
+                            self.setup_status_label.configure(text="Setup has stopped reporting progress. Copy the setup console before closing. Restart HarvHub AI to retry after reviewing the diagnostic.")
+                        if hasattr(self, "setup_action"):
+                            self.setup_action.configure(state="disabled", text="Setup stalled — restart required")
                     elif event == "setup_download_progress":
                         label, percent, downloaded, total = data
                         if hasattr(self, "setup_subtitle"):
@@ -3664,10 +3982,14 @@ Write-Output $count
                             if self.global_reset_all_button is not None:
                                 self.global_reset_all_button.configure(state="normal", text="↺  RESET ALL")
                     elif event == "setup_cancelled":
-                        self.setup_started = False
-                        self.setup_view_active = False
-                        self._append_setup_log("Setup stopped. Completed components were left in place; Setup / Repair can resume later.")
-                        self._show_workspace()
+                        if self.setup_stall_marked:
+                            self._append_setup_log("The stalled operation returned and acknowledged the watchdog cancellation. Restart HarvHub AI before retrying setup.")
+                            self.setup_started = True
+                        else:
+                            self.setup_started = False
+                            self.setup_view_active = False
+                            self._append_setup_log("Setup stopped. Completed components were left in place; Setup / Repair can resume later.")
+                            self._show_workspace()
                     elif event == "all_stopped":
                         self.stop_all_in_progress = False
                         for item in PROGRAMS:
@@ -3885,7 +4207,7 @@ Write-Output $count
 
 
 def _show_startup_error_window(error_text: str) -> bool:
-    """Present unexpected startup failures in a copyable, topmost Tk console."""
+    """Present unexpected startup failures in a normal, non-topmost Tk console."""
     error_root = None
     try:
         error_root = tk.Tk()
@@ -3893,7 +4215,6 @@ def _show_startup_error_window(error_text: str) -> bool:
         error_root.geometry("1000x680")
         error_root.minsize(680, 460)
         error_root.configure(bg=LIGHT["bg"])
-        error_root.attributes("-topmost", True)
         error_root.state("zoomed")
         panel = tk.Frame(error_root, bg=LIGHT["surface"], padx=22, pady=20)
         panel.pack(fill="both", expand=True, padx=18, pady=18)
@@ -3922,7 +4243,6 @@ def _show_startup_error_window(error_text: str) -> bool:
                                 bg=LIGHT["gold"], fg="#ffffff", relief="flat",
                                 padx=16, pady=9, font=("Segoe UI", 9, "bold"))
         copy_button.pack(side="left")
-        error_root.after(120, lambda: (error_root.lift(), error_root.focus_force()))
         error_root.mainloop()
         return True
     except Exception:

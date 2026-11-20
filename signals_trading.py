@@ -1,5 +1,8 @@
-# signals_trading.py
-"""Programme-scoped trade pipeline orchestrator.
+#current signals_trading.py
+"""
+old name programmesignals_trading.py
+current name signals_trading.py
+Programme-scoped trade pipeline orchestrator.
 
 Runs programme-requested MT5 Breakeven / Close actions first, then the
 restricted-timerange stage + recent-highest-balance target stage and the

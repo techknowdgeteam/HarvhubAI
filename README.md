@@ -34,14 +34,16 @@ The repository must be public for the unauthenticated ZIP download. The root (or
 
 - `Build_HarvHubProgram.pyw`
 - `harvcore_manager.py`
-- Python files: `mysqlremote.py`, `brokerdetails.py`, `brokercharts.py`, `programme_training.py`, `programmesignals_trading.py`, `signals_provision_challenge.py`, `ip.py`, `notification_email.py`, `notification_service.py`
+- Python files: `mysqlremote.py`, `brokerdetails.py`, `brokercharts.py`, `programme_training.py`, `signals_trading.py`, `signals_provision_challenge.py`, `ip.py`, `notification_email.py`, `notification_service.py`
 
 The Python files may be at the repository root or under `payload`. When both exist, root-level files take priority and refresh `payload`, so flat GitHub uploads replace older nested copies. The bootstrap also recognizes duplicate names like `brokercharts(3).py`. If the requirements file is missing, the bootstrap creates the default runtime dependency list. It replaces the downloaded VBS files with the exact standalone launcher that was clicked.
 
-## Update behaviour
+## Installed app versus explicit updater
 
-Every click of the installed desktop or Start Menu shortcut runs the installed `HarvHubAI.vbs` updater. It downloads and validates the current GitHub ZIP before Python checks or updates. It will not terminate running HarvHub AI services; close the manager normally before updating.
-
+- After setup, the Desktop and Start Menu **HarvHub AI** shortcuts target `C:\xampp\htdocs\harvhubAI\HarvHubAI.exe` directly. The installed EXE checks the existing Python 3.13 runtime, Python modules, Chrome, MT5 template, and deployed service files. When those dependencies are present, it opens the manager workspace immediately and does not download GitHub sources or reinstall dependencies.
+- If a required dependency is genuinely missing, the manager enters its repair/setup flow and installs only what is missing.
+- Double-clicking **HarvHubAI.vbs** explicitly starts the GitHub download, validation, update/build, and setup path. `Build_HarvHubProgram.vbs` remains a compatibility alias for that explicit updater.
+- Updating should be run with the manager and services closed, because the VBS updater replaces installed application files.
 ## Security
 
 Use a public repository only for source code that contains no passwords, API keys, private certificates, database credentials, or other secrets. Rotate any credential that was ever committed publicly. The Python 3.13.17 x64 installer is downloaded from python.org and checked against its published SHA-256 digest and Authenticode signature before installation.
