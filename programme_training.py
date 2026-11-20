@@ -97,13 +97,54 @@ def interpolate_sql(sql: str, params: Optional[Sequence[Any]] = None) -> str:
     return sql
 
 
+def _bridge_sql_is_read(sql: Any) -> bool:
+    """Only retry operations whose repeated execution cannot change data."""
+    text = str(sql or '').strip()
+    while True:
+        previous = text
+        text = text.lstrip()
+        if text.startswith('--'):
+            newline = text.find('\n')
+            text = text[newline + 1:] if newline >= 0 else ''
+        elif text.startswith('/*'):
+            close = text.find('*/')
+            text = text[close + 2:] if close >= 0 else ''
+        if text == previous:
+            break
+    if not text:
+        return False
+    first = text.split(None, 1)[0].upper()
+    return first in {'SELECT', 'SHOW', 'DESCRIBE', 'DESC', 'EXPLAIN', 'WITH'}
+
+
+def _bridge_error_is_transient(message: Any) -> bool:
+    """Recognise transient browser/PHP/bridge errors, not SQL schema errors."""
+    value = str(message or '').lower()
+    markers = (
+        "unexpected token '<'", 'not valid json', 'failed to fetch',
+        'browser not available', 'channel window missing',
+        'window missing', 'unknown channel_id', 'channel limit reached',
+        'failed to spawn dom window', 'query input failed',
+        'timed out', 'timeout (last=', 'cannot talk to bridge',
+        'mysqlremote bridge closed', 'connection refused',
+        'connection reset', 'forcibly closed', 'temporarily unavailable',
+    )
+    return any(marker in value for marker in markers)
+
+
 class BridgeClient:
-    """Persistent mysqlremote bridge client, matching brokercharts.py framing."""
+    """Persistent mysqlremote client with safe read retries and channel renewal.
+
+    A SELECT/SHOW request can be repeated after a broken bridge connection or
+    an upstream HTML-instead-of-JSON response. Writes are never replayed after
+    an ambiguous response, because they may already have reached MySQL.
+    """
     def __init__(self, host: str = BRIDGE_HOST, port: int = BRIDGE_PORT,
                  owner: str = BRIDGE_OWNER) -> None:
         self.host, self.port, self.owner = host, int(port), owner
         self.sock: Optional[socket.socket] = None
         self.channel_id: Optional[int] = None
+        self._request_lock = __import__('threading').RLock()
 
     def _recv_exact(self, count: int) -> bytes:
         assert self.sock is not None
@@ -111,7 +152,7 @@ class BridgeClient:
         while len(buf) < count:
             part = self.sock.recv(count - len(buf))
             if not part:
-                raise BridgeError("mysqlremote bridge closed the socket")
+                raise BridgeError('mysqlremote bridge closed the socket')
             buf.extend(part)
         return bytes(buf)
 
@@ -128,81 +169,135 @@ class BridgeClient:
         self.sock = None
 
     def request(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        body = json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
+        body = json.dumps(payload, ensure_ascii=False, default=str).encode('utf-8')
         if len(body) > MAX_FRAME:
-            raise BridgeError(f"request exceeds bridge frame limit: {len(body)} bytes")
+            raise BridgeError(f'bridge request exceeds frame limit: {len(body)} bytes')
         frame = HEADER.pack(len(body)) + body
+        safe_to_replay = ('sql' not in payload) or _bridge_sql_is_read(payload.get('sql'))
         last_error: Optional[Exception] = None
-        for attempt in range(2):
-            try:
-                if self.sock is None:
-                    self._connect()
-                assert self.sock is not None
-                self.sock.sendall(frame)
-                (length,) = HEADER.unpack(self._recv_exact(HEADER.size))
-                if not 0 < length <= MAX_FRAME:
-                    raise BridgeError(f"invalid bridge response frame length: {length}")
-                result = json.loads(self._recv_exact(length).decode("utf-8"))
-                if not isinstance(result, dict):
-                    raise BridgeError("bridge returned a non-object response")
-                return result
-            except Exception as exc:
-                last_error = exc
-                self._close()
-                if attempt:
-                    break
-        raise BridgeError(f"bridge request failed: {last_error}")
+        with self._request_lock:
+            for attempt in range(2):
+                sent = False
+                try:
+                    if self.sock is None:
+                        self._connect()
+                    assert self.sock is not None
+                    self.sock.sendall(frame)
+                    sent = True
+                    (length,) = HEADER.unpack(self._recv_exact(HEADER.size))
+                    if not 0 < length <= MAX_FRAME:
+                        raise BridgeError(f'invalid bridge response frame length: {length}')
+                    result = json.loads(self._recv_exact(length).decode('utf-8'))
+                    if not isinstance(result, dict):
+                        raise BridgeError('bridge returned a non-object response')
+                    return result
+                except Exception as exc:
+                    last_error = exc
+                    self._close()
+                    # An interrupted write may already have completed remotely.
+                    if sent and not safe_to_replay:
+                        break
+                    if attempt:
+                        break
+        raise BridgeError(f'bridge request failed: {last_error}')
 
     def acquire(self) -> int:
         if self.channel_id is not None:
             return self.channel_id
-        reply = self.request({"op": "acquire_channel", "owner": self.owner})
-        if reply.get("status") != "success":
+        reply = self.request({'op': 'acquire_channel', 'owner': self.owner})
+        if reply.get('status') != 'success':
             raise BridgeError(f"acquire_channel failed: {reply.get('message')}")
-        self.channel_id = int(reply["channel_id"])
-        log.info("Acquired mysqlremote channel %s", self.channel_id)
+        self.channel_id = int(reply['channel_id'])
+        log.info('Acquired mysqlremote channel %s for %s', self.channel_id, self.owner)
         return self.channel_id
+
+    def invalidate_channel(self) -> None:
+        """Release a questionable DOM window and force a fresh channel next time."""
+        channel_id, self.channel_id = self.channel_id, None
+        if channel_id is not None:
+            try:
+                self.request({'op': 'release_channel', 'channel_id': channel_id})
+            except Exception:
+                pass
+        self._close()
 
     def query(self, sql: str, params: Optional[Sequence[Any]] = None,
               timeout: float = 90.0) -> Dict[str, Any]:
-        # Do not send a parameter array to mysqlremote.  Its SQL bridge replaces
-        # only one %s token per request; render all values safely on this side.
         rendered_sql = interpolate_sql(sql, params)
-        request: Dict[str, Any] = {"sql": rendered_sql, "timeout": timeout}
-        request["channel_id"] = self.acquire()
-        reply = self.request(request)
-        if reply.get("status") != "success":
-            # The bridge often returns the generic "Some statements failed".
-            # Preserve its per-statement diagnostics and the exact SQL so the
-            # actual MySQL error (unknown column/table, permissions, etc.) is
-            # visible instead of being swallowed by main().
+        is_read = _bridge_sql_is_read(rendered_sql)
+        delay = 1.0
+        last_log = 0.0
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                request: Dict[str, Any] = {
+                    'sql': rendered_sql, 'timeout': timeout,
+                    'channel_id': self.acquire(),
+                }
+                reply = self.request(request)
+            except BridgeError as exc:
+                if not is_read:
+                    raise
+                if time.monotonic() - last_log >= 15:
+                    log.warning(
+                        'MySQL Remote read is temporarily unavailable (%s); '
+                        'keeping %s alive and retrying in %.1fs',
+                        str(exc)[:700], self.owner, delay,
+                    )
+                    last_log = time.monotonic()
+                self.invalidate_channel()
+                time.sleep(delay)
+                delay = min(10.0, delay * 1.6)
+                continue
+
+            if reply.get('status') == 'success':
+                return reply
+
+            message = str(reply.get('message') or 'SQL operation failed')
+            if 'unknown channel_id' in message.lower():
+                # mysqlremote rejects an unknown channel before dispatching SQL,
+                # so renewing and replaying this request is safe even for writes.
+                self.invalidate_channel()
+                continue
+            if reply.get('transient') or _bridge_error_is_transient(message):
+                if not is_read:
+                    raise BridgeError(
+                        'Transient upstream bridge response while executing a write; '
+                        'the write outcome is uncertain, so it was NOT replayed. '
+                        f'{message}; SQL={rendered_sql[:1200]}'
+                    )
+                if time.monotonic() - last_log >= 15:
+                    log.warning(
+                        'MySQL Remote/PHP query endpoint returned a transient error '
+                        '(%s); renewing the browser channel and retrying read query '
+                        'attempt %s', message[:500], attempt,
+                    )
+                    last_log = time.monotonic()
+                self.invalidate_channel()
+                time.sleep(delay)
+                delay = min(10.0, delay * 1.6)
+                continue
+
             detail_text = json.dumps(reply, ensure_ascii=False, default=str)
-            message = str(reply.get("message") or "SQL operation failed")
-            sql_preview = re.sub(r"\\s+", " ", rendered_sql).strip()[:1600]
+            sql_preview = re.sub(r'\s+', ' ', rendered_sql).strip()[:1600]
             raise BridgeError(
-                f"{message}; bridge_reply={detail_text[:5000]}; SQL={sql_preview}"
+                f'{message}; bridge_reply={detail_text[:5000]}; SQL={sql_preview}'
             )
-        return reply
 
     def fetch_all(self, sql: str, params: Optional[Sequence[Any]] = None,
                   timeout: float = 90.0) -> List[Dict[str, Any]]:
         result = self.query(sql, params, timeout)
-        rows = result.get("results") or []
-        return [normalise_row(r) for r in rows if isinstance(r, dict)]
+        rows = result.get('results') or []
+        return [normalise_row(row) for row in rows if isinstance(row, dict)]
 
     def execute(self, sql: str, params: Optional[Sequence[Any]] = None,
                 timeout: float = 90.0) -> int:
         result = self.query(sql, params, timeout)
-        return int(result.get("affected_rows") or 0)
+        return int(result.get('affected_rows') or 0)
 
     def close(self) -> None:
-        if self.channel_id is not None:
-            cid, self.channel_id = self.channel_id, None
-            try:
-                self.request({"op": "release_channel", "channel_id": cid})
-            except Exception as exc:
-                log.warning("Could not release bridge channel %s: %s", cid, exc)
-        self._close()
+        self.invalidate_channel()
 
 
 def normalise_row(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -3028,29 +3123,27 @@ def process_programme(db: BridgeClient, programme: Dict[str, Any]) -> Dict[str, 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Programme Training: VPS-scoped chart matcher with Begin-Test pending-order status"
+        description='Programme Training: VPS-scoped chart matcher with Begin-Test pending-order status'
     )
-    parser.add_argument("--execution-type", choices=("loop", "once"), default="loop", help="manager execution mode")
-    parser.add_argument("--once", action="store_true", help="run one complete scan and exit (legacy alias)")
-    parser.add_argument("--interval", type=int, default=10, help="seconds between complete scans (clamped to 5–10; default: 10)")
-    parser.add_argument(
-        "--programme-id", type=int, default=None,
-        help="optionally limit to one programme already assigned to this VPS IP",
-    )
-    parser.add_argument(
-        "--vps-ip", default=None,
-        help="override detected public VPS IP (must match programme_vps.programme_vps_ip_address)",
-    )
-    parser.add_argument("--bridge-host", default=BRIDGE_HOST)
-    parser.add_argument("--bridge-port", type=int, default=BRIDGE_PORT)
+    parser.add_argument('--execution-type', choices=('loop', 'once'), default='loop', help='manager execution mode')
+    parser.add_argument('--once', action='store_true', help='run one complete scan and exit (legacy alias)')
+    parser.add_argument('--interval', type=int, default=10, help='seconds between complete scans (clamped to 5–10; default: 10)')
+    parser.add_argument('--programme-id', type=int, default=None,
+                        help='optionally limit to one programme already assigned to this VPS IP')
+    parser.add_argument('--vps-ip', default=None,
+                        help='override detected public VPS IP (must match programme_vps.programme_vps_ip_address)')
+    parser.add_argument('--bridge-host', default=BRIDGE_HOST)
+    parser.add_argument('--bridge-port', type=int, default=BRIDGE_PORT)
     args = parser.parse_args()
     args.interval = min(10, max(5, int(args.interval)))
-    run_as_loop = args.execution_type == "loop" and not args.once
+    run_as_loop = args.execution_type == 'loop' and not args.once
 
-    print(f"Programme Training starting | mode={'LOOP' if run_as_loop else 'ONCE'} | interval={args.interval}s", flush=True)
-    print("Programme Training scope: programmes bound to this VPS IP (direct owner + active followers)")
-    print("Begin Test policy: enabled = pending-entry orders Live; disabled = all trades History")
-    print("Root filter: apply_to_chart = 1 only; disabled roots and their confirmations are skipped")
+    print(f'Programme Training starting | mode={"LOOP" if run_as_loop else "ONCE"} | interval={args.interval}s', flush=True)
+    print('Programme Training scope: programmes bound to this VPS IP (direct owner + active followers)', flush=True)
+    print('Begin Test policy: enabled = pending-entry orders Live; disabled = all trades History', flush=True)
+    print('Root filter: apply_to_chart = 1 only; disabled roots and their confirmations are skipped', flush=True)
+    print('Bridge recovery: safe read queries retry until available; ambiguous writes are never blindly replayed', flush=True)
+
     db = BridgeClient(args.bridge_host, args.bridge_port, BRIDGE_OWNER)
     stopping = False
 
@@ -3059,66 +3152,82 @@ def main() -> int:
         stopping = True
 
     signal.signal(signal.SIGINT, stop)
-    if hasattr(signal, "SIGTERM"):
+    if hasattr(signal, 'SIGTERM'):
         signal.signal(signal.SIGTERM, stop)
 
     try:
         local_vps_ip = args.vps_ip or detect_vps_ip()
         if local_vps_ip:
-            print(f"Detected VPS public IP: {local_vps_ip}", flush=True)
+            print(f'Detected VPS public IP: {local_vps_ip}', flush=True)
         else:
-            print("VPS public IP could not be detected. Programme discovery will fail closed; no unscoped programmes will run.", flush=True)
+            print('VPS public IP could not be detected. Programme discovery will fail closed; no unscoped programmes will run.', flush=True)
 
+        scan_number = 0
         while not stopping:
+            scan_number += 1
             started = time.monotonic()
-            print("\n" + "=" * 82, flush=True)
-            print(f"PROGRAMME TRAINING SCAN STARTED | cycle={int(started)} | mode={'LOOP' if run_as_loop else 'ONCE'}", flush=True)
-            print(f"Discovering programmes assigned to VPS IP {local_vps_ip or '(unavailable)'}...", flush=True)
-            programmes = discover_programmes(db, args.programme_id, local_vps_ip)
-            print(f"Programme discovery returned {len(programmes)} VPS-associated candidate programme(s).", flush=True)
-            totals = {"programmes": 0, "pairs": 0, "families": 0, "trades": 0, "candles": 0}
-            if not programmes:
-                if not local_vps_ip:
-                    print("No scan performed because the VPS IP is unavailable; refusing to process programmes without an IP match.")
-                elif args.programme_id is None:
-                    print(f"No programmes are assigned to VPS IP {local_vps_ip}; nothing to scan.")
-                else:
-                    print(f"Programme {args.programme_id} is not assigned to VPS IP {local_vps_ip}; nothing to scan.")
-            for programme in programmes:
-                if stopping:
-                    break
-                try:
-                    result = process_programme(db, programme)
-                    totals["programmes"] += 1
-                    for key in ("pairs", "families", "trades", "candles"):
-                        totals[key] += int(result.get(key, 0))
-                except Exception:
-                    log.error("Programme %s failed:\n%s", programme.get("id"), traceback.format_exc())
+            print('\n' + '=' * 82, flush=True)
+            print(f'PROGRAMME TRAINING SCAN STARTED | cycle={int(started)} | scan={scan_number} | mode={"LOOP" if run_as_loop else "ONCE"}', flush=True)
+            print(f'Discovering programmes assigned to VPS IP {local_vps_ip or "(unavailable)"}...', flush=True)
+            try:
+                programmes = discover_programmes(db, args.programme_id, local_vps_ip)
+                print(f'Programme discovery returned {len(programmes)} VPS-associated candidate programme(s).', flush=True)
+                totals = {'programmes': 0, 'pairs': 0, 'families': 0, 'trades': 0, 'candles': 0}
+                if not programmes:
+                    if not local_vps_ip:
+                        print('No scan performed because the VPS IP is unavailable; refusing to process programmes without an IP match.', flush=True)
+                    elif args.programme_id is None:
+                        print(f'No programmes are assigned to VPS IP {local_vps_ip}; nothing to scan.', flush=True)
+                    else:
+                        print(f'Programme {args.programme_id} is not assigned to VPS IP {local_vps_ip}; nothing to scan.', flush=True)
 
-            print("\n" + "-" * 82)
-            print("PROGRAMME TRAINING SCAN COMPLETE")
-            print(f"Programmes processed : {totals['programmes']}")
-            print(f"Analytics pairs      : {totals['pairs']}")
-            print(f"Matched families     : {totals['families']}")
-            print(f"Trade records        : {totals['trades']}")
-            print(f"Candles fetched      : {totals['candles']:,}")
-            print("Live flag            : pending-entry orders only, and only when Begin Test is enabled")
-            print(f"Programme scope      : VPS IP match ({local_vps_ip or 'unavailable'}); direct owner + active followers")
-            print("-" * 82)
+                for programme in programmes:
+                    if stopping:
+                        break
+                    try:
+                        result = process_programme(db, programme)
+                        totals['programmes'] += 1
+                        for key in ('pairs', 'families', 'trades', 'candles'):
+                            totals[key] += int(result.get(key, 0))
+                    except BridgeError:
+                        # Stop this cycle at the first bridge failure. The next
+                        # cycle starts with a fresh channel and safe reads wait
+                        # for the bridge/PHP endpoint to recover.
+                        raise
+                    except Exception:
+                        log.error('Programme %s failed:\n%s', programme.get('id'), traceback.format_exc())
+
+                print('\n' + '-' * 82, flush=True)
+                print('PROGRAMME TRAINING SCAN COMPLETE', flush=True)
+                print(f"Programmes processed : {totals['programmes']}", flush=True)
+                print(f"Analytics pairs      : {totals['pairs']}", flush=True)
+                print(f"Matched families     : {totals['families']}", flush=True)
+                print(f"Trade records        : {totals['trades']}", flush=True)
+                print(f"Candles fetched      : {totals['candles']:,}", flush=True)
+                print('Live flag            : pending-entry orders only, and only when Begin Test is enabled', flush=True)
+                print(f"Programme scope      : VPS IP match ({local_vps_ip or 'unavailable'}); direct owner + active followers", flush=True)
+                print('-' * 82, flush=True)
+            except BridgeError as exc:
+                log.error('Database bridge/query unavailable; worker remains active: %s', str(exc)[:1800])
+                if not run_as_loop:
+                    return 2
+                db.close()
+                db = BridgeClient(args.bridge_host, args.bridge_port, BRIDGE_OWNER)
+                log.warning('Programme Training will retry database discovery on the next cycle; no process exit requested.')
+            except Exception:
+                log.error('Unexpected scan error; worker remains active:\n%s', traceback.format_exc())
+                if not run_as_loop:
+                    return 1
 
             if not run_as_loop:
-                print("Programme Training one-shot scan finished; exiting.", flush=True)
+                print('Programme Training one-shot scan finished; exiting.', flush=True)
                 break
-            elapsed = time.monotonic() - started
-            sleep_for = min(10, max(5, args.interval))
-            print(f"Next Programme Training scan in {sleep_for}s.", flush=True)
+            sleep_for = args.interval
+            print(f'Next Programme Training scan in {sleep_for}s.', flush=True)
             for _ in range(sleep_for):
                 if stopping:
                     break
                 time.sleep(1)
-    except BridgeError as exc:
-        log.error("Database bridge unavailable: %s", exc)
-        return 2
     finally:
         db.close()
     return 0

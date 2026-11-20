@@ -118,8 +118,8 @@ except Exception:
 # ==============================================================================
 #  REBRANDED MT5 PATHS — must match brokerdetails.py exactly
 # ==============================================================================
-DEFAULT_MT5_PATH     = r"C:\xampp\htdocs\harvcore\mt5\MetaTrader 5"
-MT5_DESTINATION_PATH = r"C:\xampp\htdocs\harvcore\mt5"
+DEFAULT_MT5_PATH     = r"C:\xampp\htdocs\harvhubAI\mt5\MetaTrader 5"
+MT5_DESTINATION_PATH = r"C:\xampp\htdocs\harvhubAI\mt5"
 
 
 # ==============================================================================
@@ -140,40 +140,62 @@ class _BridgeError(Exception):
     pass
 
 
+def _bridge_sql_is_read(sql):
+    text = str(sql or '').strip()
+    while True:
+        previous = text
+        text = text.lstrip()
+        if text.startswith('--'):
+            newline = text.find('\n')
+            text = text[newline + 1:] if newline >= 0 else ''
+        elif text.startswith('/*'):
+            close = text.find('*/')
+            text = text[close + 2:] if close >= 0 else ''
+        if text == previous:
+            break
+    return bool(text) and text.split(None, 1)[0].upper() in {
+        'SELECT', 'SHOW', 'DESCRIBE', 'DESC', 'EXPLAIN', 'WITH'
+    }
+
+
+def _bridge_error_is_transient(message):
+    value = str(message or '').lower()
+    return any(marker in value for marker in (
+        "unexpected token '<'", 'not valid json', 'failed to fetch',
+        'browser not available', 'channel window missing', 'window missing',
+        'unknown channel_id', 'channel limit reached', 'failed to spawn dom window',
+        'query input failed', 'timed out', 'timeout (last=',
+        'cannot talk to bridge', 'bridge closed connection',
+        'connection refused', 'connection reset', 'temporarily unavailable',
+    ))
+
+
 class _BridgeClient:
-    """
-    Persistent-socket bridge client.
-
-    One TCP connection per worker, kept alive across every db_query()
-    call. Reconnects once on any transport error, then raises.
-
-    Protocol is unchanged: one length-prefixed JSON request -> one
-    length-prefixed JSON response. The bridge already loops over
-    _recv_frame() on a single connection, so no server change is needed.
-    """
+    """Channel-aware bridge client with safe idempotent-read retry behaviour."""
 
     def __init__(self, host=BRIDGE_HOST, port=BRIDGE_PORT, owner=BRIDGE_OWNER):
         self.host = host
-        self.port = port
-        self.owner = owner
+        self.port = int(port)
+        self.owner = f'{owner}:{os.getpid()}'
         self.channel_id = None
         self._channel_lock = threading.Lock()
         self._sock = None
-        self._sock_lock = threading.Lock()
+        self._sock_lock = threading.RLock()
 
-    # ---------- framing ----------
     @staticmethod
-    def _recv_exact(sock, n):
-        buf = bytearray()
-        while len(buf) < n:
-            chunk = sock.recv(n - len(buf))
+    def _recv_exact(sock, count):
+        data = bytearray()
+        while len(data) < count:
+            chunk = sock.recv(count - len(data))
             if not chunk:
                 return None
-            buf.extend(chunk)
-        return bytes(buf)
+            data.extend(chunk)
+        return bytes(data)
 
     def _connect(self):
-        return socket.create_connection((self.host, self.port), timeout=15)
+        sock = socket.create_connection((self.host, self.port), timeout=15)
+        sock.settimeout(120)
+        return sock
 
     def _close_sock_locked(self):
         if self._sock is not None:
@@ -184,87 +206,116 @@ class _BridgeClient:
             self._sock = None
 
     def _send_request(self, req):
-        """
-        Serialize all requests through one socket. Reconnect once on
-        transport failure. The bridge's _client_loop handles multiple
-        frames per connection already.
-        """
+        payload = json.dumps(req, ensure_ascii=False, default=str).encode('utf-8')
+        if len(payload) > MAX_FRAME:
+            raise _BridgeError(f'bridge request exceeds frame limit: {len(payload)} bytes')
+        frame = _HEADER.pack(len(payload)) + payload
+        safe_to_replay = ('sql' not in req) or _bridge_sql_is_read(req.get('sql'))
+        last_error = None
         with self._sock_lock:
-            payload = json.dumps(req, ensure_ascii=False).encode('utf-8')
-            frame = _HEADER.pack(len(payload)) + payload
-
-            for attempt in (1, 2):
+            for attempt in range(2):
+                sent = False
                 try:
                     if self._sock is None:
                         self._sock = self._connect()
                     self._sock.sendall(frame)
-
+                    sent = True
                     header = self._recv_exact(self._sock, _HEADER.size)
                     if header is None:
-                        raise _BridgeError("bridge closed connection (no header)")
+                        raise _BridgeError('bridge closed connection (no header)')
                     (length,) = _HEADER.unpack(header)
-                    if length == 0 or length > MAX_FRAME:
-                        raise _BridgeError(f"bad frame length: {length}")
-
+                    if length <= 0 or length > MAX_FRAME:
+                        raise _BridgeError(f'invalid bridge response frame length: {length}')
                     body = self._recv_exact(self._sock, length)
                     if body is None:
-                        raise _BridgeError("bridge closed connection (no body)")
-
-                    return json.loads(body.decode('utf-8'))
-                except _BridgeError:
-                    # protocol-level: don't retry, surface it
+                        raise _BridgeError('bridge closed connection (no body)')
+                    result = json.loads(body.decode('utf-8'))
+                    if not isinstance(result, dict):
+                        raise _BridgeError('bridge returned a non-object response')
+                    return result
+                except Exception as exc:
+                    last_error = exc
                     self._close_sock_locked()
-                    raise
-                except Exception as e:
-                    # transport-level: try once more on a fresh socket
-                    self._close_sock_locked()
-                    if attempt == 2:
-                        raise _BridgeError(
-                            f"cannot talk to bridge {self.host}:{self.port}: {e}"
-                        )
+                    if sent and not safe_to_replay:
+                        break
+                    if attempt:
+                        break
+        raise _BridgeError(f'cannot talk to bridge {self.host}:{self.port}: {last_error}')
 
-    # ---------- channel management ----------
     def acquire_channel(self):
         with self._channel_lock:
             if self.channel_id is not None:
                 return self.channel_id
-            resp = self._send_request({
-                'op': 'acquire_channel',
-                'owner': self.owner,
-            })
-            if resp.get('status') != 'success':
-                raise _BridgeError(
-                    f"acquire_channel failed: {resp.get('message')}"
-                )
-            self.channel_id = int(resp['channel_id'])
-            print(f"[bridge] {self.owner}: acquired channel "
-                  f"queryrequest_{self.channel_id} / "
-                  f"queryresult_{self.channel_id} "
-                  f"(window #{resp.get('window_id')})")
+            response = self._send_request({'op': 'acquire_channel', 'owner': self.owner})
+            if response.get('status') != 'success':
+                raise _BridgeError(f"acquire_channel failed: {response.get('message')}")
+            self.channel_id = int(response['channel_id'])
+            print(f'[bridge] {self.owner}: acquired channel {self.channel_id}', flush=True)
             return self.channel_id
 
     def release_channel(self):
         with self._channel_lock:
-            if self.channel_id is None:
-                return
-            cid = self.channel_id
-            self.channel_id = None
+            cid, self.channel_id = self.channel_id, None
+        if cid is not None:
             try:
-                self._send_request({'op': 'release_channel',
-                                    'channel_id': cid})
-                print(f"[bridge] {self.owner}: released channel {cid}")
-            except Exception as e:
-                print(f"[bridge] release_channel({cid}) failed: {e}")
-            finally:
-                with self._sock_lock:
-                    self._close_sock_locked()
+                self._send_request({'op': 'release_channel', 'channel_id': cid})
+                print(f'[bridge] {self.owner}: released channel {cid}', flush=True)
+            except Exception as exc:
+                print(f'[bridge] {self.owner}: release channel {cid} warning: {exc}', flush=True)
+        with self._sock_lock:
+            self._close_sock_locked()
 
     def put(self, request, timeout=None):
         req = dict(request)
-        if 'sql' in req and 'channel_id' not in req:
-            req['channel_id'] = self.acquire_channel()
-        return self._send_request(req)
-    
+        has_sql = 'sql' in req
+        is_read = _bridge_sql_is_read(req.get('sql')) if has_sql else True
+        delay = 1.0
+        last_log = 0.0
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                if has_sql:
+                    req['channel_id'] = self.acquire_channel()
+                response = self._send_request(req)
+            except _BridgeError as exc:
+                if not is_read:
+                    raise
+                if time.monotonic() - last_log >= 15:
+                    print(f'[bridge] {self.owner}: read request unavailable ({exc}); waiting {delay:.1f}s and reconnecting', flush=True)
+                    last_log = time.monotonic()
+                self.release_channel()
+                time.sleep(delay)
+                delay = min(10.0, delay * 1.6)
+                continue
+
+            message = str((response or {}).get('message') or '')
+            if (response or {}).get('status') == 'success':
+                return response
+            if 'unknown channel_id' in message.lower():
+                # This response is generated before SQL execution. Renewal and
+                # replay are safe for reads and writes alike.
+                self.release_channel()
+                if attempt < 3:
+                    continue
+            elif ((response or {}).get('transient') or _bridge_error_is_transient(message)) and is_read:
+                if time.monotonic() - last_log >= 15:
+                    print(f'[bridge] {self.owner}: PHP query endpoint returned a transient HTML/JSON error; renewing channel and retrying read #{attempt}', flush=True)
+                    last_log = time.monotonic()
+                self.release_channel()
+                time.sleep(delay)
+                delay = min(10.0, delay * 1.6)
+                continue
+            elif ((response or {}).get('transient') or _bridge_error_is_transient(message)) and not is_read:
+                response['message'] = (
+                    'Transient upstream response during a write; result is uncertain and '
+                    'the client deliberately did not replay it. ' + message
+                )
+            return response
+
+    def get(self, timeout=None, block=True):
+        raise _BridgeError('request/response mode is active; get() is not supported')
+
 
 # ==============================================================================
 #  MODULE-SCOPE HELPERS (shared by all future functions)
@@ -13943,7 +13994,11 @@ def main_loop():
                 print("=" * 60)
 
             try:
-                print("[ORCHESTRATOR] Discovering active investor jobs from the database bridge...", flush=True)
+                print("[ORCHESTRATOR] Checking the live MySQL Remote query path...", flush=True)
+                health = db_query('SELECT 1 AS bridge_health', timeout=15.0, quiet=True)
+                if not _is_ok(health):
+                    raise _BridgeError(f"MySQL Remote query health check failed: {health.get('message', 'unknown error')}")
+                print("[ORCHESTRATOR] Database query path is healthy. Discovering active investor jobs...", flush=True)
                 jobs = discover_investor_jobs()
                 print(f"[ORCHESTRATOR] Job discovery complete: {len(jobs)} active investor job(s).", flush=True)
 
@@ -13986,12 +14041,13 @@ def main_loop():
                 print("Single execution completed. Exiting...")
                 break
 
-            if max_loops and loop_count >= max_loops:
+            if max_loops and loop_count >= max_loops and not run_as_loop:
                 print(f"Maximum loops ({max_loops}) reached. Exiting...")
                 break
 
             if run_as_loop and loop_interval > 0:
-                time.sleep(loop_interval)
+                for _ in range(loop_interval):
+                    time.sleep(1)
 
     except KeyboardInterrupt:
         print("\n[main] interrupted — shutting down")

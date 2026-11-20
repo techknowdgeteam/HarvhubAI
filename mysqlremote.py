@@ -1101,6 +1101,7 @@ def _execute_sql_on_channel(ch, sql, timeout):
         err_msg = _channel_read_message(ch.channel_id) or banner_label or "query failed"
         return {
             'status': 'error', 'message': err_msg,
+            'transient': _is_upstream_html_json_error(err_msg),
             'results': [], 'affected_rows': 0, 'query_id': query_id,
             'raw_sql': sql, 'elapsed': time.perf_counter() - t_start,
             'channel_id': ch.channel_id,
@@ -1125,10 +1126,13 @@ def _execute_sql_on_channel(ch, sql, timeout):
         overall = 'success' if state in ('success', 'empty') else 'error'
 
     message = banner_label or f'{len(statement_results)} statement(s)'
+    failure_text = ' '.join(str(item.get('message') or '') for item in statement_results)
+    transient_error = _is_upstream_html_json_error(message) or _is_upstream_html_json_error(failure_text)
 
     return {
         'status':             overall,
-        'message':            message,
+        'message':            (failure_text[:1200] if transient_error and failure_text else message),
+        'transient':          transient_error,
         'results':            flat_rows,
         'affected_rows':      affected_rows,
         'query_id':           query_id,

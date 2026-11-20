@@ -77,6 +77,7 @@ BUNDLED_PYTHON_FILES = [
     "notification_email.py",
     "notification_service.py",
     "harvhub_ipc.py",
+    "harvcore_console_supervisor.py",
 ]
 
 PROGRAMS = [
@@ -463,11 +464,23 @@ def locate_python() -> Optional[Path]:
 
 
 def build_service_command(python_exe, script, key, execution_type, interval, extra_args=()):
-    """Build the one CLI contract accepted by every HarvHub runnable service."""
-    mode = "loop" if str(execution_type).lower() == "loop" else "once"
-    command = [str(python_exe), "-u", str(script), f"--execution-type={mode}", "--interval", str(max(1, int(interval)))]
-    command.extend(str(arg) for arg in (extra_args or ()))
-    return command
+    """Launch services under the per-console supervisor/restart wrapper."""
+    mode = 'loop' if str(execution_type).lower() == 'loop' else 'once'
+    script = Path(script).resolve()
+    supervisor = script.with_name('harvcore_console_supervisor.py')
+    if not supervisor.is_file():
+        raise FileNotFoundError(f'Console supervisor is missing: {supervisor}')
+    child_args = [f'--execution-type={mode}', '--interval', str(min(10, max(5, int(interval))))]
+    child_args.extend(str(arg) for arg in (extra_args or ()))
+    return [
+        str(python_exe), '-u', str(supervisor),
+        '--target', str(script),
+        '--execution-type', mode,
+        '--restart-min-delay', '3',
+        '--restart-max-delay', '30',
+        '--', *child_args,
+    ]
+
 
 
 class HarvCoreManager:
@@ -476,6 +489,8 @@ class HarvCoreManager:
         self.events: queue.Queue = queue.Queue()
         self.processes: dict[str, ProgramProcess] = {}
         self.process_lock = threading.RLock()
+        self.intentional_stops: set[str] = set()
+        self.restart_pending: set[str] = set()
         self.execution_config = self._load_execution_config()
         self.global_execution_type = self.execution_config.get("default", "loop")
         if self.global_execution_type not in ("loop", "once"):
@@ -2985,6 +3000,7 @@ class HarvCoreManager:
         if not item or not item["runnable"]:
             return False
         with self.process_lock:
+            self.intentional_stops.discard(key)
             existing = self.processes.get(key)
             if existing and existing.process.poll() is None:
                 self.events.put(("program_status", (key, "RUNNING")))
@@ -2994,6 +3010,11 @@ class HarvCoreManager:
             script = PYTHON_DIR / item["filename"]
             if not script.is_file():
                 self._ui_log(key, f"[MANAGER] Program file not found: {script}\n", "error")
+                self.events.put(("program_status", (key, "ERROR")))
+                return False
+            supervisor_script = PYTHON_DIR / "harvcore_console_supervisor.py"
+            if not supervisor_script.is_file():
+                self._ui_log(key, f"[MANAGER] Console supervisor file not found: {supervisor_script}. Restore it from the resilience ZIP and retry.\n", "error")
                 self.events.put(("program_status", (key, "ERROR")))
                 return False
             if not self.python_exe:
@@ -3052,7 +3073,8 @@ class HarvCoreManager:
             self.service_output_at[key] = started_at
 
         self.events.put(("program_status", (key, "RUNNING")))
-        self._ui_log(key, f"[MANAGER] STARTED: {item['label']} | PID={process.pid}\n", "success")
+        self._ui_log(key, f"[MANAGER] STARTED: {item['label']} | SUPERVISOR PID={process.pid}\n", "success")
+        self._ui_log(key, "[MANAGER] Console supervisor enabled: unexpected worker exits are restarted automatically in Loop mode.\n", "dim")
         self._ui_log(key, f"[MANAGER] Execution mode: {selected_execution.upper()} | interval={interval}s\n", "dim")
         self._ui_log(key, f"[MANAGER] Script: {script}\n", "dim")
         self._ui_log(key, "[MANAGER] Live stdout/stderr reader attached to this program only.\n", "dim")
@@ -3128,6 +3150,31 @@ class HarvCoreManager:
                 )
                 next_report = idle_seconds + 30.0
         stop_event.set()
+
+    def _schedule_service_restart(self, key: str) -> None:
+        """Fallback restart if the supervisor wrapper itself unexpectedly exits."""
+        with self.process_lock:
+            if key in self.restart_pending:
+                return
+            self.restart_pending.add(key)
+
+        def restart_worker() -> None:
+            try:
+                time.sleep(3.0)
+                if (self.closing or self.stop_all_in_progress or self.reset_lock.locked()
+                        or self.program_execution_types.get(key, self.global_execution_type) != 'loop'):
+                    return
+                self._ui_log(key, '[MANAGER][WATCHDOG] Restarting the service console supervisor.', 'dim')
+                self._launch_process(key, execution_type='loop')
+            finally:
+                with self.process_lock:
+                    self.restart_pending.discard(key)
+
+        threading.Thread(
+            target=restart_worker,
+            daemon=True,
+            name=f'{key}-supervisor-restart',
+        ).start()
 
     def stop_program(self, key: str) -> None:
         threading.Thread(target=self._stop_process_worker, args=(key,), daemon=True).start()
@@ -3377,6 +3424,7 @@ Write-Output $count
 
     def _stop_process_worker(self, key: str) -> None:
         with self.process_lock:
+            self.intentional_stops.add(key)
             entry = self.processes.get(key)
         if not entry:
             self.events.put(("program_status", (key, "STOPPED")))
@@ -3579,8 +3627,23 @@ Write-Output $count
                         self._set_program_status(data[0], data[1])
                     elif event == "process_exit":
                         key, code = data
-                        self._set_program_status(key, "STOPPED")
-                        self._append_console(key, f"[MANAGER] Process exited with code {code}.", "dim" if code in (0, None) else "error")
+                        intentional = key in self.intentional_stops
+                        if intentional:
+                            self.intentional_stops.discard(key)
+                        should_restart = (
+                            not intentional
+                            and not self.closing
+                            and not self.stop_all_in_progress
+                            and not self.reset_lock.locked()
+                            and self.program_execution_types.get(key, self.global_execution_type) == "loop"
+                        )
+                        if should_restart:
+                            self._set_program_status(key, "RESTARTING")
+                            self._append_console(key, f"[MANAGER][WATCHDOG] Supervisor process exited with code {code}; scheduling a safe restart.", "error")
+                            self._schedule_service_restart(key)
+                        else:
+                            self._set_program_status(key, "STOPPED")
+                            self._append_console(key, f"[MANAGER] Process exited with code {code}.", "dim" if code in (0, None) else "error")
                     elif event == "run_all_finished":
                         if not self.stop_all_in_progress and not self.reset_lock.locked():
                             self._set_global_run_all_buttons("normal", "▶  RUN ALL")
