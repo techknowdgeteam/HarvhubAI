@@ -4019,9 +4019,9 @@ def recent_highest_balance_revenue_target(inv_db_id=None, jobs=None):
       * harvhub.recent_highest_balance (+ last_update)         per sub-account
       * daily_target_revenue              -> daily target met rows per sub-account
                                             INCLUDING:
-                                              - daily_target_owed
-                                              - daily_target_owed_day_balance
-                                              - daily_target_owed_date
+                                              - period_target_owed
+                                              - period_target_owed_day_balance
+                                              - period_target_owed_date
 
     No JSON. No files. No folders.
     """
@@ -4273,9 +4273,9 @@ def recent_highest_balance_revenue_target(inv_db_id=None, jobs=None):
 
             week_key = f"week_{wk}"
             cfg.setdefault(week_key, {})
-            cfg[week_key].setdefault('daily_target', {})
-            cfg[week_key]['daily_target'].setdefault(day_lower, {})
-            day_config = cfg[week_key]['daily_target'][day_lower]
+            cfg[week_key].setdefault('period_target', {})
+            cfg[week_key]['period_target'].setdefault(day_lower, {})
+            day_config = cfg[week_key]['period_target'][day_lower]
             day_config[range_key] = float(target)
             day_config.setdefault('_range_options', {})[range_key] = {
                 'pre-pending_sum': pre_pending,
@@ -4288,71 +4288,48 @@ def recent_highest_balance_revenue_target(inv_db_id=None, jobs=None):
 
     def db_upsert_daily_revenue_target_row(userid, sub_account_id,
                                    week_label, day_label, date_str,
-                                   daily_target, status,
+                                   period_target, status,
                                    profit_allocated, remaining_needed,
-                                   daily_target_owed=None,
-                                   daily_target_owed_day_balance=None,
-                                   daily_target_owed_date=None):
-        existing_rows, existing_error = _strict_db_rows(
+                                   period_target_owed=None,
+                                   period_target_owed_day_balance=None,
+                                   period_target_owed_date=None):
+        """Persist one programme revenue-target day using its full row identity.
+
+        The matching unique key is (userid, sub_account_id, week, day, date).
+        INSERT ... ON DUPLICATE KEY UPDATE makes retries safe and avoids the
+        old check-then-insert race.
+        """
+        ok, _, msg = db_execute(
             """
-            SELECT id FROM daily_target_revenue
-             WHERE userid = %s
-               AND sub_account_id = %s
-               AND week = %s
-               AND day = %s
-               AND date = %s
-             LIMIT 1
+            INSERT INTO daily_target_revenue
+                (userid, sub_account_id, week, day, date,
+                 period_target, status, profit_allocated, remaining_needed,
+                 period_target_owed, period_target_owed_day_balance,
+                 period_target_owed_date)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                week = VALUES(week),
+                day = VALUES(day),
+                period_target = VALUES(period_target),
+                status = VALUES(status),
+                profit_allocated = VALUES(profit_allocated),
+                remaining_needed = VALUES(remaining_needed),
+                period_target_owed = VALUES(period_target_owed),
+                period_target_owed_day_balance = VALUES(period_target_owed_day_balance),
+                period_target_owed_date = VALUES(period_target_owed_date)
             """,
-            [userid, sub_account_id, week_label, day_label, date_str],
-            timeout=10.0,
+            [userid, sub_account_id, week_label, day_label, date_str,
+             period_target, status, profit_allocated, remaining_needed,
+             period_target_owed, period_target_owed_day_balance,
+             period_target_owed_date],
+            timeout=15.0, quiet=False,
         )
-        if existing_error:
-            stats["errors"].append(
-                f"daily_target_revenue lookup failed for {userid}/{sub_account_id}/{date_str}: {existing_error}"
+        if not ok:
+            print(
+                f"  ❌ Revenue target period-row UPSERT failed for "
+                f"{userid}/{sub_account_id}/{date_str}: {msg}"
             )
-            return False
-        existing = existing_rows[0] if existing_rows else None
-        if existing and _raw_first_key(existing, 'id'):
-            row_id = _coerce_int(_raw_first_key(existing, 'id'))
-            ok, _, msg = db_execute(
-                """
-                UPDATE daily_target_revenue
-                   SET daily_target = %s,
-                       status = %s,
-                       profit_allocated = %s,
-                       remaining_needed = %s,
-                       daily_target_owed = %s,
-                       daily_target_owed_day_balance = %s,
-                       daily_target_owed_date = %s
-                 WHERE id = %s
-                """,
-                [daily_target, status, profit_allocated, remaining_needed,
-                 daily_target_owed, daily_target_owed_day_balance,
-                 daily_target_owed_date, row_id],
-                timeout=15.0, quiet=False,
-            )
-            if not ok:
-                print(f"  ❌ Revenue target daily-row UPDATE failed for {userid}/{sub_account_id}/{date_str}: {msg}")
-            return ok
-        else:
-            ok, _, msg = db_execute(
-                """
-                INSERT INTO daily_target_revenue
-                    (userid, sub_account_id, week, day, date,
-                     daily_target, status, profit_allocated, remaining_needed,
-                     daily_target_owed, daily_target_owed_day_balance,
-                     daily_target_owed_date)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                """,
-                [userid, sub_account_id, week_label, day_label, date_str,
-                 daily_target, status, profit_allocated, remaining_needed,
-                 daily_target_owed, daily_target_owed_day_balance,
-                 daily_target_owed_date],
-                timeout=15.0, quiet=False,
-            )
-            if not ok:
-                print(f"  ❌ Revenue target daily-row INSERT failed for {userid}/{sub_account_id}/{date_str}: {msg}")
-            return ok
+        return ok
 
     # ----------------------------------------------------------------
     # Existing logic helpers (no JSON, all DB-driven)
@@ -4414,7 +4391,7 @@ def recent_highest_balance_revenue_target(inv_db_id=None, jobs=None):
         week_key = f"week_{week_number}"
         week_config = daily_target_config.get(week_key, {})
         if week_config:
-            return week_config.get('daily_target', {})
+            return week_config.get('period_target', {})
         return None
 
     def _parse_range_key(range_str):
@@ -4900,7 +4877,7 @@ def recent_highest_balance_revenue_target(inv_db_id=None, jobs=None):
             'pre_pending_total': 0.0,
             'pre_pending_enabled': False,
             'total_all_debt': 0.0,
-            'daily_target_owed': 0.0,
+            'period_target_owed': 0.0,
             'balance_used_for_bracket': starting_balance_for_today,
             'revenue_target_period': 'daily',
             'include_current_day_as_owed': False,
@@ -5108,7 +5085,7 @@ def recent_highest_balance_revenue_target(inv_db_id=None, jobs=None):
 
                 result['weekly_targets'][week_key][day_name_proper] = {
                     "date": day_date_str,
-                    "daily_target": target,
+                    "period_target": target,
                     "status": status,
                     "profit_allocated": profit_allocated,
                     "is_listed": True,
@@ -5167,21 +5144,21 @@ def recent_highest_balance_revenue_target(inv_db_id=None, jobs=None):
         for week_key, week_data in result['weekly_targets'].items():
             for day, day_data in week_data.items():
                 if day_data.get('is_listed', True) and day_data['status'] == 'owed':
-                    total_owed += (day_data['daily_target'] - day_data['profit_allocated'])
+                    total_owed += (day_data['period_target'] - day_data['profit_allocated'])
 
         result['total_owed'] = total_owed
         result['total_owed_with_shortage'] = total_owed
 
         total_all_debt = total_owed + result['pre_pending_total']
         result['total_all_debt'] = total_all_debt
-        result['daily_target_owed'] = total_all_debt
+        result['period_target_owed'] = total_all_debt
 
         if result['pre_pending_enabled']:
             print(f"\n  🔮 PRE-PENDING MODE ACTIVE (current week)")
             print(f"  ──────────────────────────────────────")
             print(f"  💰 Owed Debt (backward, PAST days only): ${total_owed:.2f}")
             print(f"  🔮 Pre-Pending Sum (forward, current week): ${result['pre_pending_total']:.2f}")
-            print(f"  📊 Total All Debt (daily_target_owed): ${total_all_debt:.2f}")
+            print(f"  📊 Total All Debt (period_target_owed): ${total_all_debt:.2f}")
             print("  📌 Missed-day inclusion was evaluated separately for each configured day.")
 
             if total_all_debt <= 0:
@@ -5213,7 +5190,7 @@ def recent_highest_balance_revenue_target(inv_db_id=None, jobs=None):
         print(f"  Pre-Pending Total (forward, current week): ${result['pre_pending_total']:.2f}")
         print(f"  Pre-Pending Enabled: {'YES 🔮' if result['pre_pending_enabled'] else 'NO'}")
         print(f"  Total All Debt: ${total_all_debt:.2f}")
-        print(f"  Daily Target Owed (combined): ${result['daily_target_owed']:.2f}")
+        print(f"  Daily Target Owed (combined): ${result['period_target_owed']:.2f}")
         print(f"  Alarm Trigger: {'YES 🚨' if result['alarm_trigger'] else 'NO 🔇'}")
 
         return result
@@ -5231,7 +5208,7 @@ def recent_highest_balance_revenue_target(inv_db_id=None, jobs=None):
             for week_data in alarm_result.get('weekly_targets', {}).values():
                 for day_name, day_data in week_data.items():
                     if day_data.get('date') == alarm_result.get('effective_today'):
-                        today_target = float(day_data.get('daily_target', 0.0) or 0.0)
+                        today_target = float(day_data.get('period_target', 0.0) or 0.0)
                         break
 
             if alarm_result.get('pre_pending_enabled'):
@@ -5660,7 +5637,7 @@ def recent_highest_balance_revenue_target(inv_db_id=None, jobs=None):
         pre_pending_total = result['pre_pending_total']
         pre_pending_enabled = result['pre_pending_enabled']
         total_all_debt = result['total_all_debt']
-        daily_target_owed_combined = result['daily_target_owed']
+        daily_target_owed_combined = result['period_target_owed']
 
         daily_target_owed_value = float(daily_target_owed_combined or 0.0)
 
@@ -5700,9 +5677,9 @@ def recent_highest_balance_revenue_target(inv_db_id=None, jobs=None):
                     owed_day_balance_value = float(today_start_balance) if today_start_balance is not None else None
 
         print(f"\n  📌 HANDOFF FIELDS (persisted to daily_target_revenue):")
-        print(f"     daily_target_owed              : ${daily_target_owed_value:.2f}")
-        print(f"     daily_target_owed_day_balance  : ${owed_day_balance_value:.2f}" if owed_day_balance_value is not None else "     daily_target_owed_day_balance  : N/A (history unavailable)")
-        print(f"     daily_target_owed_date         : {owed_date_value or 'NULL'}")
+        print(f"     period_target_owed              : ${daily_target_owed_value:.2f}")
+        print(f"     period_target_owed_day_balance  : ${owed_day_balance_value:.2f}" if owed_day_balance_value is not None else "     period_target_owed_day_balance  : N/A (history unavailable)")
+        print(f"     period_target_owed_date         : {owed_date_value or 'NULL'}")
 
         alarm_confirmed = False
         alarm_block_reason = None
@@ -5726,7 +5703,7 @@ def recent_highest_balance_revenue_target(inv_db_id=None, jobs=None):
                 for day, day_data in week_data.items():
                     status = day_data['status']
                     allocated = day_data['profit_allocated']
-                    target = day_data['daily_target']
+                    target = day_data['period_target']
                     date_str = day_data['date']
                     is_listed = day_data.get('is_listed', True)
                     remaining_needed = day_data.get('remaining_needed', 0)
@@ -5769,7 +5746,7 @@ def recent_highest_balance_revenue_target(inv_db_id=None, jobs=None):
         for week_key, week_data in weekly_targets.items():
             for day_name, day_data in week_data.items():
                 status = day_data['status']
-                target = day_data['daily_target']
+                target = day_data['period_target']
                 allocated = day_data['profit_allocated']
                 remaining = day_data.get('remaining_needed', 0.0)
                 date_str = day_data['date']
@@ -5780,13 +5757,13 @@ def recent_highest_balance_revenue_target(inv_db_id=None, jobs=None):
                     week_label=week_key,
                     day_label=day_name,
                     date_str=date_str,
-                    daily_target=round(target, 8),
+                    period_target=round(target, 8),
                     status=status,
                     profit_allocated=round(allocated, 8),
                     remaining_needed=round(remaining, 8),
-                    daily_target_owed=round(daily_target_owed_value, 8),
-                    daily_target_owed_day_balance=(round(owed_day_balance_value, 8) if owed_day_balance_value is not None else None),
-                    daily_target_owed_date=owed_date_value or None,
+                    period_target_owed=round(daily_target_owed_value, 8),
+                    period_target_owed_day_balance=(round(owed_day_balance_value, 8) if owed_day_balance_value is not None else None),
+                    period_target_owed_date=owed_date_value or None,
                 )
                 if ok:
                     rows_written += 1
@@ -5822,7 +5799,7 @@ def recent_highest_balance_revenue_target(inv_db_id=None, jobs=None):
                 )
 
         handoff_rows, handoff_error = _strict_db_rows(
-            "SELECT daily_target_owed, daily_target_owed_day_balance, daily_target_owed_date "
+            "SELECT period_target_owed, period_target_owed_day_balance, period_target_owed_date "
             "FROM daily_target_revenue WHERE userid = %s AND sub_account_id = %s "
             "ORDER BY updated_at DESC, id DESC LIMIT 1",
             [inv_db_id_db, sub_id_db], timeout=15.0,
@@ -5834,9 +5811,9 @@ def recent_highest_balance_revenue_target(inv_db_id=None, jobs=None):
             )
         else:
             saved_handoff = handoff_rows[0]
-            saved_owed = _coerce_float(_raw_first_key(saved_handoff, 'daily_target_owed'), default=None)
-            saved_balance = _coerce_float(_raw_first_key(saved_handoff, 'daily_target_owed_day_balance'), default=None)
-            saved_date_raw = _raw_first_key(saved_handoff, 'daily_target_owed_date')
+            saved_owed = _coerce_float(_raw_first_key(saved_handoff, 'period_target_owed'), default=None)
+            saved_balance = _coerce_float(_raw_first_key(saved_handoff, 'period_target_owed_day_balance'), default=None)
+            saved_date_raw = _raw_first_key(saved_handoff, 'period_target_owed_date')
             saved_date = str(saved_date_raw)[:10] if saved_date_raw not in (None, '') else ''
             handoff_matches = (
                 saved_owed is not None and abs(saved_owed - daily_target_owed_value) <= 0.011
@@ -5854,9 +5831,9 @@ def recent_highest_balance_revenue_target(inv_db_id=None, jobs=None):
 
         print(f"\n  💾 Daily target met updated to {username} sub account {sub_id_db}: "
               f"{rows_written} row(s) written to daily_target_revenue")
-        print(f"     ├─ daily_target_owed             : ${daily_target_owed_value:.2f}")
-        print(f"     ├─ daily_target_owed_day_balance : ${owed_day_balance_value:.2f}" if owed_day_balance_value is not None else "     ├─ daily_target_owed_day_balance : N/A (history unavailable)")
-        print(f"     └─ daily_target_owed_date        : {owed_date_value or 'NULL'}")
+        print(f"     ├─ period_target_owed             : ${daily_target_owed_value:.2f}")
+        print(f"     ├─ period_target_owed_day_balance : ${owed_day_balance_value:.2f}" if owed_day_balance_value is not None else "     ├─ period_target_owed_day_balance : N/A (history unavailable)")
+        print(f"     └─ period_target_owed_date        : {owed_date_value or 'NULL'}")
 
         if alarm_trigger:
             print(f"\n  🚨 ALARM TRIGGERED (CONFIRMED)!")
@@ -5889,7 +5866,7 @@ def recent_highest_balance_revenue_target(inv_db_id=None, jobs=None):
                 'pre_pending_enabled': pre_pending_enabled,
                 'pre_pending_total': pre_pending_total,
                 'total_all_debt': total_all_debt,
-                'daily_target_owed': daily_target_owed_combined,
+                'period_target_owed': daily_target_owed_combined,
                 'effective_today': effective_today.strftime("%Y-%m-%d"),
                 'trade_date_aligned': False,
                 'timezone': "Africa/Lagos",
@@ -5954,7 +5931,7 @@ def recent_highest_balance_revenue_target(inv_db_id=None, jobs=None):
                 'pre_pending_enabled': pre_pending_enabled,
                 'pre_pending_total': pre_pending_total,
                 'total_all_debt': total_all_debt,
-                'daily_target_owed': daily_target_owed_combined,
+                'period_target_owed': daily_target_owed_combined,
                 'effective_today': effective_today.strftime("%Y-%m-%d"),
                 'trade_date_aligned': False,
                 'timezone': "Africa/Lagos"
@@ -5984,9 +5961,9 @@ def recent_highest_balance_revenue_target(inv_db_id=None, jobs=None):
             "pre_pending_enabled": pre_pending_enabled,
             "pre_pending_total": pre_pending_total,
             "total_all_debt": total_all_debt,
-            "daily_target_owed": daily_target_owed_combined,
-            "daily_target_owed_day_balance": owed_day_balance_value,
-            "daily_target_owed_date": owed_date_value,
+            "period_target_owed": daily_target_owed_combined,
+            "period_target_owed_day_balance": owed_day_balance_value,
+            "period_target_owed_date": owed_date_value,
             "include_current_day_as_owed": result.get('include_current_day_as_owed', False),
             "last_update_date": today_str if alarm_trigger else existing_last_update,
             "effective_today": effective_today.strftime("%Y-%m-%d"),
@@ -6146,7 +6123,7 @@ def _revenue_target_alarm_banner(inv_db_id, sub_id, programme_id, programme_name
     the local file's `recent_highest_hit` path.
     """
     mode = "PRE-PENDING" if alert.get('pre_pending_enabled') else "DAILY"
-    owed = alert.get('daily_target_owed')
+    owed = alert.get('period_target_owed')
     pre_pending = alert.get('pre_pending_total')
     total_debt = alert.get('total_all_debt')
     effective_today = alert.get('effective_today')
@@ -6362,13 +6339,13 @@ def recovery_generator_system(inv_db_id=None, jobs=None):
         return db_fetch_one(
             """
             SELECT id, userid, sub_account_id, week, day, date,
-                   daily_target, status, profit_allocated, remaining_needed,
-                   daily_target_owed, daily_target_owed_day_balance,
-                   daily_target_owed_date
+                   period_target, status, profit_allocated, remaining_needed,
+                   period_target_owed, period_target_owed_day_balance,
+                   period_target_owed_date
               FROM daily_target_revenue
              WHERE userid = %s
                AND sub_account_id = %s
-               AND daily_target_owed IS NOT NULL
+               AND period_target_owed IS NOT NULL
              ORDER BY updated_at DESC, id DESC
              LIMIT 1
             """,
@@ -6937,9 +6914,9 @@ def recovery_generator_system(inv_db_id=None, jobs=None):
             'programme_name': programme_name,
             'mt5_balance': None,
             'execution_start_balance': None,
-            'daily_target_owed': 0.0,
-            'daily_target_owed_day_balance': None,
-            'daily_target_owed_date': None,
+            'period_target_owed': 0.0,
+            'period_target_owed_day_balance': None,
+            'period_target_owed_date': None,
             'drawdown': 0.0,
             'stage': 0,
             'stage_drawdown': 0.0,
@@ -7026,15 +7003,15 @@ def recovery_generator_system(inv_db_id=None, jobs=None):
         print(f"  │ Execution-start balance: ${broker_balance:.2f}")
 
         dtr = investor_fetch_daily_target(investor_id, sub_account_id) or {}
-        daily_target_owed = _coerce_float(_raw_first_key(dtr, 'daily_target_owed'), default=0.0) or 0.0
+        period_target_owed = _coerce_float(_raw_first_key(dtr, 'period_target_owed'), default=0.0) or 0.0
         owed_day_balance = _coerce_float(
-            _raw_first_key(dtr, 'daily_target_owed_day_balance'), default=None)
-        owed_date = _raw_first_key(dtr, 'daily_target_owed_date')
-        detail['daily_target_owed'] = daily_target_owed
-        detail['daily_target_owed_day_balance'] = owed_day_balance
-        detail['daily_target_owed_date'] = owed_date
+            _raw_first_key(dtr, 'period_target_owed_day_balance'), default=None)
+        owed_date = _raw_first_key(dtr, 'period_target_owed_date')
+        detail['period_target_owed'] = period_target_owed
+        detail['period_target_owed_day_balance'] = owed_day_balance
+        detail['period_target_owed_date'] = owed_date
         owed_balance_label = f"${owed_day_balance:.2f}" if owed_day_balance is not None else 'N/A'
-        print(f"  │ Revenue target owed : ${daily_target_owed:.2f} "
+        print(f"  │ Revenue target owed : ${period_target_owed:.2f} "
               f"(owed-day opening balance {owed_balance_label}, date {owed_date or '—'})")
 
         default_minimum_risk = 2.0
@@ -7043,7 +7020,7 @@ def recovery_generator_system(inv_db_id=None, jobs=None):
         print(f"  │ Default risk floor: ${default_risk_value:.2f} ({default_risk_src})")
 
         base_drawdown = max(0.0, float(broker_balance) - float(current_balance))
-        total_drawdown = base_drawdown + daily_target_owed
+        total_drawdown = base_drawdown + period_target_owed
         if pre_drawdown_assumption:
             print(f"\n  🔄 PRE-DRAWDOWN ASSUMPTION ENABLED:")
             print(f"  │ Locked-profit exemption: SL must guarantee at least +$0.01")
@@ -7134,13 +7111,13 @@ def recovery_generator_system(inv_db_id=None, jobs=None):
 
         if recovery_generator_type == 'loss_streak':
             print(f"\n  📊 LOSS_STREAK TARGET CALCULATION")
-            if daily_target_owed > 0 and (owed_day_balance is None or not owed_date):
+            if period_target_owed > 0 and (owed_day_balance is None or not owed_date):
                 detail['error'] = 'revenue_target_owed_anchor_missing'
                 print("  │ ⚠️ Revenue Target has outstanding debt but its actual owed-day opening balance/date is unavailable.")
                 print("  │ Recovery sizing is skipped rather than treating the owed dollar amount as an account balance.")
                 return detail
-            if daily_target_owed <= 0:
-                print(f"  │ No daily_target_owed — falling back to default risk floor")
+            if period_target_owed <= 0:
+                print(f"  │ No period_target_owed — falling back to default risk floor")
                 sequence_risk = default_risk_value
             else:
                 risk_ratio, reward_ratio, rr_src = resolve_rr_from_cfg(rr_cfg)
@@ -7149,7 +7126,7 @@ def recovery_generator_system(inv_db_id=None, jobs=None):
                     sequence_risk = default_risk_value
                 else:
                     target_balance = float(owed_day_balance)
-                    target_owed = daily_target_owed
+                    target_owed = period_target_owed
 
                     sequence, meta = build_target_sum_sequence(
                         target_balance=target_balance,
@@ -7185,7 +7162,7 @@ def recovery_generator_system(inv_db_id=None, jobs=None):
                                 print("     " + ", ".join(f"${v:.2f}" for v in chunk))
                         print(f"  {'─'*58}")
 
-                        base_drawdown_loss = max(0.0, round(total_drawdown - daily_target_owed, 2))
+                        base_drawdown_loss = max(0.0, round(total_drawdown - period_target_owed, 2))
                         cumulative = 0.0
                         loss_prefix = []
                         approx_position = 0
@@ -15094,7 +15071,7 @@ def process_single_investor_from(job):
                 "PRE-PENDING" if alert.get('pre_pending_enabled') else "DAILY"
             )
             account_stats['alarm_details'] = {
-                'daily_target_owed': alert.get('daily_target_owed'),
+                'period_target_owed': alert.get('period_target_owed'),
                 'pre_pending_total': alert.get('pre_pending_total'),
                 'total_all_debt': alert.get('total_all_debt'),
                 'effective_today': alert.get('effective_today'),
