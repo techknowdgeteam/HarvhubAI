@@ -104,11 +104,11 @@ The normal automated trading stages then use the two short-circuits below:
   GATE 1 — Restricted timerange
     If the investor's programme is currently restricted (restricted
     date / full restricted day / inside restricted time window), skip
-    all normal automated trading stages, including recent_highest_balance_target_db.
+    all normal automated trading stages, including recent_highest_balance_revenue_target_db.
     Programme-requested Breakeven / Close commands have already run.
 
-  GATE 2 — Daily-target alarm
-    recent_highest_balance_target_db() populates the module-global
+  GATE 2 — Revenue Target alarm
+    recent_highest_balance_revenue_target_db() populates the module-global
     `recent_highest_alert`. If `is_triggered` is True after that stage
     runs (target met, or pre-pending alarm fired), skip subsequent normal
     automated trading stages for this cycle. Programme-requested manual
@@ -349,7 +349,7 @@ class _BridgeClient:
 # ==============================================================================
 _db = None
 recent_highest_alert = None
-martingale_alert = None   # populated by martingale_system_db()
+recovery_generator_alert = None   # populated by recovery_generator_system_db()
 
 
 def _worker_init():
@@ -4010,7 +4010,7 @@ def restricted_timerange_db(inv_db_id=None, jobs=None):
 # ==============================================================================
 #  RECENT HIGHEST BALANCE TARGET — DB-driven, programme-scoped
 # ==============================================================================
-def recent_highest_balance_target_db(inv_db_id=None, jobs=None):
+def recent_highest_balance_revenue_target_db(inv_db_id=None, jobs=None):
     """
     DB-driven recent_highest_balance tracker + daily_target_revenue writer.
 
@@ -4187,13 +4187,13 @@ def recent_highest_balance_target_db(inv_db_id=None, jobs=None):
         )
         return ok
 
-    def db_fetch_daily_target_config_for_programme(programme_id):
+    def db_fetch_revenue_target_config_for_programme(programme_id):
         rows = db_fetch_all(
             """
             SELECT week_no, day_name, from_balance, to_balance,
-                   target_amount, pre_pending_sum,
-                   target_daily_profit, include_missed_days,
-                   include_current_day_as_owed, loss_streak_chances
+                   target_amount, pre_pending_sum, include_missed_days,
+                   target_daily_profit, include_current_day_as_owed,
+                   loss_streak_chances, revenue_target_period
               FROM programme_revenue_target
              WHERE programme_id = %s
              ORDER BY week_no ASC, id ASC
@@ -4204,8 +4204,11 @@ def recent_highest_balance_target_db(inv_db_id=None, jobs=None):
             return None
 
         first = rows[0]
+        period = str(_raw_first_key(first, 'revenue_target_period') or 'daily').strip().lower()
+        if period not in ('daily', 'weekly', 'monthly', 'annually'):
+            raise ValueError(f"Invalid revenue_target_period in programme {programme_id}: {period!r}")
         cfg = {
-            'include_missed_days': to_bool(_raw_first_key(first, 'include_missed_days')),
+            'revenue_target_period': period,
             'include_current_day_as_owed': to_bool(_raw_first_key(first, 'include_current_day_as_owed')),
             'loss_streak_chances': _coerce_int(_raw_first_key(first, 'loss_streak_chances')) or 0,
         }
@@ -4216,15 +4219,15 @@ def recent_highest_balance_target_db(inv_db_id=None, jobs=None):
             if not day_name:
                 continue
             day_lower = day_name.lower()
-
             frm = _coerce_float(_raw_first_key(r, 'from_balance'), default=0.0)
             to_raw = _raw_first_key(r, 'to_balance')
             to_val = _coerce_float(to_raw, default=None)
             target = _coerce_float(_raw_first_key(r, 'target_amount'), default=0.0)
             pre_pending = to_bool(_raw_first_key(r, 'pre_pending_sum'))
+            include_missed = to_bool(_raw_first_key(r, 'include_missed_days'))
 
             if to_val is None:
-                range_key = f"{int(frm)}_risk"
+                range_key = f"{int(frm)}+_risk"
             else:
                 range_key = f"{int(frm)}-{int(to_val)}_risk"
 
@@ -4232,12 +4235,18 @@ def recent_highest_balance_target_db(inv_db_id=None, jobs=None):
             cfg.setdefault(week_key, {})
             cfg[week_key].setdefault('daily_target', {})
             cfg[week_key]['daily_target'].setdefault(day_lower, {})
-            cfg[week_key]['daily_target'][day_lower][range_key] = float(target)
-            cfg[week_key]['daily_target'][day_lower]['pre-pending_sum'] = pre_pending
+            day_config = cfg[week_key]['daily_target'][day_lower]
+            day_config[range_key] = float(target)
+            day_config.setdefault('_range_options', {})[range_key] = {
+                'pre-pending_sum': pre_pending,
+                'include_missed_days': include_missed,
+                'from_balance': float(frm),
+                'to_balance': to_val,
+            }
 
         return cfg
 
-    def db_upsert_daily_target_row(userid, sub_account_id,
+    def db_upsert_daily_revenue_target_row(userid, sub_account_id,
                                    week_label, day_label, date_str,
                                    daily_target, status,
                                    profit_allocated, remaining_needed,
@@ -4259,7 +4268,7 @@ def recent_highest_balance_target_db(inv_db_id=None, jobs=None):
         )
         if existing and _raw_first_key(existing, 'id'):
             row_id = _coerce_int(_raw_first_key(existing, 'id'))
-            ok, _, _ = db_execute(
+            ok, _, msg = db_execute(
                 """
                 UPDATE daily_target_revenue
                    SET daily_target = %s,
@@ -4274,11 +4283,13 @@ def recent_highest_balance_target_db(inv_db_id=None, jobs=None):
                 [daily_target, status, profit_allocated, remaining_needed,
                  daily_target_owed, daily_target_owed_day_balance,
                  daily_target_owed_date, row_id],
-                timeout=15.0, quiet=True,
+                timeout=15.0, quiet=False,
             )
+            if not ok:
+                print(f"  ❌ Revenue target daily-row UPDATE failed for {userid}/{sub_account_id}/{date_str}: {msg}")
             return ok
         else:
-            ok, _, _ = db_execute(
+            ok, _, msg = db_execute(
                 """
                 INSERT INTO daily_target_revenue
                     (userid, sub_account_id, week, day, date,
@@ -4291,8 +4302,10 @@ def recent_highest_balance_target_db(inv_db_id=None, jobs=None):
                  daily_target, status, profit_allocated, remaining_needed,
                  daily_target_owed, daily_target_owed_day_balance,
                  daily_target_owed_date],
-                timeout=15.0, quiet=True,
+                timeout=15.0, quiet=False,
             )
+            if not ok:
+                print(f"  ❌ Revenue target daily-row INSERT failed for {userid}/{sub_account_id}/{date_str}: {msg}")
             return ok
 
     # ----------------------------------------------------------------
@@ -4323,12 +4336,14 @@ def recent_highest_balance_target_db(inv_db_id=None, jobs=None):
             latest_time_lagos = None
             if deals:
                 for deal in deals:
-                    if deal.profit is None:
-                        continue
-                    total += deal.profit
-                    deal_ts = getattr(deal, 'time', None)
-                    if not deal_ts:
-                        deal_ts = getattr(deal, 'time_msc', None)
+                    movement = 0.0
+                    for field in ('profit', 'commission', 'swap', 'fee'):
+                        try:
+                            movement += float(getattr(deal, field, 0.0) or 0.0)
+                        except Exception:
+                            pass
+                    total += movement
+                    deal_ts = getattr(deal, 'time', None) or getattr(deal, 'time_msc', None)
                     deal_time_lagos = lagos_from_timestamp(deal_ts)
                     if deal_time_lagos is not None:
                         if latest_time_lagos is None or deal_time_lagos > latest_time_lagos:
@@ -4341,7 +4356,9 @@ def recent_highest_balance_target_db(inv_db_id=None, jobs=None):
     def get_week_number_from_date(start_date, target_date):
         if not start_date or not target_date:
             return 1
-        diff_days = (target_date - start_date).days
+        start_day = start_date.date() if isinstance(start_date, datetime) else start_date
+        target_day = target_date.date() if isinstance(target_date, datetime) else target_date
+        diff_days = (target_day - start_day).days
         if diff_days < 0:
             return 1
         return (diff_days // 7) + 1
@@ -4358,15 +4375,17 @@ def recent_highest_balance_target_db(inv_db_id=None, jobs=None):
         if not range_str:
             return None
         try:
+            if '+' in range_str:
+                lo_str = range_str.split('+', 1)[0]
+                return float(lo_str), float('inf')
             if '-' in range_str:
                 lo_str, hi_str = range_str.split('-', 1)
                 return float(lo_str), float(hi_str)
-            else:
-                return 0.0, float(range_str)
+            return 0.0, float(range_str)
         except (TypeError, ValueError):
             return None
 
-    def _resolve_target_for_balance(day_config, balance):
+    def _resolve_target_entry_for_balance(day_config, balance):
         risk_pairs = []
         for key, value in day_config.items():
             if '_risk' not in key:
@@ -4382,18 +4401,19 @@ def recent_highest_balance_target_db(inv_db_id=None, jobs=None):
                 continue
             risk_pairs.append((lo, hi, target_val, key))
         if not risk_pairs:
-            return 0.0
+            return 0.0, None
+        risk_pairs.sort(key=lambda item: item[0])
         if balance is None:
-            return risk_pairs[0][2]
-        for lo, hi, target_val, _key in risk_pairs:
-            if lo <= balance <= hi:
-                return target_val
-        below = [p for p in risk_pairs if p[0] <= balance]
-        if below:
-            below.sort(key=lambda p: p[0])
-            return below[-1][2]
-        risk_pairs.sort(key=lambda p: p[0])
-        return risk_pairs[0][2]
+            chosen = risk_pairs[0]
+        else:
+            chosen = next((item for item in risk_pairs if item[0] <= balance <= item[1]), None)
+            if chosen is None:
+                below = [item for item in risk_pairs if item[0] <= balance]
+                chosen = below[-1] if below else risk_pairs[0]
+        return chosen[2], chosen[3]
+
+    def _resolve_target_for_balance(day_config, balance):
+        return _resolve_target_entry_for_balance(day_config, balance)[0]
 
     def get_weekly_targets_from_config(investor_data, week_number, balance=None):
         week_config = get_week_config(investor_data, week_number)
@@ -4410,17 +4430,145 @@ def recent_highest_balance_target_db(inv_db_id=None, jobs=None):
                 targets[day_name_lower] = 0.0
         return targets
 
-    def get_week_pre_pending_flags(investor_data, week_number):
-        week_config = get_week_config(investor_data, week_number)
-        if not week_config:
-            return {}
-        flags = {}
-        for day_name_lower, day_config in week_config.items():
-            if isinstance(day_config, dict):
-                flags[day_name_lower] = bool(day_config.get('pre-pending_sum', False))
-            else:
-                flags[day_name_lower] = False
-        return flags
+    def _revenue_target_period_start_date(target_date, execution_start_date, period):
+        """Period anniversaries are anchored to the exact contract start date."""
+        from calendar import monthrange
+        target_date = target_date.date() if isinstance(target_date, datetime) else target_date
+        start_dt = parse_date_flexible(execution_start_date)
+        if start_dt is None:
+            return target_date
+        start_date = start_dt.date()
+        period = str(period or 'daily').lower()
+        if target_date <= start_date or period == 'daily':
+            return target_date if period == 'daily' else start_date
+        if period == 'weekly':
+            days = (target_date - start_date).days
+            return start_date + timedelta(days=(days // 7) * 7)
+        if period == 'monthly':
+            months = (target_date.year - start_date.year) * 12 + target_date.month - start_date.month
+            def month_anniversary(index):
+                absolute = start_date.year * 12 + (start_date.month - 1) + index
+                year, month0 = divmod(absolute, 12)
+                month = month0 + 1
+                day = min(start_date.day, monthrange(year, month)[1])
+                return datetime(year, month, day).date()
+            candidate = month_anniversary(months)
+            if candidate > target_date:
+                candidate = month_anniversary(max(0, months - 1))
+            return candidate
+        if period == 'annually':
+            years = target_date.year - start_date.year
+            def year_anniversary(index):
+                year = start_date.year + index
+                day = min(start_date.day, monthrange(year, start_date.month)[1])
+                return datetime(year, start_date.month, day).date()
+            candidate = year_anniversary(years)
+            if candidate > target_date:
+                candidate = year_anniversary(max(0, years - 1))
+            return candidate
+        raise ValueError(f"Unsupported revenue target period: {period}")
+
+    _revenue_balance_history_cache = {}
+
+    def _load_revenue_balance_history(execution_start_date):
+        """Load one contract-to-now deal window and group full balance movements by Lagos date."""
+        start_dt = parse_date_flexible(execution_start_date)
+        if not start_dt:
+            return None
+        key = start_dt.strftime('%Y-%m-%d')
+        if key in _revenue_balance_history_cache:
+            return _revenue_balance_history_cache[key]
+        try:
+            if not mt5.terminal_info():
+                return None
+            lagos_start = datetime.combine(start_dt.date(), datetime.min.time()).replace(tzinfo=LAGOS_TZ)
+            lagos_end = lagos_now()
+            start_srv, end_srv, _ = lagos_window_to_server_naive(lagos_start, lagos_end)
+            deals = mt5.history_deals_get(start_srv, end_srv)
+            if deals is None:
+                print(f"  ⚠️ MT5 history unavailable while reconstructing period opening balances: {mt5.last_error()}")
+                return None
+            grouped = {}
+            for deal in deals:
+                ts = getattr(deal, 'time', None) or getattr(deal, 'time_msc', None)
+                deal_dt = lagos_from_timestamp(ts)
+                if deal_dt is None:
+                    continue
+                movement = 0.0
+                for field in ('profit', 'commission', 'swap', 'fee'):
+                    try:
+                        movement += float(getattr(deal, field, 0.0) or 0.0)
+                    except Exception:
+                        pass
+                grouped.setdefault(deal_dt.date(), 0.0)
+                grouped[deal_dt.date()] += movement
+            _revenue_balance_history_cache[key] = grouped
+            return grouped
+        except Exception as exc:
+            print(f"  ⚠️ Could not reconstruct period opening balances from MT5 deal history: {exc}")
+            return None
+
+    def _revenue_day_open_balance(day_date, execution_start_date,
+                                  contract_start_balance, today_start_balance,
+                                  current_mt5_balance):
+        start_dt = parse_date_flexible(execution_start_date)
+        if not start_dt:
+            return None
+        contract_date = start_dt.date()
+        today_date = lagos_now().date()
+        if day_date > today_date:
+            return None
+        if day_date == contract_date:
+            return float(contract_start_balance) if contract_start_balance is not None else None
+        if day_date == today_date and today_start_balance is not None:
+            return float(today_start_balance)
+        if current_mt5_balance is None:
+            return None
+        movements = _load_revenue_balance_history(execution_start_date)
+        if movements is None:
+            return None
+        future_movement = sum(float(v) for d, v in movements.items() if d >= day_date)
+        return float(current_mt5_balance) - future_movement
+
+    def _revenue_target_for_date(investor_data, target_date, execution_start_date,
+                                 daily_bracket_balance, contract_start_balance,
+                                 today_start_balance, current_mt5_balance):
+        """Resolve each daily target from its configured period-opening balance."""
+        start_dt = parse_date_flexible(execution_start_date)
+        target_date = target_date.date() if isinstance(target_date, datetime) else target_date
+        week_number = get_week_number_from_date(start_dt, datetime.combine(target_date, datetime.min.time()))
+        week_config = get_week_config(investor_data, week_number) or {}
+        day_name = target_date.strftime('%A').lower()
+        day_config = week_config.get(day_name, {}) if isinstance(week_config, dict) else {}
+        period = str((investor_data.get('daily_target_config') or {}).get('revenue_target_period') or 'daily').lower()
+        if period == 'daily':
+            period_start = target_date
+            bracket_balance = daily_bracket_balance
+        else:
+            period_start = _revenue_target_period_start_date(target_date, execution_start_date, period)
+            bracket_balance = _revenue_day_open_balance(
+                period_start, execution_start_date, contract_start_balance,
+                today_start_balance, current_mt5_balance,
+            )
+        actual_day_open = _revenue_day_open_balance(
+            target_date, execution_start_date, contract_start_balance,
+            today_start_balance, current_mt5_balance,
+        )
+        if isinstance(day_config, dict):
+            target, selected_range = _resolve_target_entry_for_balance(day_config, bracket_balance)
+            range_options = (day_config.get('_range_options') or {}).get(selected_range, {})
+        else:
+            target, selected_range, range_options = 0.0, None, {}
+        return {
+            'target': float(target or 0.0),
+            'day_start_balance': actual_day_open,
+            'period_start_date': period_start.strftime('%Y-%m-%d'),
+            'period_start_balance': bracket_balance,
+            'revenue_target_period': period,
+            'selected_range': selected_range,
+            'pre_pending_sum': bool(range_options.get('pre-pending_sum', False)),
+            'include_missed_days': bool(range_options.get('include_missed_days', False)),
+        }
 
     def parse_date_flexible(date_str):
         if not date_str:
@@ -4474,15 +4622,17 @@ def recent_highest_balance_target_db(inv_db_id=None, jobs=None):
                 return []
             out = []
             for deal in deals:
-                if deal.profit is None:
-                    continue
-                deal_ts = getattr(deal, 'time', None)
-                if not deal_ts:
-                    deal_ts = getattr(deal, 'time_msc', None)
+                deal_ts = getattr(deal, 'time', None) or getattr(deal, 'time_msc', None)
                 deal_time_lagos = lagos_from_timestamp(deal_ts)
                 if deal_time_lagos is None:
                     continue
-                out.append((deal_time_lagos, float(deal.profit)))
+                movement = 0.0
+                for field in ('profit', 'commission', 'swap', 'fee'):
+                    try:
+                        movement += float(getattr(deal, field, 0.0) or 0.0)
+                    except Exception:
+                        pass
+                out.append((deal_time_lagos, movement))
             out.sort(key=lambda x: x[0])
             return out
         except Exception as e:
@@ -4491,22 +4641,22 @@ def recent_highest_balance_target_db(inv_db_id=None, jobs=None):
 
     def find_progress_halter_day(investor_data, execution_start_date, effective_today,
                                  contract_start_balance, srv_offset,
-                                 current_mt5_balance=None):
+                                 current_mt5_balance=None, today_start_balance=None):
         result = {
             'anchor_found': False,
             'anchor_date': '',
-            'anchor_day_balance': 0.0,
+            'anchor_day_balance': None,
             'anchor_daily_target': 0.0,
             'anchor_net_profit': 0.0,
             'anchor_week': 0,
             'anchor_day_name': '',
-            'is_contract_start_day': False
+            'is_contract_start_day': False,
+            'revenue_target_period': (investor_data.get('daily_target_config') or {}).get('revenue_target_period', 'daily'),
         }
 
         start_date = parse_date_flexible(execution_start_date)
         if not start_date:
             return result
-
         if effective_today is None:
             effective_today = lagos_naive_now()
         if effective_today.tzinfo is not None:
@@ -4515,25 +4665,25 @@ def recent_highest_balance_target_db(inv_db_id=None, jobs=None):
         start_date_only = start_date.date()
         scan_date = start_date_only
         end_date = effective_today.date()
-
-        week_targets_cache = {}
+        period = result['revenue_target_period']
 
         while scan_date <= end_date:
             scan_dt = datetime.combine(scan_date, datetime.min.time())
             wk = get_week_number_from_date(start_date, scan_dt)
-
-            if wk not in week_targets_cache:
-                week_targets_cache[wk] = get_weekly_targets_from_config(
-                    investor_data, wk, balance=contract_start_balance
-                )
-            week_targets = week_targets_cache.get(wk, {})
-
-            day_name_lower = scan_date.strftime("%A").lower()
-            day_target = week_targets.get(day_name_lower, 0.0) or 0.0
-
+            target_info = _revenue_target_for_date(
+                investor_data, scan_date, execution_start_date,
+                daily_bracket_balance=contract_start_balance,
+                contract_start_balance=contract_start_balance,
+                today_start_balance=today_start_balance,
+                current_mt5_balance=current_mt5_balance,
+            )
+            day_target = float(target_info['target'])
             is_contract_start_day = (scan_date == start_date_only)
 
-            if is_contract_start_day and (current_mt5_balance is not None) and (contract_start_balance is not None):
+            # Only the active contract-start date may use live balance minus
+            # contract anchor. Historical contract-start dates use that day's
+            # realized MT5 deals, just like every other historical day.
+            if is_contract_start_day and scan_date == end_date and current_mt5_balance is not None and contract_start_balance is not None:
                 day_profit = float(current_mt5_balance) - float(contract_start_balance)
                 print(f"  🧮 CONTRACT-START DAY NET P/L:")
                 print(f"     Contract-aware start balance (C): ${float(contract_start_balance):.2f}")
@@ -4545,25 +4695,30 @@ def recent_highest_balance_target_db(inv_db_id=None, jobs=None):
                 day_profit = sum(p for _, p in day_deals)
 
             if day_profit < 0:
-                halter_balance = contract_start_balance
-
-                result['anchor_found'] = True
-                result['anchor_date'] = scan_date.strftime("%Y-%m-%d")
-                result['anchor_day_balance'] = float(halter_balance) if halter_balance is not None else 0.0
-                result['anchor_daily_target'] = float(day_target)
-                result['anchor_net_profit'] = float(day_profit)
-                result['anchor_week'] = wk
-                result['anchor_day_name'] = scan_date.strftime("%A")
-                result['is_contract_start_day'] = is_contract_start_day
-
+                halter_balance = target_info.get('day_start_balance')
+                result.update({
+                    'anchor_found': True,
+                    'anchor_date': scan_date.strftime('%Y-%m-%d'),
+                    'anchor_day_balance': float(halter_balance) if halter_balance is not None else None,
+                    'anchor_daily_target': day_target,
+                    'anchor_net_profit': float(day_profit),
+                    'anchor_week': wk,
+                    'anchor_day_name': scan_date.strftime('%A'),
+                    'is_contract_start_day': is_contract_start_day,
+                    'period_start_date': target_info.get('period_start_date'),
+                    'period_start_balance': target_info.get('period_start_balance'),
+                })
                 print(f"  🎯 PROGRESS-HALTER DAY FOUND: {result['anchor_date']} ({result['anchor_day_name']}, week {wk})")
-                print(f"     Start-of-day balance: ${result['anchor_day_balance']:.2f}")
+                if result['anchor_day_balance'] is None:
+                    print("     Start-of-day balance: unavailable from MT5 deal history")
+                else:
+                    print(f"     Start-of-day balance: ${result['anchor_day_balance']:.2f}")
+                print(f"     Revenue target period: {period} (period starts {result.get('period_start_date')})")
                 print(f"     Daily target: ${result['anchor_daily_target']:.2f}")
                 print(f"     Net P/L for day: ${result['anchor_net_profit']:.2f}")
                 if is_contract_start_day:
-                    print(f"     ⚠️ Contract-start day: the recorded loss IS what halts progress.")
+                    print("     ⚠️ Contract-start day: the recorded loss IS what halts progress.")
                 return result
-
             scan_date += timedelta(days=1)
 
         print(f"  ✅ No progress-halter (loss) day found from {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
@@ -4681,11 +4836,14 @@ def recent_highest_balance_target_db(inv_db_id=None, jobs=None):
             print(f"  ⚠️ Could not compute loss streak from halter: {e}")
             return out
 
-    def calculate_daily_target_status(investor_data, profit, execution_start_date,
+    def calculate_revenue_target_status(investor_data, profit, execution_start_date,
                                       inv_db_id=None, starting_balance_for_today=None,
                                       effective_today=None,
                                       anchor_info=None,
-                                      halter_recovered=False):
+                                      halter_recovered=False,
+                                      contract_start_balance=None,
+                                      current_mt5_balance=None,
+                                      today_start_balance=None):
         result = {
             'weekly_targets': {},
             'today_met': False,
@@ -4698,7 +4856,7 @@ def recent_highest_balance_target_db(inv_db_id=None, jobs=None):
             'total_all_debt': 0.0,
             'daily_target_owed': 0.0,
             'balance_used_for_bracket': starting_balance_for_today,
-            'include_missed_days': False,
+            'revenue_target_period': 'daily',
             'include_current_day_as_owed': False,
             'effective_today': effective_today.strftime("%Y-%m-%d") if effective_today else None,
             'anchor_found': bool(anchor_info and anchor_info.get('anchor_found')),
@@ -4730,10 +4888,10 @@ def recent_highest_balance_target_db(inv_db_id=None, jobs=None):
 
         lagos_wall_now = lagos_naive_now()
 
-        daily_target_config = investor_data.get('daily_target_config', {})
-        include_missed_days = daily_target_config.get('include_missed_days', False) if daily_target_config else False
-        include_current_day_as_owed = daily_target_config.get('include_current_day_as_owed', False) if daily_target_config else False
-        result['include_missed_days'] = include_missed_days
+        daily_target_config = investor_data.get('daily_target_config', {}) or {}
+        revenue_target_period = str(daily_target_config.get('revenue_target_period') or 'daily').lower()
+        include_current_day_as_owed = bool(daily_target_config.get('include_current_day_as_owed', False))
+        result['revenue_target_period'] = revenue_target_period
         result['include_current_day_as_owed'] = include_current_day_as_owed
 
         print(f"\n  📊 CALCULATING DAILY TARGET STATUS (SECTION 2)")
@@ -4748,17 +4906,22 @@ def recent_highest_balance_target_db(inv_db_id=None, jobs=None):
         print(f"  📆 Current Week: {current_week}")
         print(f"  💰 Total Profit: ${profit:.2f}")
         print(f"  📌 Week starts on: {start_date.strftime('%A')} (execution start day)")
-        print(f"  🔁 Include Missed Days: {'YES ✅' if include_missed_days else 'NO ⏭️ (past missed days will be skipped)'}")
-        print(f"  🔁 Include Current Day As Owed: {'YES ✅' if include_current_day_as_owed else 'NO ⏭️ (today is always PENDING)'}")
+        print(f"  🗓️ Revenue Target Period: {revenue_target_period}")
+        print(f"  🔁 Include Missed Days: configured independently for each day")
+        print(f"  🔁 Include Current Day As Owed: {'YES ✅' if include_current_day_as_owed else 'NO ⏭️ (today is PENDING unless met)'}")
         if starting_balance_for_today is not None:
-            print(f"  🎯 Balance used for bracket resolution: ${starting_balance_for_today:.2f}")
+            print(f"  📍 Current-day opening balance: ${starting_balance_for_today:.2f}")
         else:
-            print(f"  🎯 Balance used for bracket resolution: N/A (will use first bracket)")
+            print("  📍 Current-day opening balance: unavailable")
+        if revenue_target_period == 'daily':
+            print("  🎯 Daily period: existing daily bracket-balance behaviour is retained.")
+        else:
+            print("  🎯 Bracket balance: each day's configured period-opening balance (weekly/monthly/annual).")
 
         if anchor_info and anchor_info.get('anchor_found'):
             if halter_recovered:
                 print(f"  ✅ PROGRESS-HALTER RECOVERED: {anchor_info['anchor_date']} ({anchor_info['anchor_day_name']})")
-                print(f"     The loss has been bought back — normal daily-target logic resumed.")
+                print(f"     The loss has been bought back — normal revenue-target logic resumed.")
             else:
                 print(f"  🛑 PROGRESS-HALTER ACTIVE: {anchor_info['anchor_date']} ({anchor_info['anchor_day_name']})")
                 print(f"     Progress HALTED at this day until its loss is recovered.")
@@ -4773,20 +4936,12 @@ def recent_highest_balance_target_db(inv_db_id=None, jobs=None):
             week_targets = get_weekly_targets_from_config(
                 investor_data, week_num, balance=starting_balance_for_today
             )
-            week_pre_pending_flags = get_week_pre_pending_flags(investor_data, week_num)
-
             if not week_targets:
                 print(f"  ⚠️ No targets found for {week_key} - skipping")
                 continue
 
             week_start_date = start_date + timedelta(days=(week_num - 1) * 7)
             week_end_date = week_start_date + timedelta(days=6)
-
-            week_is_entirely_past = week_end_date.date() < current_date.date()
-            if week_is_entirely_past and not include_missed_days:
-                print(f"\n  📆 {week_key.upper()}: {week_start_date.strftime('%Y-%m-%d')} ({week_start_date.strftime('%A')}) to {week_end_date.strftime('%Y-%m-%d')} ({week_end_date.strftime('%A')})")
-                print(f"  ⏭️ SKIPPED (fully past week, include_missed_days=False) — no debt, no profit consumed")
-                continue
 
             result['weekly_targets'][week_key] = {}
 
@@ -4798,7 +4953,7 @@ def recent_highest_balance_target_db(inv_db_id=None, jobs=None):
 
             remaining_profit = profit
 
-            week_pre_pending_enabled = any(week_pre_pending_flags.values()) if week_pre_pending_flags else False
+            week_pre_pending_enabled = False
             week_pre_pending_total = 0.0
 
             for day_name_proper in ordered_days:
@@ -4816,8 +4971,33 @@ def recent_highest_balance_target_db(inv_db_id=None, jobs=None):
 
                 check_date = week_start_date + timedelta(days=day_index)
                 day_date_str = check_date.strftime("%Y-%m-%d")
-                target = week_targets.get(day_name_lower, 0.0) or 0.0
-                pre_pending_flag = week_pre_pending_flags.get(day_name_lower, False)
+                target_info = _revenue_target_for_date(
+                    investor_data, check_date.date(), execution_start_date,
+                    daily_bracket_balance=starting_balance_for_today,
+                    contract_start_balance=contract_start_balance,
+                    today_start_balance=today_start_balance,
+                    current_mt5_balance=current_mt5_balance,
+                )
+                target = float(target_info.get('target', week_targets.get(day_name_lower, 0.0)) or 0.0)
+                if day_date_str == today_str:
+                    day_open = target_info.get('day_start_balance')
+                    period_open = target_info.get('period_start_balance')
+                    if revenue_target_period != 'daily':
+                        day_label = f"${float(day_open):.2f}" if day_open is not None else 'N/A'
+                        period_label = f"${float(period_open):.2f}" if period_open is not None else 'N/A'
+                        print(f"  📍 TODAY BALANCE COMPARISON: actual {today_str} opening balance={day_label}; "
+                              f"{revenue_target_period} opening balance ({target_info.get('period_start_date')})={period_label}.")
+                if (revenue_target_period != 'daily'
+                        and day_date_str == target_info.get('period_start_date')):
+                    pbal = target_info.get('period_start_balance')
+                    if pbal is None:
+                        print(f"  ⚠️ {revenue_target_period.upper()} period starts {day_date_str}; opening balance is not available from MT5 history. Target bracket cannot be confirmed yet.")
+                    else:
+                        print(f"  🎯 {revenue_target_period.upper()} period starts {day_date_str}: opening balance ${float(pbal):.2f}; this balance controls the period's daily target brackets.")
+                # Both switches belong to the exact configured day + balance
+                # bracket selected for this date, not to the whole programme.
+                pre_pending_flag = bool(target_info.get('pre_pending_sum', False))
+                include_missed_day = bool(target_info.get('include_missed_days', False))
 
                 is_today = (day_date_str == today_str)
                 is_past_day = check_date.date() < current_date.date()
@@ -4827,7 +5007,7 @@ def recent_highest_balance_target_db(inv_db_id=None, jobs=None):
                 is_halted = bool(halt_active and anchor_date_str and (day_date_str >= anchor_date_str))
 
                 if is_past_day:
-                    if not include_missed_days:
+                    if not include_missed_day:
                         status = 'skipped'
                         profit_allocated = 0.0
                     else:
@@ -4877,6 +5057,7 @@ def recent_highest_balance_target_db(inv_db_id=None, jobs=None):
                         and is_future
                         and pre_pending_flag):
                     is_pre_pending_day = True
+                    week_pre_pending_enabled = True
                     week_pre_pending_total += target
 
                 result['weekly_targets'][week_key][day_name_proper] = {
@@ -4886,6 +5067,11 @@ def recent_highest_balance_target_db(inv_db_id=None, jobs=None):
                     "profit_allocated": profit_allocated,
                     "is_listed": True,
                     "remaining_needed": max(0, target - profit_allocated),
+                    "day_start_balance": target_info.get('day_start_balance'),
+                    "period_start_date": target_info.get('period_start_date'),
+                    "period_start_balance": target_info.get('period_start_balance'),
+                    "revenue_target_period": revenue_target_period,
+                    "include_missed_days": include_missed_day,
                     "pre_pending_sum": pre_pending_flag,
                     "is_pre_pending_day": is_pre_pending_day,
                     "is_halter_day": is_halter_day,
@@ -4950,8 +5136,7 @@ def recent_highest_balance_target_db(inv_db_id=None, jobs=None):
             print(f"  💰 Owed Debt (backward, PAST days only): ${total_owed:.2f}")
             print(f"  🔮 Pre-Pending Sum (forward, current week): ${result['pre_pending_total']:.2f}")
             print(f"  📊 Total All Debt (daily_target_owed): ${total_all_debt:.2f}")
-            if not include_missed_days:
-                print(f"  ⏭️ Note: past missed days were SKIPPED (include_missed_days=False)")
+            print("  📌 Missed-day inclusion was evaluated separately for each configured day.")
 
             if total_all_debt <= 0:
                 result['alarm_trigger'] = True
@@ -4974,7 +5159,8 @@ def recent_highest_balance_target_db(inv_db_id=None, jobs=None):
 
         print(f"\n  📊 FINAL STATUS:")
         print(f"  ──────────────────")
-        print(f"  Include Missed Days: {'YES ✅' if include_missed_days else 'NO ⏭️'}")
+        print("  Include Missed Days: independently configured per day")
+        print(f"  Revenue Target Period: {revenue_target_period}")
         print(f"  Include Current Day As Owed: {'YES ✅' if include_current_day_as_owed else 'NO ⏭️'}")
         print(f"  Today's Target Met: {'YES ✅' if result['today_met'] else 'NO ⏳ (PENDING)'}")
         print(f"  Total Owed (backward, PAST days only): ${total_owed:.2f}")
@@ -5313,11 +5499,11 @@ def recent_highest_balance_target_db(inv_db_id=None, jobs=None):
         print(f"  ────────────────────────────────────────")
         print(f"  📊 Using recent_highest_balance (from harvhub): ${existing_recent:.2f}")
 
-        daily_target_config = db_fetch_daily_target_config_for_programme(programme_id)
+        daily_target_config = db_fetch_revenue_target_config_for_programme(programme_id)
 
         if not daily_target_config:
             print(f"  ⚠️ No programme revenue target config found for programme "
-                  f"'{programme_name}' (id={programme_id}) — skipping daily target calculations")
+                  f"'{programme_name}' (id={programme_id}) — skipping revenue target calculations")
             stats["investors_skipped"] += 1
             stats["investors_checked"] += 1
             continue
@@ -5356,7 +5542,8 @@ def recent_highest_balance_target_db(inv_db_id=None, jobs=None):
             effective_today,
             contract_start_balance,
             srv_offset,
-            current_mt5_balance=mt5_balance
+            current_mt5_balance=mt5_balance,
+            today_start_balance=today_start_balance
         )
 
         halter_recovered = False
@@ -5384,7 +5571,10 @@ def recent_highest_balance_target_db(inv_db_id=None, jobs=None):
         if anchor_info.get('anchor_found'):
             print(f"\n  🛑 PROGRESS-HALTER DAY: {anchor_info['anchor_date']} "
                   f"({anchor_info['anchor_day_name']}, week {anchor_info['anchor_week']})")
-            print(f"     Balance at halter start: ${anchor_info['anchor_day_balance']:.2f}")
+            if anchor_info.get('anchor_day_balance') is None:
+                print("     Balance at halter start: N/A (MT5 history unavailable)")
+            else:
+                print(f"     Balance at halter start: ${anchor_info['anchor_day_balance']:.2f}")
             print(f"     Daily target at halter: ${anchor_info['anchor_daily_target']:.2f}")
             print(f"     Net P/L that day: ${anchor_info['anchor_net_profit']:.2f}")
             print(f"     Contract-start day? {'YES' if anchor_info.get('is_contract_start_day') else 'NO'}")
@@ -5401,7 +5591,7 @@ def recent_highest_balance_target_db(inv_db_id=None, jobs=None):
             current_mt5_balance=mt5_balance
         )
 
-        result = calculate_daily_target_status(
+        result = calculate_revenue_target_status(
             {'daily_target_config': daily_target_config},
             total_profit,
             execution_start_date,
@@ -5409,7 +5599,10 @@ def recent_highest_balance_target_db(inv_db_id=None, jobs=None):
             starting_balance_for_today=today_start_balance,
             effective_today=effective_today,
             anchor_info=anchor_info,
-            halter_recovered=halter_recovered
+            halter_recovered=halter_recovered,
+            contract_start_balance=contract_start_balance,
+            current_mt5_balance=mt5_balance,
+            today_start_balance=today_start_balance
         )
 
         weekly_targets = result['weekly_targets']
@@ -5425,21 +5618,44 @@ def recent_highest_balance_target_db(inv_db_id=None, jobs=None):
 
         daily_target_owed_value = float(daily_target_owed_combined or 0.0)
 
+        owed_day_balance_value = None
+        owed_date_value = ''
         if anchor_info.get('anchor_found'):
-            owed_day_balance_value = float(anchor_info.get('anchor_day_balance', 0.0) or 0.0)
             owed_date_value = anchor_info.get('anchor_date', '') or ''
-        else:
-            if contract_start_balance is not None:
-                owed_day_balance_value = float(contract_start_balance)
-            elif starting_balance is not None:
-                owed_day_balance_value = float(starting_balance)
+            anchor_balance = anchor_info.get('anchor_day_balance')
+            owed_day_balance_value = float(anchor_balance) if anchor_balance is not None else None
+        elif daily_target_owed_value > 0:
+            outstanding_days = []
+            for week_data in result.get('weekly_targets', {}).values():
+                for day_data in week_data.values():
+                    if day_data.get('status') == 'owed' and float(day_data.get('remaining_needed', 0.0) or 0.0) > 0:
+                        outstanding_days.append(day_data)
+            outstanding_days.sort(key=lambda item: item.get('date') or '9999-12-31')
+            if outstanding_days:
+                first_owed = outstanding_days[0]
+                owed_date_value = first_owed.get('date') or ''
+                day_balance = first_owed.get('day_start_balance')
+                owed_day_balance_value = float(day_balance) if day_balance is not None else None
             else:
-                owed_day_balance_value = float(today_start_balance or 0.0)
-            owed_date_value = ''
+                # A pre-pending-only debt has no past owed day; anchor it to the
+                # first configured future day that contributes to that sum.
+                pre_days = []
+                for week_data in result.get('weekly_targets', {}).values():
+                    for day_data in week_data.values():
+                        if day_data.get('is_pre_pending_day'):
+                            pre_days.append(day_data)
+                pre_days.sort(key=lambda item: item.get('date') or '9999-12-31')
+                if pre_days:
+                    owed_date_value = pre_days[0].get('date') or ''
+                    day_balance = pre_days[0].get('day_start_balance')
+                    owed_day_balance_value = float(day_balance) if day_balance is not None else None
+                else:
+                    owed_date_value = effective_today.strftime('%Y-%m-%d')
+                    owed_day_balance_value = float(today_start_balance) if today_start_balance is not None else None
 
         print(f"\n  📌 HANDOFF FIELDS (persisted to daily_target_revenue):")
         print(f"     daily_target_owed              : ${daily_target_owed_value:.2f}")
-        print(f"     daily_target_owed_day_balance  : ${owed_day_balance_value:.2f}")
+        print(f"     daily_target_owed_day_balance  : ${owed_day_balance_value:.2f}" if owed_day_balance_value is not None else "     daily_target_owed_day_balance  : N/A (history unavailable)")
         print(f"     daily_target_owed_date         : {owed_date_value or 'NULL'}")
 
         alarm_confirmed = False
@@ -5505,7 +5721,7 @@ def recent_highest_balance_target_db(inv_db_id=None, jobs=None):
                 remaining = day_data.get('remaining_needed', 0.0)
                 date_str = day_data['date']
 
-                ok = db_upsert_daily_target_row(
+                ok = db_upsert_daily_revenue_target_row(
                     userid=inv_db_id_db,
                     sub_account_id=sub_id_db,
                     week_label=week_key,
@@ -5516,7 +5732,7 @@ def recent_highest_balance_target_db(inv_db_id=None, jobs=None):
                     profit_allocated=round(allocated, 8),
                     remaining_needed=round(remaining, 8),
                     daily_target_owed=round(daily_target_owed_value, 8),
-                    daily_target_owed_day_balance=round(owed_day_balance_value, 8),
+                    daily_target_owed_day_balance=(round(owed_day_balance_value, 8) if owed_day_balance_value is not None else None),
                     daily_target_owed_date=owed_date_value or None,
                 )
                 if ok:
@@ -5527,7 +5743,7 @@ def recent_highest_balance_target_db(inv_db_id=None, jobs=None):
         print(f"\n  💾 Daily target met updated to {username} sub account {sub_id_db}: "
               f"{rows_written} row(s) written to daily_target_revenue")
         print(f"     ├─ daily_target_owed             : ${daily_target_owed_value:.2f}")
-        print(f"     ├─ daily_target_owed_day_balance : ${owed_day_balance_value:.2f}")
+        print(f"     ├─ daily_target_owed_day_balance : ${owed_day_balance_value:.2f}" if owed_day_balance_value is not None else "     ├─ daily_target_owed_day_balance : N/A (history unavailable)")
         print(f"     └─ daily_target_owed_date        : {owed_date_value or 'NULL'}")
 
         if alarm_trigger:
@@ -5796,14 +6012,14 @@ def _restriction_skip_banner(inv_db_id, sub_id, programme_id, programme_name,
         print(f"           📅 Day: {day_name}")
     if window_desc:
         print(f"           🕐 Window: {window_desc}")
-    print(f"           ⏭️  Skipping recent_highest_balance_target_db and every "
+    print(f"           ⏭️  Skipping recent_highest_balance_revenue_target_db and every "
           f"future stage — no trade activity allowed right now.")
 
 
-def _daily_target_alarm_banner(inv_db_id, sub_id, programme_id, programme_name,
+def _revenue_target_alarm_banner(inv_db_id, sub_id, programme_id, programme_name,
                                alert):
     """
-    Uniform log banner for the daily-target alarm short-circuit. Mirrors
+    Uniform log banner for the revenue-target alarm short-circuit. Mirrors
     the local file's `recent_highest_hit` path.
     """
     mode = "PRE-PENDING" if alert.get('pre_pending_enabled') else "DAILY"
@@ -5814,7 +6030,7 @@ def _daily_target_alarm_banner(inv_db_id, sub_id, programme_id, programme_name,
 
     print(f"\n[STAGE ⏭] Investor {inv_db_id} (sub {sub_id}) | "
           f"programme '{programme_name}' (id={programme_id})")
-    print(f"           🚨 DAILY-TARGET ALARM ACTIVE [{mode}] — "
+    print(f"           🚨 REVENUE-TARGET ALARM ACTIVE [{mode}] — "
           f"trading suspended, all future stages skipped.")
     if effective_today:
         print(f"           📅 Effective trade date: {effective_today}")
@@ -5826,12 +6042,12 @@ def _daily_target_alarm_banner(inv_db_id, sub_id, programme_id, programme_name,
         print(f"           📊 Total all debt: ${float(total_debt):.2f}")
 
 # ==============================================================================
-#  MARTINGALE — DB version (complete, non-grid)
+#  RECOVERY_GENERATOR — DB version (complete, non-grid)
 #
 #  Configuration ownership:
 #    ┌─────────────────────────────────────────────────────────────────────┐
 #    │ PROGRAMME CONFIGURATION  (fetched ONCE per programme, shared)        │
-#    │   source: accountmanagement_trades_martingale                        │
+#    │   source: accountmanagement_trades_recovery_generator                        │
 #    │           accountmanagement_balance_default_risk                     │
 #    │           accountmanagement.fixed_risk_reward / minimum_risk_reward  │
 #    │           programme_revenue_target.loss_streak_chances               │
@@ -5859,8 +6075,8 @@ def _daily_target_alarm_banner(inv_db_id, sub_id, programme_id, programme_name,
 #
 #  stoploss_factor semantics: unchanged — risk = target.
 # ==============================================================================
-def martingale_system_db(inv_db_id=None, jobs=None):
-    global martingale_alert
+def recovery_generator_system_db(inv_db_id=None, jobs=None):
+    global recovery_generator_alert
     from datetime import datetime, timedelta, timezone
 
     # ------------------------------------------------------------------
@@ -5880,7 +6096,7 @@ def martingale_system_db(inv_db_id=None, jobs=None):
     def lagos_now_str():
         return lagos_now().strftime("%Y-%m-%d %H:%M:%S")
 
-    martingale_alert = {
+    recovery_generator_alert = {
         'is_triggered': False,
         'investor_id': inv_db_id if inv_db_id else 'all',
         'programme_id': None,
@@ -5898,7 +6114,7 @@ def martingale_system_db(inv_db_id=None, jobs=None):
         'timestamp': lagos_now_str(),
     }
 
-    print(f"\n{'='*10} 🎰 MARTINGALE SYSTEM (DB) {'='*10}")
+    print(f"\n{'='*10} 🎰 RECOVERY GENERATOR SYSTEM (DB) {'='*10}")
     print(f" 🕒 Lagos time now: {lagos_now().strftime('%Y-%m-%d %H:%M:%S %Z')} (source: {_LAGOS_TZ_SOURCE})")
     if inv_db_id:
         print(f" 🎯 Target Investor: {inv_db_id}")
@@ -5916,23 +6132,47 @@ def martingale_system_db(inv_db_id=None, jobs=None):
         'details': [],
     }
 
+    # The stage is invoked immediately after Revenue Target. Respect its alarm
+    # before touching trade rows, then preserve the old audit -> sizing -> recovery
+    # dependency order inside this stage so no later sizing pass overwrites volumes.
+    revenue_alert = recent_highest_alert or {}
+    if revenue_alert.get('is_triggered'):
+        stats['processing_success'] = True
+        stats['skipped'] = True
+        stats['skip_reason'] = 'revenue_target_alarm_active'
+        print("  🔇 Recovery Generator skipped because Revenue Target alarm is active.")
+        return stats
+
+    try:
+        stats['authorization_audit'] = check_and_record_unauthorized_actions_db(
+            inv_db_id=inv_db_id, jobs=jobs,
+        )
+        stats['investor_order_sizing'] = calculate_investor_symbols_orders_db(
+            inv_db_id=inv_db_id, jobs=jobs,
+        )
+    except Exception as prerequisite_error:
+        stats['errors'].append(f"Recovery prerequisites failed: {prerequisite_error}")
+        print(f"  ❌ Recovery Generator prerequisite failure: {prerequisite_error}")
+        stats['processing_success'] = False
+        return stats
+
     # ==================================================================
     # SECTION 1 — PROGRAMME CONFIGURATION READERS
     # ==================================================================
-    def programme_fetch_martingale_config(programme_id):
+    def programme_fetch_recovery_generator_config(programme_id):
         return db_fetch_all(
             """
             SELECT id, developerid, programme_id,
                    from_balance, to_balance,
-                   enable_martingale, martingale_type, martingale_factor,
-                   martingale_for_position_order_scale,
-                   martingale_loss_recovery_adder_percentage,
-                   pre_drawdown_assumption, martingale_pre_scaling,
-                   martingale_linear_scaling,
+                   enable_recovery_generator, recovery_generator_type, recovery_generator_factor,
+                   recovery_generator_for_position_order_scale,
+                   recovery_generator_loss_recovery_adder_percentage,
+                   pre_drawdown_assumption, recovery_generator_pre_scaling,
+                   recovery_generator_linear_scaling,
                    enable_initial_risk_retention,
                    initial_risk_retention_percentage,
-                   martingale_per_stage_drawdown_amount
-              FROM accountmanagement_trades_martingale
+                   recovery_generator_per_stage_drawdown_amount
+              FROM accountmanagement_trades_recovery_generator
              WHERE programme_id = %s
              ORDER BY from_balance ASC, id ASC
             """,
@@ -6026,7 +6266,7 @@ def martingale_system_db(inv_db_id=None, jobs=None):
     def investor_fetch_pending_trades(investor_id, sub_account_id, programme_id):
         programme_userid = resolve_programme_userid(programme_id)
         if not programme_userid:
-            print(f"      [martingale] missing programme owner userid for programme={programme_id}")
+            print(f"      [Recovery Generator] missing programme owner userid for programme={programme_id}")
             return []
         hub = investor_fetch_harvhub_anchor(investor_id, sub_account_id) or {}
         execution_start_date = _raw_first_key(hub, 'execution_start_date')
@@ -6035,10 +6275,10 @@ def martingale_system_db(inv_db_id=None, jobs=None):
             execution_start_date, pending_only=True,
         )
         if eligibility.get('reason'):
-            print(f"      [martingale] live-trade gate closed: {eligibility['reason']}")
+            print(f"      [Recovery Generator] live-trade gate closed: {eligibility['reason']}")
         if eligibility.get('skipped_old_contract') or eligibility.get('skipped_missing_trade_time') or eligibility.get('skipped_future_trade_time'):
             print(
-                "      [martingale] excluded rows: "
+                "      [Recovery Generator] excluded rows: "
                 f"old_contract={eligibility.get('skipped_old_contract', 0)}, "
                 f"missing_trade_time={eligibility.get('skipped_missing_trade_time', 0)}, "
                 f"future_trade_time={eligibility.get('skipped_future_trade_time', 0)}"
@@ -6130,44 +6370,148 @@ def martingale_system_db(inv_db_id=None, jobs=None):
             return None
 
     def get_open_positions_total_risk():
+        """Return the open-position risk that must be added to pre-drawdown.
+
+        A position is exempt ONLY when its stop loss guarantees at least
+        0.01 of positive P/L in the MT5 account currency. Floating profit is
+        deliberately not considered: an open position that is currently in
+        profit but whose SL still allows a loss remains part of pre-drawdown.
+
+        Positions with no SL (or with insufficient data to value their SL)
+        are marked unbounded. The caller must fail closed instead of silently
+        excluding them from the recovery calculation.
+        """
         positions = mt5_positions_get()
         if not positions:
             return 0.0, []
+
+        LOCKED_PROFIT_EXEMPTION_MIN = 0.01
         total_risk = 0.0
         details = []
-        skipped_no_sl = 0
-        skipped_breakeven = 0
+
         for pos in positions:
-            sym = pos.symbol
-            info = mt5_symbol_info(sym)
-            if not info:
+            sym = str(getattr(pos, 'symbol', '') or '').strip()
+            ticket = _coerce_int(getattr(pos, 'ticket', None))
+            volume = _coerce_float(getattr(pos, 'volume', None), default=None)
+            entry = _coerce_float(getattr(pos, 'price_open', None), default=None)
+            sl = _coerce_float(getattr(pos, 'sl', None), default=0.0) or 0.0
+            position_type = _coerce_int(getattr(pos, 'type', None))
+
+            is_buy = position_type == getattr(mt5, 'POSITION_TYPE_BUY', 0)
+            is_sell = position_type == getattr(mt5, 'POSITION_TYPE_SELL', 1)
+            direction = 'BUY' if is_buy else ('SELL' if is_sell else 'UNKNOWN')
+
+            base_detail = {
+                'ticket': ticket,
+                'symbol': sym,
+                'volume': volume,
+                'entry': entry,
+                'sl': sl,
+                'type': direction,
+                'floating_profit': _coerce_float(
+                    getattr(pos, 'profit', None), default=0.0
+                ) or 0.0,
+            }
+
+            # A missing SL does not make the position safe. Its downside is
+            # not bounded, so recovery sizing must stop rather than ignore it.
+            if sl <= 0:
+                details.append({
+                    **base_detail,
+                    'status': 'unbounded',
+                    'risk': None,
+                    'reason': 'no stop loss; downside exposure cannot be bounded',
+                })
                 continue
-            if pos.sl is None or pos.sl == 0:
-                skipped_no_sl += 1
+
+            if (not sym or volume is None or volume <= 0 or entry is None
+                    or entry <= 0 or not (is_buy or is_sell)):
+                details.append({
+                    **base_detail,
+                    'status': 'unbounded',
+                    'risk': None,
+                    'reason': 'incomplete position data; stop-loss exposure cannot be valued',
+                })
                 continue
-            if pos.type == 0:
-                price_diff = pos.price_open - pos.sl
-                direction = 'BUY'
+
+            calc_type = (
+                getattr(mt5, 'ORDER_TYPE_BUY', 0)
+                if is_buy else getattr(mt5, 'ORDER_TYPE_SELL', 1)
+            )
+            sl_outcome = mt5_order_calc_profit(
+                calc_type, sym, float(volume), float(entry), float(sl)
+            )
+            calculation_method = 'mt5_order_calc_profit'
+
+            # Prefer MT5's account-currency conversion. If it cannot value
+            # the SL leg, use the same contract-size approximation previously
+            # used by this helper; if even that is unavailable, fail closed.
+            if sl_outcome is None:
+                info = mt5_symbol_info(sym)
+                contract_size = _coerce_float(
+                    getattr(info, 'trade_contract_size', None), default=None
+                ) if info is not None else None
+                if contract_size is None or contract_size <= 0:
+                    details.append({
+                        **base_detail,
+                        'status': 'unbounded',
+                        'risk': None,
+                        'reason': 'MT5 could not value SL and contract size is unavailable',
+                    })
+                    continue
+
+                if is_buy:
+                    sl_outcome = (float(sl) - float(entry)) * float(volume) * contract_size
+                else:
+                    sl_outcome = (float(entry) - float(sl)) * float(volume) * contract_size
+                calculation_method = 'contract_size_fallback'
+
+            try:
+                sl_outcome = float(sl_outcome)
+            except (TypeError, ValueError):
+                details.append({
+                    **base_detail,
+                    'status': 'unbounded',
+                    'risk': None,
+                    'reason': 'SL outcome was not numeric',
+                })
+                continue
+
+            # Only a guaranteed stop-loss outcome of +0.01 or more qualifies
+            # for exemption. A floating profit alone never qualifies.
+            if sl_outcome >= LOCKED_PROFIT_EXEMPTION_MIN - 1e-9:
+                details.append({
+                    **base_detail,
+                    'status': 'locked_profit_exempt',
+                    'risk': 0.0,
+                    'locked_profit': sl_outcome,
+                    'calculation_method': calculation_method,
+                    'reason': 'SL guarantees at least +0.01 profit',
+                })
+                continue
+
+            if sl_outcome < 0:
+                # The SL can still close the position at a loss. Include the
+                # full entry-to-SL loss even when the position is floating green.
+                risk = abs(sl_outcome)
+                reason = 'SL still permits a loss; included in pre-drawdown'
             else:
-                price_diff = pos.sl - pos.price_open
-                direction = 'SELL'
-            if price_diff <= 0:
-                skipped_breakeven += 1
-                print(f"  │ ⏭️ {sym} {direction}: SL at/beyond breakeven "
-                      f"(entry={pos.price_open:.5f}, SL={pos.sl:.5f}) → NO RISK")
-                continue
-            contract_size = float(getattr(info, 'trade_contract_size', 1.0))
-            risk = price_diff * pos.volume * contract_size
+                # At breakeven or with a sub-cent locked gain, the strict
+                # +0.01 exemption threshold has not been met. Keep the position
+                # represented by a conservative 0.01 minimum exposure amount.
+                risk = LOCKED_PROFIT_EXEMPTION_MIN
+                reason = 'SL lock is below +0.01; conservative 0.01 floor included'
+
             total_risk += risk
             details.append({
-                'ticket': pos.ticket, 'symbol': sym, 'volume': pos.volume,
-                'entry': pos.price_open, 'sl': pos.sl, 'type': direction,
+                **base_detail,
+                'status': 'included',
                 'risk': risk,
+                'sl_outcome': sl_outcome,
+                'calculation_method': calculation_method,
+                'reason': reason,
             })
-        if skipped_no_sl:
-            print(f"  │ ℹ️ Skipped {skipped_no_sl} position(s) with no stop loss")
-        if skipped_breakeven:
-            print(f"  │ ℹ️ Skipped {skipped_breakeven} position(s) at breakeven/profit-locked")
+
         return total_risk, details
 
     def mt5_pending_orders_for_symbols(symbols):
@@ -6370,7 +6714,7 @@ def martingale_system_db(inv_db_id=None, jobs=None):
         for r in config_rows:
             lo = _coerce_float(_raw_first_key(r, 'from_balance'), default=None)
             hi = _coerce_float(_raw_first_key(r, 'to_balance'), default=None)
-            amt = _coerce_float(_raw_first_key(r, 'martingale_per_stage_drawdown_amount'),
+            amt = _coerce_float(_raw_first_key(r, 'recovery_generator_per_stage_drawdown_amount'),
                                 default=None)
             if lo is None or amt is None:
                 continue
@@ -6381,7 +6725,7 @@ def martingale_system_db(inv_db_id=None, jobs=None):
             if lo <= balance <= hi:
                 return float(amt)
         last_amt = _coerce_float(
-            _raw_first_key(config_rows[-1], 'martingale_per_stage_drawdown_amount'),
+            _raw_first_key(config_rows[-1], 'recovery_generator_per_stage_drawdown_amount'),
             default=100.0,
         )
         return float(last_amt or 100.0)
@@ -6482,7 +6826,7 @@ def martingale_system_db(inv_db_id=None, jobs=None):
             'mt5_balance': None,
             'execution_start_balance': None,
             'daily_target_owed': 0.0,
-            'daily_target_owed_day_balance': 0.0,
+            'daily_target_owed_day_balance': None,
             'daily_target_owed_date': None,
             'drawdown': 0.0,
             'stage': 0,
@@ -6501,12 +6845,12 @@ def martingale_system_db(inv_db_id=None, jobs=None):
             'error': None,
         }
 
-        enable_martingale = programme_cfg['enable_martingale']
-        martingale_type = programme_cfg['martingale_type']
-        martingale_factor = programme_cfg['martingale_factor']
+        enable_recovery_generator = programme_cfg['enable_recovery_generator']
+        recovery_generator_type = programme_cfg['recovery_generator_type']
+        recovery_generator_factor = programme_cfg['recovery_generator_factor']
         recovery_adder_pct = programme_cfg['recovery_adder_pct']
         pre_drawdown_assumption = programme_cfg['pre_drawdown_assumption']
-        martingale_pre_scaling = programme_cfg['martingale_pre_scaling']
+        recovery_generator_pre_scaling = programme_cfg['recovery_generator_pre_scaling']
         linear_scaling = programme_cfg['linear_scaling']
         enable_retention = programme_cfg['enable_retention']
         retention_pct = programme_cfg['retention_pct']
@@ -6516,17 +6860,17 @@ def martingale_system_db(inv_db_id=None, jobs=None):
         loss_streak_chances = programme_cfg['loss_streak_chances']
         programme_rr = programme_cfg.get('programme_rr')
 
-        detail['mode'] = martingale_type
-        detail['factor'] = martingale_factor
+        detail['mode'] = recovery_generator_type
+        detail['factor'] = recovery_generator_factor
         detail['programme_rr'] = programme_rr
 
-        if not enable_martingale:
+        if not enable_recovery_generator:
             print(f"\n  ⏭️ Investor {investor_id} | programme '{programme_name}' "
-                  f"(id={programme_id}) — martingale DISABLED")
-            detail['error'] = 'martingale_disabled'
+                  f"(id={programme_id}) — Recovery Generator DISABLED")
+            detail['error'] = 'recovery_generator_disabled'
             return detail
 
-        if martingale_factor == 'profit_factor' and (programme_rr is None or programme_rr <= 0):
+        if recovery_generator_factor == 'profit_factor' and (programme_rr is None or programme_rr <= 0):
             print(f"\n  ⚠️ Investor {investor_id} | programme '{programme_name}' "
                   f"(id={programme_id}) — profit_factor set but no "
                   f"signals_provider_interest.risk_reward available; skipping")
@@ -6538,13 +6882,13 @@ def martingale_system_db(inv_db_id=None, jobs=None):
               f"programme '{programme_name}' (id={programme_id})")
         print(f"{'─'*72}")
         print(f"  PROGRAMME CONFIGURATION (id={programme_id}):")
-        print(f"  │ Mode              : {martingale_type}")
-        print(f"  │ Factor            : {martingale_factor}")
-        if martingale_factor == 'profit_factor':
+        print(f"  │ Mode              : {recovery_generator_type}")
+        print(f"  │ Factor            : {recovery_generator_factor}")
+        if recovery_generator_factor == 'profit_factor':
             print(f"  │ Programme R:R     : 1:{programme_rr}  "
                   f"(risk → reward multiplier; the target is a reward)")
         print(f"  │ Pre-drawdown      : {'ON' if pre_drawdown_assumption else 'OFF'}")
-        print(f"  │ Pre-scaling       : {'ON' if martingale_pre_scaling else 'OFF'}")
+        print(f"  │ Pre-scaling       : {'ON' if recovery_generator_pre_scaling else 'OFF'}")
         print(f"  │ Linear scaling    : {'ON' if linear_scaling else 'OFF'}")
         print(f"  │ Retention         : {'ON' if enable_retention else 'OFF'} ({retention_pct}%)")
         print(f"  │ Recovery adder    : {recovery_adder_pct}%")
@@ -6573,14 +6917,13 @@ def martingale_system_db(inv_db_id=None, jobs=None):
         daily_target_owed = _coerce_float(_raw_first_key(dtr, 'daily_target_owed'), default=0.0) or 0.0
         owed_day_balance = _coerce_float(
             _raw_first_key(dtr, 'daily_target_owed_day_balance'), default=None)
-        if owed_day_balance is None:
-            owed_day_balance = daily_target_owed
         owed_date = _raw_first_key(dtr, 'daily_target_owed_date')
         detail['daily_target_owed'] = daily_target_owed
         detail['daily_target_owed_day_balance'] = owed_day_balance
         detail['daily_target_owed_date'] = owed_date
-        print(f"  │ Daily target owed : ${daily_target_owed:.2f} "
-              f"(day balance ${owed_day_balance:.2f}, date {owed_date or '—'})")
+        owed_balance_label = f"${owed_day_balance:.2f}" if owed_day_balance is not None else 'N/A'
+        print(f"  │ Revenue target owed : ${daily_target_owed:.2f} "
+              f"(owed-day opening balance {owed_balance_label}, date {owed_date or '—'})")
 
         default_minimum_risk = 2.0
         default_risk_value, default_risk_src = resolve_default_risk_from_rows(
@@ -6591,17 +6934,66 @@ def martingale_system_db(inv_db_id=None, jobs=None):
         total_drawdown = base_drawdown + daily_target_owed
         if pre_drawdown_assumption:
             print(f"\n  🔄 PRE-DRAWDOWN ASSUMPTION ENABLED:")
+            print(f"  │ Locked-profit exemption: SL must guarantee at least +$0.01")
+            print(f"  │ Floating profit is NOT treated as locked profit")
+
             positions_risk, positions_details = get_open_positions_total_risk()
+            locked_positions = [
+                p for p in positions_details
+                if p.get('status') == 'locked_profit_exempt'
+            ]
+            included_positions = [
+                p for p in positions_details
+                if p.get('status') == 'included'
+            ]
+            unbounded_positions = [
+                p for p in positions_details
+                if p.get('status') == 'unbounded'
+            ]
+
+            for pos in locked_positions:
+                print(
+                    f"  │ ⏭️ {pos['symbol']} {pos['type']} ticket #{pos['ticket']}: "
+                    f"SL locks +${pos['locked_profit']:.2f} "
+                    f"(>= $0.01) — excluded from pre-drawdown"
+                )
+
+            for pos in included_positions:
+                print(
+                    f"  │ ➕ {pos['symbol']} {pos['type']} ticket #{pos['ticket']}: "
+                    f"${pos['risk']:.2f} risk included "
+                    f"(floating P/L ${pos['floating_profit']:+.2f}; {pos['reason']})"
+                )
+
+            if unbounded_positions:
+                print(f"  │ 🚫 Cannot safely calculate pre-drawdown: "
+                      f"{len(unbounded_positions)} open position(s) have unbounded/unknown SL risk")
+                for pos in unbounded_positions:
+                    print(
+                        f"  │   ├─ {pos.get('symbol') or 'Unknown symbol'} "
+                        f"{pos.get('type', 'UNKNOWN')} ticket #{pos.get('ticket')}: "
+                        f"{pos.get('reason')}"
+                    )
+                print(f"  │ Recovery Generator sizing is stopped for this investor; "
+                      f"unprotected positions cannot be silently excluded.")
+                detail['error'] = 'pre_drawdown_position_risk_unbounded'
+                detail['pre_drawdown_unbounded_positions'] = len(unbounded_positions)
+                return detail
+
+            if included_positions:
+                print(f"  │ Included positions: {len(included_positions)}")
+            if locked_positions:
+                print(f"  │ Excluded profit-locked positions: {len(locked_positions)}")
+
             if positions_risk > 0:
-                print(f"  │ Found {len(positions_details)} open position(s) with stop losses:")
-                for pos in positions_details:
-                    print(f"  │   ├─ {pos['symbol']} {pos['type']}: ${pos['risk']:.2f} risk")
-                print(f"  │ Total open positions risk: ${positions_risk:.2f}")
+                print(f"  │ Total open positions risk added: ${positions_risk:.2f}")
                 print(f"  │ ${total_drawdown:.2f} + ${positions_risk:.2f} = "
                       f"${total_drawdown + positions_risk:.2f}")
                 total_drawdown += positions_risk
+            elif not locked_positions:
+                print(f"  │ No positive stop-loss exposure found")
             else:
-                print(f"  │ No open positions with stop losses found")
+                print(f"  │ All open positions qualify for the locked-profit exemption")
         else:
             print(f"  │ Pre-drawdown assumption DISABLED")
         detail['drawdown'] = total_drawdown
@@ -6628,8 +7020,13 @@ def martingale_system_db(inv_db_id=None, jobs=None):
 
         sequence_risk = None
 
-        if martingale_type == 'loss_streak':
+        if recovery_generator_type == 'loss_streak':
             print(f"\n  📊 LOSS_STREAK TARGET CALCULATION")
+            if daily_target_owed > 0 and (owed_day_balance is None or not owed_date):
+                detail['error'] = 'revenue_target_owed_anchor_missing'
+                print("  │ ⚠️ Revenue Target has outstanding debt but its actual owed-day opening balance/date is unavailable.")
+                print("  │ Recovery sizing is skipped rather than treating the owed dollar amount as an account balance.")
+                return detail
             if daily_target_owed <= 0:
                 print(f"  │ No daily_target_owed — falling back to default risk floor")
                 sequence_risk = default_risk_value
@@ -6639,7 +7036,7 @@ def martingale_system_db(inv_db_id=None, jobs=None):
                     print(f"  │ ⚠️ R:R unavailable — falling back to default risk")
                     sequence_risk = default_risk_value
                 else:
-                    target_balance = owed_day_balance if owed_day_balance > 0 else daily_target_owed
+                    target_balance = float(owed_day_balance)
                     target_owed = daily_target_owed
 
                     sequence, meta = build_target_sum_sequence(
@@ -6736,8 +7133,7 @@ def martingale_system_db(inv_db_id=None, jobs=None):
         detail['rows_seen'] = len(pending_rows)
         print(f"\n  📋 Pending trades for this investor: {len(pending_rows)}")
         if not pending_rows:
-            print(f"  │ ℹ️ Nothing to modify")
-            return detail
+            print(f"  │ ℹ️ No investor programme_trades copy rows found. Continuing with canonical MT5-order reconciliation so an eligible live order can be restored safely.")
 
         symbol_info_cache = {}
         def get_symbol_info(sym):
@@ -6756,7 +7152,7 @@ def martingale_system_db(inv_db_id=None, jobs=None):
         # ------------------------------------------------------------------
         # STEP 1: recovery / reset (sequence-driven)
         # ------------------------------------------------------------------
-        if current_stage_drawdown > 0 or martingale_type == 'loss_streak':
+        if current_stage_drawdown > 0 or recovery_generator_type == 'loss_streak':
             print(f"\n  📝 STEP 1: Recovery Processing (SEQUENCE-DRIVEN)")
         else:
             print(f"\n  📝 STEP 1: Reset to SEQUENCE RISK")
@@ -6768,9 +7164,11 @@ def martingale_system_db(inv_db_id=None, jobs=None):
         print(f"\n  🗑️ STEP: Removing Invalid Price Levels")
         print(f"  {'─'*60}")
         total_removed = 0
+        invalid_mt5_removed = 0
         for row in pending_rows[:]:
             sym = (_raw_first_key(row, 'symbol') or '').strip()
             rid = _coerce_int(_raw_first_key(row, 'id'))
+            tradeid = _coerce_int(_raw_first_key(row, 'tradeid'))
             if not sym:
                 continue
             si = get_symbol_info(sym)
@@ -6792,10 +7190,38 @@ def martingale_system_db(inv_db_id=None, jobs=None):
                 if entry >= bid:
                     is_valid = False
             if not is_valid:
-                if delete_trade_row(rid):
+                mt5_removal_confirmed = True
+                if tradeid is not None and tradeid > 0:
+                    try:
+                        matching_tickets = [
+                            order for order in (mt5_pending_orders_for_symbols([sym]) or [])
+                            if _coerce_int(getattr(order, 'magic', 0) or 0) == tradeid
+                            and _identity_text(getattr(order, 'symbol', '')) == _identity_text(sym)
+                        ]
+                        for ticket_order in matching_tickets:
+                            ticket = getattr(ticket_order, 'ticket', None)
+                            if not ticket:
+                                mt5_removal_confirmed = False
+                                continue
+                            remove_result = mt5_order_send({
+                                'action': mt5.TRADE_ACTION_REMOVE,
+                                'order': ticket,
+                            })
+                            if remove_result and remove_result.retcode == mt5.TRADE_RETCODE_DONE:
+                                invalid_mt5_removed += 1
+                                print(f"  │ 🗑️ Removed invalid MT5 pending ticket#{ticket} ({sym}, magic={tradeid})")
+                            else:
+                                mt5_removal_confirmed = False
+                                retcode = getattr(remove_result, 'retcode', None) if remove_result else None
+                                print(f"  │ ⚠️ Could not confirm removal of invalid MT5 ticket#{ticket} (retcode={retcode}); DB row retained")
+                    except Exception as remove_error:
+                        mt5_removal_confirmed = False
+                        print(f"  │ ❌ Invalid MT5 order cancellation failed for row {rid}: {remove_error}; DB row retained")
+                if mt5_removal_confirmed and rid is not None and delete_trade_row(rid):
                     total_removed += 1
+                    rows_deleted += 1
                     pending_rows.remove(row)
-                    print(f"  │ ✗ Removed invalid row {rid} ({sym} {ot} entry={entry})")
+                    print(f"  │ ✗ Removed invalid row {rid} ({sym} {ot} entry={entry}) after MT5 removal was confirmed")
         if total_removed:
             print(f"  │ Removed {total_removed} invalid row(s)")
 
@@ -6816,7 +7242,7 @@ def martingale_system_db(inv_db_id=None, jobs=None):
                 print(f"  │ ⚠️ row {rid}: no symbol_info for {sym} — skipped")
                 continue
 
-            if martingale_factor == 'profit_factor':
+            if recovery_generator_factor == 'profit_factor':
                 new_vol, reward_if_tp, risk_if_sl = _size_volume_from_tp_target(
                     row, si, sequence_risk, programme_rr)
                 if new_vol > 0:
@@ -6848,11 +7274,11 @@ def martingale_system_db(inv_db_id=None, jobs=None):
                 new_vol = valid_vol
                 risk_per_lot = _risk_per_lot(row, si)
                 risk_if_sl = new_vol * risk_per_lot
-                reward_if_tp = risk_if_sl * float(programme_rr) if martingale_factor == 'profit_factor' else 0.0
+                reward_if_tp = risk_if_sl * float(programme_rr) if recovery_generator_factor == 'profit_factor' else 0.0
 
             if update_trade_volume(rid, new_vol):
                 rows_updated_vol += 1
-                if martingale_factor == 'profit_factor':
+                if recovery_generator_factor == 'profit_factor':
                     print(f"  │ ✓ row {rid} ({sym} {ot} tradeid={tradeid}) "
                           f"→ {new_vol:.2f} lots | risk ${risk_if_sl:.2f} → "
                           f"reward ${reward_if_tp:.2f}")
@@ -6865,13 +7291,13 @@ def martingale_system_db(inv_db_id=None, jobs=None):
         # ------------------------------------------------------------------
         # STEP 2: pre-scaling
         # ------------------------------------------------------------------
-        if martingale_pre_scaling:
+        if recovery_generator_pre_scaling:
             print(f"\n{'='*60}")
             print(f"  🎯 PRE-SCALING ANALYSIS")
             print(f"{'='*60}")
-            print(f"  │ Mode: {martingale_type.upper()}")
-            print(f"  │ Assumption: {martingale_factor.upper()}")
-            if martingale_factor == 'profit_factor':
+            print(f"  │ Mode: {recovery_generator_type.upper()}")
+            print(f"  │ Assumption: {recovery_generator_factor.upper()}")
+            if recovery_generator_factor == 'profit_factor':
                 print(f"  │ Programme R:R: 1:{programme_rr} "
                       f"(risk → reward multiplier)")
             print(f"  │ Linear scaling: {'✓ ENABLED' if linear_scaling else '✗ DISABLED'}")
@@ -6939,7 +7365,7 @@ def martingale_system_db(inv_db_id=None, jobs=None):
                 print(f"\n  🔹 [NON-GRID] Scaling {sym} orders "
                       f"(independent target: ${per_symbol_target:.2f}):")
 
-                if martingale_factor == 'profit_factor':
+                if recovery_generator_factor == 'profit_factor':
                     print(f"     Target ${per_symbol_target:.2f} is the reward to earn at 1:{programme_rr}")
                     for row in symbol_rows:
                         rid = _coerce_int(_raw_first_key(row, 'id'))
@@ -7046,7 +7472,7 @@ def martingale_system_db(inv_db_id=None, jobs=None):
                     first_row = symbol_rows[0]
                     first_vol = _coerce_float(_raw_first_key(first_row, 'volume'), default=0.01) or 0.01
                     leader_amount = 0.0
-                    if martingale_factor == 'profit_factor':
+                    if recovery_generator_factor == 'profit_factor':
                         per_lot = _reward_per_lot_from_programme_rr(first_row, si, programme_rr)
                         if per_lot > 0:
                             leader_amount = per_lot * first_vol - per_symbol_target
@@ -7077,7 +7503,7 @@ def martingale_system_db(inv_db_id=None, jobs=None):
                             if entry is None:
                                 continue
 
-                            if martingale_factor == 'profit_factor':
+                            if recovery_generator_factor == 'profit_factor':
                                 per_lot = _reward_per_lot_from_programme_rr(row, si, programme_rr)
                             else:
                                 per_lot = _risk_per_lot(row, si)
@@ -7158,7 +7584,7 @@ def martingale_system_db(inv_db_id=None, jobs=None):
                 continue
             per_lot_risk = abs(entry - sl) * float(getattr(si, 'trade_contract_size', 1.0))
             risk = per_lot_risk * vol
-            if martingale_factor == 'profit_factor':
+            if recovery_generator_factor == 'profit_factor':
                 reward = risk * float(programme_rr)
                 system_analysis_results[tid] = {
                     'symbol': sym, 'volume': vol, 'risk': risk, 'reward': reward,
@@ -7173,14 +7599,14 @@ def martingale_system_db(inv_db_id=None, jobs=None):
         print(f"\n  📊 System Analysis Results:")
         for tid, res in system_analysis_results.items():
             sym = res['symbol']
-            if martingale_factor == 'profit_factor':
+            if recovery_generator_factor == 'profit_factor':
                 print(f"     magic={tid} {sym}: {res['volume']:.2f} lots | "
                       f"risk ${res['risk']:.2f} → reward ${res['reward']:.2f}")
             else:
                 print(f"     magic={tid} {sym}: {res['volume']:.2f} lots | "
                       f"risk ${res['risk']:.2f}")
 
-        cancelled = 0
+        cancelled = invalid_mt5_removed
         symbols_in_rows = {v['symbol'] for v in system_analysis_results.values()}
         if symbols_in_rows:
             mt5_orders = mt5_pending_orders_for_symbols(list(symbols_in_rows))
@@ -7201,7 +7627,7 @@ def martingale_system_db(inv_db_id=None, jobs=None):
                 si = get_symbol_info(sym)
                 contract_size = float(getattr(si, 'trade_contract_size', 1.0)) if si else 1.0
 
-                if martingale_factor == 'profit_factor':
+                if recovery_generator_factor == 'profit_factor':
                     if sl_o is None:
                         continue
                     live_risk = abs(entry_o - sl_o) * volume * contract_size
@@ -7226,19 +7652,18 @@ def martingale_system_db(inv_db_id=None, jobs=None):
 
                 print(f"  ❌ {sym} ticket#{order_ticket}: mismatch "
                       f"(amount ${live_amount:.2f} vs ${sys_amount:.2f}, "
-                      f"vol {volume:.2f} vs {sys_vol:.2f}) — DELETE")
+                      f"vol {volume:.2f} vs {sys_vol:.2f}) — CANCEL MT5 TICKET; KEEP DB ROW FOR RE-PLACEMENT")
                 try:
                     req = {"action": mt5.TRADE_ACTION_REMOVE, "order": order_ticket}
                     res = mt5_order_send(req)
                     if res and res.retcode == mt5.TRADE_RETCODE_DONE:
                         cancelled += 1
-                        if order_magic in pending_row_by_magic:
-                            row_id = _coerce_int(_raw_first_key(pending_row_by_magic[order_magic], 'id'))
-                            if row_id is not None:
-                                delete_trade_row(row_id)
-                                rows_deleted += 1
+                        print(f"     ✅ MT5 ticket#{order_ticket} removed; programme_trades row retained with desired volume {sys_vol:.2f}. Place stage will recreate it.")
+                    else:
+                        retcode = getattr(res, 'retcode', None) if res else None
+                        print(f"     ⚠️ MT5 removal not confirmed (retcode={retcode}); database row retained.")
                 except Exception as e:
-                    print(f"     delete error: {e}")
+                    print(f"     ❌ MT5 cancellation error (DB row retained): {e}")
 
         # ------------------------------------------------------------------
         # STEP 4: restore MT5 orders not in DB (order.magic → tradeid)
@@ -7249,18 +7674,30 @@ def martingale_system_db(inv_db_id=None, jobs=None):
             if sym:
                 symbols_in_rows.add(sym)
 
-        if symbols_in_rows:
+        programme_userid = resolve_programme_userid(programme_id)
+        canonical_groups = fetch_programme_analytics_magic_groups(
+            programme_id, programme_userid, require_live=True,
+        )
+        subaccount_catalog = fetch_subaccount_magic_catalog(investor_id, sub_account_id)
+        restore_tradeids = set(canonical_groups.get('canonical_tradeids') or set())
+        restore_ambiguous = set(canonical_groups.get('ambiguous') or set())
+        if not subaccount_catalog.get('ok') or not canonical_groups.get('ok'):
+            restore_tradeids = set()
+        restore_ambiguous.update(subaccount_catalog.get('ambiguous') or set())
+        restore_tradeids.difference_update(restore_ambiguous)
+
+        # A DB copy may be missing while the matching canonical order is still
+        # live in this verified investor MT5 account. Use only symbols from
+        # unambiguous canonical analytics identities; never scan unrelated symbols.
+        if not symbols_in_rows and restore_tradeids:
+            for tid in restore_tradeids:
+                group = (canonical_groups.get('by_magic') or {}).get(tid, {}).get('group', {})
+                canonical_symbol = (_raw_first_key(group, 'symbol') or '').strip()
+                if canonical_symbol:
+                    symbols_in_rows.add(canonical_symbol)
+
+        if symbols_in_rows and restore_tradeids:
             mt5_orders = mt5_pending_orders_for_symbols(list(symbols_in_rows))
-            canonical_groups = fetch_programme_analytics_magic_groups(
-                programme_id, resolve_programme_userid(programme_id), require_live=True,
-            )
-            subaccount_catalog = fetch_subaccount_magic_catalog(investor_id, sub_account_id)
-            restore_tradeids = set(canonical_groups.get('canonical_tradeids') or set())
-            restore_ambiguous = set(canonical_groups.get('ambiguous') or set())
-            if not subaccount_catalog.get('ok') or not canonical_groups.get('ok'):
-                restore_tradeids = set()
-            restore_ambiguous.update(subaccount_catalog.get('ambiguous') or set())
-            restore_tradeids.difference_update(restore_ambiguous)
             existing_tradeids = set()
             for row in pending_rows:
                 tid = _coerce_int(_raw_first_key(row, 'tradeid'))
@@ -7336,7 +7773,7 @@ def martingale_system_db(inv_db_id=None, jobs=None):
             print(" ⚠️ Could not determine local IP")
             stats['errors'].append('local IP unknown')
             stats['processing_success'] = False
-            martingale_alert['errors'] = list(stats['errors'])
+            recovery_generator_alert['errors'] = list(stats['errors'])
             return stats
         print(f" │ Local IP: {local_ip}")
 
@@ -7344,7 +7781,7 @@ def martingale_system_db(inv_db_id=None, jobs=None):
         if not all_jobs:
             print(" │ ℹ️ No active investor jobs found for this VPS")
             stats['processing_success'] = True
-            martingale_alert['errors'] = []
+            recovery_generator_alert['errors'] = []
             return stats
 
         if inv_db_id:
@@ -7353,7 +7790,7 @@ def martingale_system_db(inv_db_id=None, jobs=None):
                 print(f" ⚠️ Investor {inv_db_id} not found in any VPS-scoped job")
                 stats['errors'].append(f"Investor {inv_db_id} not found")
                 stats['processing_success'] = False
-                martingale_alert['errors'] = list(stats['errors'])
+                recovery_generator_alert['errors'] = list(stats['errors'])
                 return stats
         else:
             jobs = all_jobs
@@ -7368,9 +7805,9 @@ def martingale_system_db(inv_db_id=None, jobs=None):
         print(f"  📦 LOADING PROGRAMME CONFIGURATION (id={programme_id})")
         print(f"{'='*60}")
 
-        config_rows = programme_fetch_martingale_config(programme_id)
+        config_rows = programme_fetch_recovery_generator_config(programme_id)
         if not config_rows:
-            print(f"  │ ⚠️ No martingale rows for programme {programme_id}")
+            print(f"  │ ⚠️ No recovery_generator rows for programme {programme_id}")
             return None
 
         first = config_rows[0]
@@ -7382,26 +7819,26 @@ def martingale_system_db(inv_db_id=None, jobs=None):
             'rr_cfg': programme_fetch_rr_config(programme_id),
             'loss_streak_chances': programme_fetch_loss_streak_chances(programme_id),
             'programme_rr': programme_rr,
-            'enable_martingale': to_bool(_raw_first_key(first, 'enable_martingale'), default=False),
-            'martingale_type': (_raw_first_key(first, 'martingale_type') or 'balance_based').strip(),
-            'martingale_factor': (_raw_first_key(first, 'martingale_factor') or 'stoploss_factor').strip(),
-            'recovery_adder_pct': parse_percent(_raw_first_key(first, 'martingale_loss_recovery_adder_percentage')),
+            'enable_recovery_generator': to_bool(_raw_first_key(first, 'enable_recovery_generator'), default=False),
+            'recovery_generator_type': (_raw_first_key(first, 'recovery_generator_type') or 'balance_based').strip(),
+            'recovery_generator_factor': (_raw_first_key(first, 'recovery_generator_factor') or 'stoploss_factor').strip(),
+            'recovery_adder_pct': parse_percent(_raw_first_key(first, 'recovery_generator_loss_recovery_adder_percentage')),
             'pre_drawdown_assumption': to_bool(_raw_first_key(first, 'pre_drawdown_assumption'), default=False),
-            'martingale_pre_scaling': to_bool(_raw_first_key(first, 'martingale_pre_scaling'), default=False),
-            'linear_scaling': to_bool(_raw_first_key(first, 'martingale_linear_scaling'), default=False),
+            'recovery_generator_pre_scaling': to_bool(_raw_first_key(first, 'recovery_generator_pre_scaling'), default=False),
+            'linear_scaling': to_bool(_raw_first_key(first, 'recovery_generator_linear_scaling'), default=False),
             'enable_retention': to_bool(_raw_first_key(first, 'enable_initial_risk_retention'), default=False),
             'retention_pct': parse_percent(_raw_first_key(first, 'initial_risk_retention_percentage')),
         }
 
-        print(f"  │ enable_martingale        : {cfg['enable_martingale']}")
-        print(f"  │ martingale_type          : {cfg['martingale_type']}")
-        print(f"  │ martingale_factor        : {cfg['martingale_factor']}")
-        if cfg['martingale_factor'] == 'profit_factor':
+        print(f"  │ enable_recovery_generator        : {cfg['enable_recovery_generator']}")
+        print(f"  │ recovery_generator_type          : {cfg['recovery_generator_type']}")
+        print(f"  │ recovery_generator_factor        : {cfg['recovery_generator_factor']}")
+        if cfg['recovery_generator_factor'] == 'profit_factor':
             print(f"  │ programme_rr             : {cfg['programme_rr']}  "
                   f"(risk → reward multiplier)")
         print(f"  │ recovery_adder_pct       : {cfg['recovery_adder_pct']}%")
         print(f"  │ pre_drawdown_assumption  : {cfg['pre_drawdown_assumption']}")
-        print(f"  │ martingale_pre_scaling   : {cfg['martingale_pre_scaling']}")
+        print(f"  │ recovery_generator_pre_scaling   : {cfg['recovery_generator_pre_scaling']}")
         print(f"  │ linear_scaling           : {cfg['linear_scaling']}")
         print(f"  │ enable_retention         : {cfg['enable_retention']} ({cfg['retention_pct']}%)")
         print(f"  │ loss_streak_chances      : {cfg['loss_streak_chances']}")
@@ -7437,18 +7874,18 @@ def martingale_system_db(inv_db_id=None, jobs=None):
             stats['details'].append(detail)
             stats['investors_processed'] += 1
 
-            if not martingale_alert.get('programme_id'):
-                martingale_alert['programme_id'] = programme_id
-                martingale_alert['investor_id'] = investor_id
-                martingale_alert['stage'] = detail.get('stage', 0)
-                martingale_alert['stage_drawdown'] = detail.get('stage_drawdown', 0.0)
-                martingale_alert['total_drawdown'] = detail.get('drawdown', 0.0)
-                martingale_alert['sequence_next_risk'] = detail.get('sequence_next_risk', 0.0)
-                martingale_alert['mode'] = detail.get('mode')
-                martingale_alert['factor'] = detail.get('factor')
-                martingale_alert['programme_rr'] = detail.get('programme_rr')
+            if not recovery_generator_alert.get('programme_id'):
+                recovery_generator_alert['programme_id'] = programme_id
+                recovery_generator_alert['investor_id'] = investor_id
+                recovery_generator_alert['stage'] = detail.get('stage', 0)
+                recovery_generator_alert['stage_drawdown'] = detail.get('stage_drawdown', 0.0)
+                recovery_generator_alert['total_drawdown'] = detail.get('drawdown', 0.0)
+                recovery_generator_alert['sequence_next_risk'] = detail.get('sequence_next_risk', 0.0)
+                recovery_generator_alert['mode'] = detail.get('mode')
+                recovery_generator_alert['factor'] = detail.get('factor')
+                recovery_generator_alert['programme_rr'] = detail.get('programme_rr')
         except Exception as e:
-            print(f"\n[CRITICAL] martingale investor={investor_id}: {e}")
+            print(f"\n[CRITICAL] Recovery Generator investor={investor_id}: {e}")
             traceback.print_exc()
             stats['errors'].append(f"investor={investor_id}: {e}")
             stats['investors_skipped'] += 1
@@ -7457,12 +7894,12 @@ def martingale_system_db(inv_db_id=None, jobs=None):
     stats['rows_restored'] = sum(d.get('rows_restored', 0) for d in stats['details'])
     stats['mt5_cancelled'] = sum(d.get('mt5_cancelled', 0) for d in stats['details'])
 
-    martingale_alert['rows_updated'] = stats['rows_updated']
-    martingale_alert['rows_restored'] = stats['rows_restored']
-    martingale_alert['mt5_cancelled'] = stats['mt5_cancelled']
-    martingale_alert['errors'] = list(stats['errors'])
+    recovery_generator_alert['rows_updated'] = stats['rows_updated']
+    recovery_generator_alert['rows_restored'] = stats['rows_restored']
+    recovery_generator_alert['mt5_cancelled'] = stats['mt5_cancelled']
+    recovery_generator_alert['errors'] = list(stats['errors'])
 
-    print(f"\n{'='*10} 🎰 MARTINGALE SUMMARY (DB) {'='*10}")
+    print(f"\n{'='*10} 🎰 RECOVERY_GENERATOR SUMMARY (DB) {'='*10}")
     print(f"  Programmes processed: {stats['programmes_processed']}")
     print(f"  Investors processed : {stats['investors_processed']}")
     print(f"  Investors skipped   : {stats['investors_skipped']}")
@@ -7925,7 +8362,7 @@ def calculate_investor_symbols_orders_db(inv_db_id=None, jobs=None):
 
         # ------------------------------------------------------------------
         # ACTIONABLE ROWS
-        # Same predicate as place_usd_orders_db, chunk, martingale:
+        # Same predicate as place_usd_orders_db, chunk, recovery_generator:
         #   orderstatus = 'pending'  OR  IS NULL  OR  = ''
         # ------------------------------------------------------------------
         start_row = db_fetch_one(
@@ -12684,7 +13121,7 @@ def trades_analytics_db(inv_db_id=None, jobs=None):
 #
 #  Gate order (matches the local file's conditional routing):
 #    1. restricted_timerange_db  -> if restricted, skip everything else.
-#    2. recent_highest_balance_target_db -> populates recent_highest_alert.
+#    2. recent_highest_balance_revenue_target_db -> populates recent_highest_alert.
 #    3. If recent_highest_alert['is_triggered'] -> skip every future
 #       trading stage (local file deletes open orders/positions at this
 #       point; the DB orchestrator will do the same once that stage is
@@ -12964,7 +13401,7 @@ def _pt_request_matches_signal(item, signal, tradeid, is_position=False):
     Primary identity: item.magic == programme_trades.tradeid.
     Safety checks: exact symbol and compatible BUY/SELL direction.
 
-    A martingale/chunking stage may produce multiple broker tickets from one
+    A Recovery Generator/chunking stage may produce multiple broker tickets from one
     programme signal. Those child tickets retain the same magic and are all
     included, regardless of their individual volume or execution prices.
     Prices are deliberately not used as identifiers: unrelated trades can
@@ -14167,12 +14604,12 @@ def process_single_investor_from_db(job):
     Stage order:
         programme-requested MT5 Breakeven / Close commands (priority stage)
         gate 1 (restriction)
-        gate 2 (alarm)
-        else:
-            check_and_record_unauthorized_actions_db
-            calculate_investor_symbols_orders_db
+        Revenue Target calculation
+        Recovery Generator (immediately after Revenue Target; internally runs
+        the authorization audit and investor risk-sizing prerequisites)
+        Revenue Target alarm gate
+        if not alarmed:
             chunk_orders_with_volume_beyond_max_db
-            martingale_system_db
             place_usd_orders_db
             check_pending_orders_risk_db
             orders_reward_correction_db
@@ -14187,7 +14624,7 @@ def process_single_investor_from_db(job):
     Skipped entirely when no MT5 terminal path can be resolved.
     """
 
-    global martingale_alert
+    global recovery_generator_alert
     global unauthorized_alert
 
     inv_db_id = job.get('investor_id')
@@ -14335,7 +14772,7 @@ def process_single_investor_from_db(job):
 
         # ==================================================================
         # MANUAL PROGRAMME REQUESTS — PRIORITY EXECUTION STAGE
-        # This deliberately runs BEFORE restricted-timerange and daily-target
+        # This deliberately runs BEFORE restricted-timerange and revenue-target
         # gates. Programme close/breakeven commands must reach each connected
         # investor subaccount even when normal new-trade activity is restricted.
         # It does not read programme_training_configuration. Unfilled failures
@@ -14387,19 +14824,28 @@ def process_single_investor_from_db(job):
         # GATE 2 — RECENT HIGHEST BALANCE TARGET + DAILY-TARGET ALARM
         # ==================================================================
         recent_balance_stats = run_stage(
-            'recent_highest_balance_target_db',
-            recent_highest_balance_target_db,
+            'recent_highest_balance_revenue_target_db',
+            recent_highest_balance_revenue_target_db,
             inv_db_id=inv_db_id,
             jobs=_cached_jobs,
         )
-        account_stats['stages']['recent_highest_balance_target_db'] = recent_balance_stats
+        account_stats['stages']['recent_highest_balance_revenue_target_db'] = recent_balance_stats
         account_stats['recent_highest_balance_stats'] = recent_balance_stats
+
+        recovery_stats = run_stage(
+            'recovery_generator_system_db',
+            recovery_generator_system_db,
+            inv_db_id=inv_db_id,
+            jobs=_cached_jobs,
+        )
+        account_stats['stages']['recovery_generator_system_db'] = recovery_stats
+        account_stats['recovery_generator_stats'] = recovery_stats
 
         alert = recent_highest_alert or {}
         alarm_hit = bool(alert.get('is_triggered'))
 
         if alarm_hit:
-            _daily_target_alarm_banner(
+            _revenue_target_alarm_banner(
                 inv_db_id=inv_db_id,
                 sub_id=sub_id,
                 programme_id=programme_id,
@@ -14429,30 +14875,6 @@ def process_single_investor_from_db(job):
         print(f"  ✅ Trading allowed for {inv_db_id}")
 
         # ------------------------------------------------------------------
-        # A1. Unauthorized-actions audit
-        # ------------------------------------------------------------------
-        audit_stats_top = run_stage(
-            'check_and_record_unauthorized_actions_db',
-            check_and_record_unauthorized_actions_db,
-            inv_db_id=inv_db_id,
-            jobs=_cached_jobs,
-        )
-        account_stats['stages']['check_and_record_unauthorized_actions_db_top'] = audit_stats_top
-        account_stats['unauthorized_actions_stats_top'] = audit_stats_top
-
-        # ------------------------------------------------------------------
-        # A2. CALCULATE INVESTOR SYMBOLS ORDERS
-        # ------------------------------------------------------------------
-        calc_stats = run_stage(
-            'calculate_investor_symbols_orders_db',
-            calculate_investor_symbols_orders_db,
-            inv_db_id=inv_db_id,
-            jobs=_cached_jobs,
-        )
-        account_stats['stages']['calculate_investor_symbols_orders_db'] = calc_stats
-        account_stats['calculate_stats'] = calc_stats
-
-        # ------------------------------------------------------------------
         # A3. CHUNK ORDERS WITH VOLUME BEYOND MAX
         # ------------------------------------------------------------------
         chunk_stats = run_stage(
@@ -14463,18 +14885,6 @@ def process_single_investor_from_db(job):
         )
         account_stats['stages']['chunk_orders_with_volume_beyond_max_db'] = chunk_stats
         account_stats['chunk_stats'] = chunk_stats
-
-        # ------------------------------------------------------------------
-        # A4. MARTINGALE
-        # ------------------------------------------------------------------
-        martingale_stats = run_stage(
-            'martingale_system_db',
-            martingale_system_db,
-            inv_db_id=inv_db_id,
-            jobs=_cached_jobs,
-        )
-        account_stats['stages']['martingale_system_db'] = martingale_stats
-        account_stats['martingale_stats'] = martingale_stats
 
         # ------------------------------------------------------------------
         # A5. PLACE USD ORDERS
