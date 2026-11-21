@@ -72,6 +72,7 @@ import os
 import sys
 import time
 import json
+import hashlib
 import socket
 import struct
 import threading
@@ -109,6 +110,11 @@ BRIDGE_HOST = "127.0.0.1"
 BRIDGE_PORT = 5599
 
 BRIDGE_OWNER = "signals_trading"
+
+# Revenue Target SQL/schema contract fingerprint.
+REVENUE_TARGET_CODE_REVISION = 'revenue-target-period-columns-v1-2026-11-21'
+_RUNTIME_IDENTITY_LOGGED = False
+_REVENUE_TARGET_SCHEMA_PREFLIGHT_CACHE = None
 
 _HEADER = struct.Struct(">I")
 MAX_FRAME = 64 * 1024 * 1024
@@ -305,9 +311,34 @@ recent_highest_alert = None
 recovery_generator_alert = None   # populated by recovery_generator_system()
 
 
+def _log_runtime_identity():
+    """Print the exact source file/build loaded by this Python process."""
+    global _RUNTIME_IDENTITY_LOGGED
+    if _RUNTIME_IDENTITY_LOGGED:
+        return
+    _RUNTIME_IDENTITY_LOGGED = True
+    source_path = os.path.realpath(__file__)
+    try:
+        stat = os.stat(source_path)
+        with open(source_path, 'rb') as source_file:
+            digest = hashlib.sha256(source_file.read()).hexdigest()[:16]
+        print(
+            f"[BUILD] signals_trading revision={REVENUE_TARGET_CODE_REVISION} "
+            f"path={source_path} size={stat.st_size} "
+            f"mtime={datetime.fromtimestamp(stat.st_mtime).isoformat(timespec='seconds')} "
+            f"sha256={digest}", flush=True,
+        )
+    except Exception as exc:
+        print(
+            f"[BUILD] signals_trading revision={REVENUE_TARGET_CODE_REVISION} "
+            f"path={source_path} fingerprint_error={exc}", flush=True,
+        )
+
+
 def _worker_init():
     """Each worker process gets its own bridge client -> its own channel."""
     global _db
+    _log_runtime_identity()
     _db = _BridgeClient()
 
 
@@ -549,6 +580,154 @@ def _normalize_row(row):
             for k, v in row.items()
         }
     return None
+
+
+def _check_daily_target_revenue_schema(force=False):
+    """Read-only check of period_* columns and the full row-identity key."""
+    global _REVENUE_TARGET_SCHEMA_PREFLIGHT_CACHE
+    now = time.monotonic()
+    cached = _REVENUE_TARGET_SCHEMA_PREFLIGHT_CACHE
+    if not force and cached and cached[1] and (now - cached[0]) < 60:
+        return True, cached[2]
+
+    table_name = 'daily_target_revenue'
+    required_columns = {
+        'id', 'userid', 'sub_account_id', 'week', 'day', 'date',
+        'period_target', 'status', 'profit_allocated', 'remaining_needed',
+        'period_target_owed', 'period_target_owed_day_balance',
+        'period_target_owed_date', 'updated_at',
+    }
+    expected_unique_key = {'userid', 'sub_account_id', 'week', 'day', 'date'}
+    legacy_columns = {
+        'daily_target', 'daily_target_owed',
+        'daily_target_owed_day_balance', 'daily_target_owed_date',
+    }
+
+    col_res = db_query(
+        "SELECT COLUMN_NAME AS column_name, IS_NULLABLE AS is_nullable, "
+        "COLUMN_DEFAULT AS column_default, EXTRA AS extra "
+        "FROM information_schema.COLUMNS "
+        "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s",
+        [table_name], timeout=15.0, quiet=True,
+    )
+    if not _is_ok(col_res):
+        return False, (
+            "Cannot inspect daily_target_revenue columns: "
+            + str(col_res.get('message') or col_res)
+        )
+
+    actual_columns = set()
+    column_metadata = {}
+    for raw_row in col_res.get('results') or []:
+        row = _normalize_row(raw_row) or {}
+        name = str(_raw_first_key(row, 'column_name') or '').strip().lower()
+        if name:
+            actual_columns.add(name)
+            column_metadata[name] = {
+                'is_nullable': str(_raw_first_key(row, 'is_nullable') or '').upper(),
+                'column_default': _raw_first_key(row, 'column_default'),
+                'extra': str(_raw_first_key(row, 'extra') or '').lower(),
+            }
+    if not actual_columns:
+        return False, (
+            "daily_target_revenue was not found in DATABASE(), or the active database "
+            "returned no column metadata. Check DATABASE() and the table name."
+        )
+
+    missing_columns = sorted(required_columns - actual_columns)
+    present_legacy_columns = sorted(legacy_columns & actual_columns)
+
+    idx_res = db_query(
+        "SELECT INDEX_NAME AS index_name, NON_UNIQUE AS non_unique, "
+        "SEQ_IN_INDEX AS seq_in_index, COLUMN_NAME AS column_name "
+        "FROM information_schema.STATISTICS "
+        "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s "
+        "ORDER BY INDEX_NAME, SEQ_IN_INDEX",
+        [table_name], timeout=15.0, quiet=True,
+    )
+    if not _is_ok(idx_res):
+        return False, (
+            "Cannot inspect daily_target_revenue indexes: "
+            + str(idx_res.get('message') or idx_res)
+        )
+
+    grouped = {}
+    for raw_row in idx_res.get('results') or []:
+        row = _normalize_row(raw_row) or {}
+        name = str(_raw_first_key(row, 'index_name') or '').strip()
+        col = str(_raw_first_key(row, 'column_name') or '').strip().lower()
+        non_unique = _coerce_int(_raw_first_key(row, 'non_unique'))
+        seq = _coerce_int(_raw_first_key(row, 'seq_in_index'))
+        if not name or not col:
+            continue
+        item = grouped.setdefault(name, {'non_unique': non_unique, 'columns': []})
+        item['columns'].append((seq if seq is not None else 999999, col))
+
+    unique_indexes = {}
+    for name, item in grouped.items():
+        if item.get('non_unique') == 0:
+            unique_indexes[name] = [c for _, c in sorted(item['columns'])]
+
+    has_expected_key = any(
+        len(cols) == len(expected_unique_key) and set(cols) == expected_unique_key
+        for cols in unique_indexes.values()
+    )
+    conflicting_unique_indexes = {
+        name: cols for name, cols in unique_indexes.items()
+        if name.lower() != 'primary'
+        and set(cols)
+        and set(cols).issubset(expected_unique_key)
+        and set(cols) != expected_unique_key
+    }
+
+    issues = []
+    if missing_columns:
+        issues.append('missing required columns: ' + ', '.join(missing_columns))
+
+    # Also catch extra mandatory columns that the 12-column INSERT does not fill.
+    insert_columns = {
+        'userid', 'sub_account_id', 'week', 'day', 'date', 'period_target',
+        'status', 'profit_allocated', 'remaining_needed', 'period_target_owed',
+        'period_target_owed_day_balance', 'period_target_owed_date',
+    }
+    extra_required_columns = []
+    for name, meta in column_metadata.items():
+        if name in insert_columns:
+            continue
+        extra = meta.get('extra', '')
+        is_generated = ('generated' in extra)
+        is_auto_increment = ('auto_increment' in extra)
+        no_default = meta.get('column_default') is None
+        if meta.get('is_nullable') == 'NO' and no_default and not is_generated and not is_auto_increment:
+            extra_required_columns.append(name)
+    if extra_required_columns:
+        issues.append(
+            'additional NOT NULL column(s) have no default and are not supplied by the INSERT: '
+            + ', '.join(sorted(extra_required_columns))
+        )
+
+    if not has_expected_key:
+        issues.append('missing UNIQUE key on (userid, sub_account_id, week, day, date)')
+    if conflicting_unique_indexes:
+        conflicts = '; '.join(
+            f"{name}=({', '.join(cols)})" for name, cols in conflicting_unique_indexes.items()
+        )
+        issues.append('conflicting narrower UNIQUE index(es): ' + conflicts)
+
+    idx_summary = '; '.join(
+        f"{name}=({', '.join(cols)})" for name, cols in unique_indexes.items()
+    ) or 'none'
+    detail = (
+        f"table={table_name}; columns={', '.join(sorted(actual_columns))}; "
+        f"unique_indexes={idx_summary}; "
+        f"legacy_columns_present={', '.join(present_legacy_columns) if present_legacy_columns else 'none'}"
+    )
+    if issues:
+        return False, '; '.join(issues) + '. ' + detail
+
+    message = 'Revenue Target schema contract is valid. ' + detail
+    _REVENUE_TARGET_SCHEMA_PREFLIGHT_CACHE = (now, True, message)
+    return True, message
 
 
 def _is_nullish(value):
@@ -4140,6 +4319,21 @@ def recent_highest_balance_revenue_target(inv_db_id=None, jobs=None):
         "details": []
     }
 
+    # Validate the Revenue Target table before Stage 4 writes anything.
+    revenue_schema_ok, revenue_schema_message = _check_daily_target_revenue_schema()
+    print(f"\n  [REVENUE TARGET DB PREFLIGHT] {revenue_schema_message}", flush=True)
+    if not revenue_schema_ok:
+        stats["errors"].append(
+            "daily_target_revenue schema preflight failed: " + revenue_schema_message
+        )
+        stats["processing_success"] = False
+        print(
+            "  🛑 Revenue Target writes are blocked before any Stage 4 changes. "
+            "Match the deployed script to the table schema and correct the index.",
+            flush=True,
+        )
+        return stats
+
     # ----------------------------------------------------------------
     # DB helpers specific to this stage
     # ----------------------------------------------------------------
@@ -4293,14 +4487,8 @@ def recent_highest_balance_revenue_target(inv_db_id=None, jobs=None):
                                    period_target_owed=None,
                                    period_target_owed_day_balance=None,
                                    period_target_owed_date=None):
-        """Persist one programme revenue-target day using its full row identity.
-
-        The matching unique key is (userid, sub_account_id, week, day, date).
-        INSERT ... ON DUPLICATE KEY UPDATE makes retries safe and avoids the
-        old check-then-insert race.
-        """
-        ok, _, msg = db_execute(
-            """
+        """Persist one day using period_* fields and the full row identity."""
+        sql = """
             INSERT INTO daily_target_revenue
                 (userid, sub_account_id, week, day, date,
                  period_target, status, profit_allocated, remaining_needed,
@@ -4317,17 +4505,32 @@ def recent_highest_balance_revenue_target(inv_db_id=None, jobs=None):
                 period_target_owed = VALUES(period_target_owed),
                 period_target_owed_day_balance = VALUES(period_target_owed_day_balance),
                 period_target_owed_date = VALUES(period_target_owed_date)
-            """,
-            [userid, sub_account_id, week_label, day_label, date_str,
-             period_target, status, profit_allocated, remaining_needed,
-             period_target_owed, period_target_owed_day_balance,
-             period_target_owed_date],
-            timeout=15.0, quiet=False,
-        )
+        """
+        params = [
+            userid, sub_account_id, week_label, day_label, date_str,
+            period_target, status, profit_allocated, remaining_needed,
+            period_target_owed, period_target_owed_day_balance,
+            period_target_owed_date,
+        ]
+        response = db_query(sql, params, timeout=15.0, quiet=True)
+        ok = _is_ok(response)
         if not ok:
             print(
                 f"  ❌ Revenue target period-row UPSERT failed for "
-                f"{userid}/{sub_account_id}/{date_str}: {msg}"
+                f"{userid}/{sub_account_id}/{date_str}", flush=True,
+            )
+            print("      [REVENUE TARGET SQL CONTRACT] period_* columns", flush=True)
+            print("      [SQL] " + ' '.join(sql.split()), flush=True)
+            print("      [PARAMS] " + json.dumps(params, ensure_ascii=False, default=str), flush=True)
+            print(
+                "      [BRIDGE RESPONSE] "
+                + json.dumps(response, ensure_ascii=False, default=str)[:6000],
+                flush=True,
+            )
+            print(
+                "      [NOTE] If the bridge response still only says 'Some statements failed', "
+                "the PHP SQL endpoint is suppressing the underlying PDO SQLSTATE/error.",
+                flush=True,
             )
         return ok
 
@@ -15224,6 +15427,7 @@ def main_loop():
     loop_interval = min(10, max(5, int(loop_interval)))
     print("\n" + "=" * 60)
     print("         SIGNALS TRADING — PROGRAMME REQUEST + TRADE ORCHESTRATOR", flush=True)
+    print(f"[Revenue Target SQL contract] {REVENUE_TARGET_CODE_REVISION}", flush=True)
     print("=" * 60)
     print("  Investor jobs: contract_active programme revenue-deal pairs on programmes hosted by this VPS")
     print("  Programme authority: explicit manual requests matched by programme tradeid/MT5 magic only")
