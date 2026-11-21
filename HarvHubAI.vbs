@@ -1,15 +1,14 @@
 Option Explicit
 
-Dim fso, sh, shellApp, processEnv, localAppData, installRoot, cacheRoot
+Dim fso, sh, processEnv, localAppData, installRoot, cacheRoot
 Dim psScriptPath, markerPath, pythonMarkerPath, psFile, psExit, projectRoot
-Dim pythonwPath, builderScript, adminResult, appRunning, clickedVbs
+Dim pythonwPath, builderScript, appRunning, clickedVbs
 Dim psProcess, psStdOut, psStdErr, diagnosticText
 Dim validatorProcess, validationCommand, validationStdOut, validationStdErr, validationExit, validationOutput
 Dim builderLogPath, builderExit, builderCommand, builderLaunchError
 
 Set fso = CreateObject("Scripting.FileSystemObject")
 Set sh = CreateObject("WScript.Shell")
-Set shellApp = CreateObject("Shell.Application")
 
 localAppData = sh.ExpandEnvironmentStrings("%LOCALAPPDATA%")
 installRoot = "C:\xampp\htdocs\harvhubAI"
@@ -20,20 +19,8 @@ pythonMarkerPath = fso.BuildPath(cacheRoot, "pythonw_path.txt")
 builderLogPath = fso.BuildPath(cacheRoot, "builder_output.log")
 clickedVbs = WScript.ScriptFullName
 
-' Elevate before downloading so the visible installer is not restarted midway.
-If Not IsAdministrator() Then
-    On Error Resume Next
-    shellApp.ShellExecute "wscript.exe", """" & WScript.ScriptFullName & """ /elevated", fso.GetParentFolderName(WScript.ScriptFullName), "runas", 1
-    If Err.Number <> 0 Then
-        diagnosticText = "Could not request administrator permission." & vbCrLf & _
-            "VBScript error " & Err.Number & ": " & Err.Description
-        Err.Clear
-        Call ShowDiagnosticWindow("HarvHub AI elevation request failed", diagnosticText)
-        WScript.Quit 22
-    End If
-    On Error GoTo 0
-    WScript.Quit 0
-End If
+' Start without requesting elevation. Operations needing protected system access
+' report a diagnostic instead of raising UAC merely to open the launcher.
 
 ' Enforce one active HarvHub setup/update session. Older HarvHub manager,
 ' bootstrap, builder, and service processes are stopped before files are touched.
@@ -1119,12 +1106,6 @@ Sub StopExistingHarvHubProcesses()
         WScript.Quit 13
     End If
 End Sub
-
-Function IsAdministrator()
-    Dim result
-    result = sh.Run("powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden -Command ""$p=New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent()); if($p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){exit 0}else{exit 1}""", 0, True)
-    IsAdministrator = (result = 0)
-End Function
 
 ' Retained for compatibility with older launcher copies; startup now force-cleans older HarvHub processes.
 Function IsInstalledHarvHubRunning(ByVal targetPath)

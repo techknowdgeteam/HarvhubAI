@@ -1,0 +1,53 @@
+HARVHUB AI — NO AUTOMATIC UAC PROMPT SOURCE PATCH
+=================================================
+
+WHAT THIS PATCH CHANGES
+-----------------------
+- Removes the VBS launcher's unconditional ShellExecute("runas") request.
+- Removes PyInstaller's --uac-admin option so the rebuilt EXE runs at the
+  current user's normal Windows integrity level.
+- Removes the builder's and desktop manager's automatic runas relaunches.
+- Keeps the administrator check inside the actual setup/repair worker. That
+  check applies only when installing system-wide components or changing
+  protected locations; it no longer elevates an ordinary desktop launch.
+- Keeps HarvHubAI.vbs and Build_HarvHubProgram.vbs byte-identical.
+
+FILES TO REPLACE IN THE PROJECT ROOT AND GITHUB REPOSITORY
+----------------------------------------------------------
+HarvHubAI.vbs
+Build_HarvHubProgram.vbs
+Build_HarvHubProgram.pyw
+harvcore_manager.py
+
+README.md is updated with the new launch behavior and rollout notes.
+
+IMPORTANT: THE EXISTING EXE MUST BE REBUILT
+-------------------------------------------
+The uploaded HarvHubAI.exe was built with the old --uac-admin option. Replacing
+Python/VBS source files does not change the manifest inside an already-built
+EXE. Update the four source files in the GitHub repository first, then run the
+updated HarvHubAI.vbs so the builder creates a new release/HarvHubAI.exe. Use
+that rebuilt EXE for the desktop and Start Menu shortcuts.
+
+SECURITY / PERMISSIONS
+----------------------
+This removes an elevation request when opening the application. It does not
+silently approve UAC and does not bypass Windows permissions. If an explicit
+setup/repair operation must install system-wide dependencies or write to a
+protected directory, it still checks for Administrator privileges. Run that
+specific setup operation with administrator rights when required.
+
+This patch targets the UAC dialog that says an unknown publisher wants to make
+changes. It does not suppress Windows SmartScreen's separate "Windows protected
+your PC" warning. Do not disable UAC or SmartScreen to work around either.
+
+VALIDATION PERFORMED IN THE BUILD ENVIRONMENT
+---------------------------------------------
+- Both VBS launchers are byte-identical.
+- No runas/elevation command remains in the VBS launchers, builder or manager's
+  ordinary startup path.
+- The builder no longer passes --uac-admin to PyInstaller.
+- The manager still checks administrator privileges inside setup/repair.
+- Both Python files pass Python syntax compilation.
+- A Windows rebuild and actual Windows UAC behavior still need to be confirmed
+  on the target Windows VPS.

@@ -334,20 +334,6 @@ def is_admin() -> bool:
         return False
 
 
-def relaunch_as_admin() -> bool:
-    """Request UAC elevation when running the source build (the EXE has a manifest)."""
-    if not is_windows() or is_admin():
-        return True
-    try:
-        params = subprocess.list2cmdline(sys.argv)
-        result = ctypes.windll.shell32.ShellExecuteW(
-            None, "runas", sys.executable, params, None, 1
-        )
-        return int(result) > 32
-    except Exception:
-        return False
-
-
 def resource_directory() -> Path:
     if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
         return Path(sys._MEIPASS) / "payload"
@@ -4308,19 +4294,9 @@ def main() -> None:
                 pass
         return
 
-    if is_windows() and not is_admin():
-        if not relaunch_as_admin():
-            try:
-                ctypes.windll.user32.MessageBoxW(
-                    None,
-                    "HarvHub AI needs Administrator privileges to install Python, Chrome, MetaTrader 5 and write to C:\\xampp\\htdocs\\harvhubAI.",
-                    APP_TITLE,
-                    0x10,
-                )
-            except Exception:
-                pass
-            return
-        return
+    # Normal desktop startup always runs as the signed-in user. Administrator
+    # permission is checked only inside the explicit setup/repair worker, where
+    # protected system changes may actually be required.
     root = None
     try:
         root = tk.Tk()
