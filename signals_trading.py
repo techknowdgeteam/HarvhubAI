@@ -4232,7 +4232,7 @@ def recent_highest_balance_revenue_target(inv_db_id=None, jobs=None):
             SELECT week_no, day_name, from_balance, to_balance,
                    target_amount, pre_pending_sum,
                    include_target_as_debt_if_missed AS include_missed_days,
-                   target_daily_profit, include_current_day_as_owed,
+                   target_period_profit, include_current_day_as_owed,
                    loss_streak_chances, revenue_target_period
               FROM programme_revenue_target
              WHERE programme_id = %s
