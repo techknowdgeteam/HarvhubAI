@@ -1,118 +1,71 @@
-
 """
  signals_trading.py
 Programme-scoped trade pipeline orchestrator.
 
-Runs programme-requested MT5 Breakeven / Close actions first, then the
-restricted-timerange stage + recent-highest-balance target stage and the
-existing investor trading pipeline. Programme requests are independent of
-programme_training_configuration and retry until MT5 confirms the action.
+EXECUTION PRIORITY
+------------------
+After investor job eligibility, the programme Restricted Timerange check is
+Stage 1 and has absolute priority, before MT5 terminal resolution or connection.
+If a restriction is active, the worker returns immediately: no Stage 2 or
+later audit, sizing, Revenue Target, Recovery Generator, manual request, or
+normal trading operation is executed.
+
+On an unrestricted cycle the order is:
+  Stage 2 — check_and_record_unauthorized_actions()
+  Stage 3 — calculate_investor_symbols_orders()
+  Stage 4 — recent_highest_balance_revenue_target()
+  Stage 5 — recovery_generator_system() immediately after Stage 4 commits
+  Then — explicit manual programme requests, Revenue Target alarm gate, and
+           the normal chunk/place/risk/reward/breakeven/analytics pipeline.
+
+The two mandatory account safety/calculation stages run sequentially before
+any subsequent manual or automated order-management stage. Revenue Target must
+confirm its database persistence/read-back before Recovery Generator is called.
 
 ARCHITECTURE
 ------------
-* Same bridge pattern as brokerdetails.py: this file is a TCP CLIENT of
-  the long-running mysqlremote.py bridge. It does NOT launch Chrome.
+* Same bridge pattern as brokerdetails.py: this file is a TCP CLIENT of the
+  long-running mysqlremote.py bridge. It does NOT launch Chrome.
 * The DATABASE is the source of truth. No local folder scanning, no JSON
   reads, no JSON writes. EVER.
 * Every worker process (one per investor) acquires its OWN dedicated
   channel from the bridge. Channels are isolated.
-* Helpers (db_query, _BridgeClient, channel mgmt, time helpers) live at
-  MODULE scope so all future functions in this file can share one channel
-  per worker.
+* Helpers (db_query, _BridgeClient, channel management, time helpers) live at
+  MODULE scope so worker functions can share one channel per worker.
 * Normal investor-side reconciliation remains subaccount-aware and uses the
-  investor copy's tradeid/magic plus chart identity and programme_analytics groups.
-  This is part of the investor's own execution pipeline, not programme authority.
-* The programme's explicit manual request path selects MT5 tickets primarily
-  by `magic == programme_trades.tradeid`, then verifies exact symbol and BUY/SELL
-  direction. All child tickets sharing that magic are managed; volume and prices
-  are not used as identity fields.
+  investor copy's tradeid/magic plus chart identity and programme_analytics
+  groups. This is the investor's own execution pipeline, not programme authority.
+* Explicit programme manual requests select MT5 tickets primarily by
+  magic == programme_trades.tradeid, then verify exact symbol and BUY/SELL
+  direction. All child tickets sharing that magic are managed.
 
 RESTRICTED TIMERANGE SEMANTICS
 ------------------------------
 Restriction is PROGRAMME-SCOPED, not investor-scoped.
 
-Two stages, evaluated in order:
+Stage 1 checks Restricted Dates first and Restricted Days second. If today is
+a configured restricted date, or the current programme-local time falls inside
+a configured restricted-day window, the worker aborts every subsequent stage.
+A missing/empty programme timezone means restrictions are not configured for
+that programme, matching the existing programme configuration semantics.
 
-  STAGE 1 — Restricted Dates
-    Query `accountmanagement_restricted_dates` for the programme.
-    Convert "now" to the programme's timezone, format as YYYY-MM-DD.
-    If that exact date appears in the list -> FULL-DAY LOCKOUT.
-    No further checks are performed for that programme.
-
-  STAGE 2 — Restricted Days
-    Only reached when Stage 1 finds nothing for today.
-    Query `accountmanagement_restricted_days` for the programme and
-    evaluate the window for today's weekday using the strict rule
-    below.
-
-WINDOW RULE (strict, Stage 2 only)
-----------------------------------
-`from_time` and `to_time` define an inclusive span. `now` is RESTRICTED
-if it lies between `from_time` and `to_time` inclusive. Anything outside
-that span is FREE.
-
-  * 12:00 AM -> 12:00 PM  restricts 12:00 AM..11:59 AM. Noon onward = free.
-  * 12:00 AM -> 12:00 AM  restricts the WHOLE day.
-  * 12:00 AM -> 2:00 AM   restricts 12:00 AM..2:00 AM. 2:01 AM onward = free.
-  * Cross-midnight windows (e.g. 10:00 PM -> 2:00 AM) are handled.
-
-A "NULL" timezone (or empty) is NOT an error — it means the programme has
-not configured a timezone, and the restriction check is skipped for that
-programme.
+Window boundaries are inclusive. Cross-midnight windows are supported.
 
 ACTIVE INVESTOR DETECTION
 -------------------------
 VPS eligibility and investor entitlement are separate:
-
-* The programme VPS IP identifies the owner programme and its active
-  programme-VPS followers. Account-VPS tables are not consulted here.
-* An investor/subaccount is eligible only when a `programme_revenue_deals`
-  row associates that exact pair with the programme AND the matching
-  `harvhub.id` + `harvhub.sub_account_id` row has
-  `account_contract_status = 'contract_active'`. This mirrors the PHP investor
-  synchronization rule exactly.
-* The programme VPS IP scopes which programmes can run on this computer; it
-  does not replace or weaken the active investor eligibility check.
-* `programme_trades` remains the sole signal-copy and manual-request authority.
-  An active investor worker can run its own programme account-management stages
-  even before a new inherited signal copy exists.
-* Programme-owned `programme_trades` rows (`investor_id IS NULL`) remain the
-  canonical signal and manual-request source. Investor copies are the
-  account-specific signal records.
+* Programme VPS bindings scope which programmes can run on this computer.
+* An investor/subaccount is eligible only when the matching programme revenue
+deal and exact harvhub subaccount have contract_active status.
+* Programme-owned programme_trades rows remain the canonical signal and
+manual-request source; investor copies are account-specific signal records.
 
 PROGRAMME AUTHORITY
 -------------------
-Programme master trades do not control investor sizing or account-management
-stages. The investor pipeline continues to use the programme's own
-`accountmanagement_*` configuration against that investor's MT5 account.
-The programme has a narrow execution authority only through the explicit
-`order_request_status` manual-request fields (`order closing requested`,
-`position closing requested`, `breakeven requested`). Those requests are
-matched by canonical MT5 magic (`programme_trades.tradeid`) and verified by
-symbol/direction. They may affect all child tickets for that signal; volume is
-used only when MT5 requires it to send a close, never to identify a ticket.
-
-PIPELINE ORDER AND GATES
-------------------------
-Programme-requested Breakeven / Close commands run immediately after each
-investor MT5 account is connected and its login/server identity is verified.
-They run before both normal trading gates and do not depend on programme
-training configuration. Failed actions retain a reason and retry each cycle.
-
-The normal automated trading stages then use the two short-circuits below:
-
-  GATE 1 — Restricted timerange
-    If the investor's programme is currently restricted (restricted
-    date / full restricted day / inside restricted time window), skip
-    all normal automated trading stages, including recent_highest_balance_revenue_target_db.
-    Programme-requested Breakeven / Close commands have already run.
-
-  GATE 2 — Revenue Target alarm
-    recent_highest_balance_revenue_target_db() populates the module-global
-    `recent_highest_alert`. If `is_triggered` is True after that stage
-    runs (target met, or pre-pending alarm fired), skip subsequent normal
-    automated trading stages for this cycle. Programme-requested manual
-    actions have already been processed before either gate.
+The programme's explicit order_request_status fields are the authority for
+manual close, position close, and breakeven requests. These run only after the
+restriction gate and mandatory Stage 2/3 checks, and before normal new-order
+processing. Failed requests retain a reason and retry on the next cycle.
 """
 
 import os
@@ -349,7 +302,7 @@ class _BridgeClient:
 # ==============================================================================
 _db = None
 recent_highest_alert = None
-recovery_generator_alert = None   # populated by recovery_generator_system_db()
+recovery_generator_alert = None   # populated by recovery_generator_system()
 
 
 def _worker_init():
@@ -2230,10 +2183,7 @@ def is_active_investor_for_programme(investor_id, sub_account_id, programme_id):
     return True, None
 
 def fetch_programmes_metadata_batch(programme_ids):
-    """
-    Return {programme_id: {'programme_name': str, 'timezone': str|None}}
-    for every id, in ONE query.
-    """
+    """Return programme metadata, raising when the authoritative read fails."""
     if not programme_ids:
         return {}
     ids = [int(p) for p in programme_ids if p]
@@ -2244,7 +2194,9 @@ def fetch_programmes_metadata_batch(programme_ids):
         f"SELECT id, program_name, timezone FROM programme "
         f"WHERE id IN ({placeholders})"
     )
-    rows = db_fetch_all(sql, ids, timeout=15.0, quiet=True)
+    rows, error = _strict_db_rows(sql, ids, timeout=15.0)
+    if rows is None:
+        raise RuntimeError(f"restricted timerange programme metadata query failed: {error}")
     out = {}
     for row in rows:
         pid = _coerce_int(_pick_first_key(row, 'id'))
@@ -2257,18 +2209,13 @@ def fetch_programmes_metadata_batch(programme_ids):
     return out
 
 def fetch_programme_restrictions_batch(programme_ids):
-    """
-    Return {programme_id: {'dates': [...], 'days': [...]}} for every id.
-
-    Two queries total regardless of how many programmes are passed.
-    """
+    """Return date/day restrictions, raising when either authoritative read fails."""
     if not programme_ids:
         return {}
     ids = [int(p) for p in programme_ids if p]
     if not ids:
         return {}
     placeholders = ','.join(['%s'] * len(ids))
-
     out = {pid: {'dates': [], 'days': []} for pid in ids}
 
     dates_sql = (
@@ -2277,14 +2224,17 @@ def fetch_programme_restrictions_batch(programme_ids):
         f"WHERE programme_id IN ({placeholders}) "
         f"ORDER BY programme_id ASC, restricted_date ASC"
     )
-    for row in db_fetch_all(dates_sql, ids, timeout=15.0, quiet=True):
+    date_rows, date_error = _strict_db_rows(dates_sql, ids, timeout=15.0)
+    if date_rows is None:
+        raise RuntimeError(f"restricted dates query failed: {date_error}")
+    for row in date_rows:
         pid = _coerce_int(_pick_first_key(row, 'programme_id'))
         val = _pick_first_key(row, 'restricted_date')
-        if pid is None or val is None:
+        if pid is None or pid not in out or val is None:
             continue
-        s = str(val).strip()
-        if s:
-            out[pid]['dates'].append(s[:10])
+        value = str(val).strip()
+        if value:
+            out[pid]['dates'].append(value[:10])
 
     days_sql = (
         f"SELECT programme_id, day, from_time, to_time "
@@ -2292,14 +2242,17 @@ def fetch_programme_restrictions_batch(programme_ids):
         f"WHERE programme_id IN ({placeholders}) "
         f"ORDER BY programme_id ASC, id ASC"
     )
-    for row in db_fetch_all(days_sql, ids, timeout=15.0, quiet=True):
+    day_rows, day_error = _strict_db_rows(days_sql, ids, timeout=15.0)
+    if day_rows is None:
+        raise RuntimeError(f"restricted days query failed: {day_error}")
+    for row in day_rows:
         pid = _coerce_int(_pick_first_key(row, 'programme_id'))
-        if pid is None:
+        if pid is None or pid not in out:
             continue
         out[pid]['days'].append({
-            'day':       (_pick_first_key(row, 'day') or '').strip(),
+            'day': (_pick_first_key(row, 'day') or '').strip(),
             'from_time': str(_pick_first_key(row, 'from_time') or '').strip(),
-            'to_time':   str(_pick_first_key(row, 'to_time') or '').strip(),
+            'to_time': str(_pick_first_key(row, 'to_time') or '').strip(),
         })
     return out
 
@@ -2417,7 +2370,7 @@ def fetch_programme_name(programme_id):
 #
 #  Nothing here touches JSON files.
 # ==============================================================================
-def check_and_record_unauthorized_actions_db(inv_db_id=None, jobs=None):
+def check_and_record_unauthorized_actions(inv_db_id=None, jobs=None):
     """
     Reads:
         * programme_trades        -> this investor's authorized tradeid set
@@ -3325,9 +3278,28 @@ def check_and_record_unauthorized_actions_db(inv_db_id=None, jobs=None):
 
             running_balance = day_close
 
-        # ONE batched round-trip for every day
+        # ONE batched round-trip for every day. Do not report the audit as
+        # successful if the authoritative balance_log history was not committed.
         if statements:
-            db_query_many(statements, timeout=60.0, quiet=True)
+            batch_result = db_query_many(statements, timeout=60.0, quiet=True)
+            batch_status = str((batch_result or {}).get('status') or 'error').lower()
+            statement_results = (batch_result or {}).get('statements') or []
+            failed_statements = [
+                item for item in statement_results
+                if str((item or {}).get('status') or '').lower() in ('error', 'failed', 'skipped')
+            ]
+            if batch_status != 'success' or failed_statements:
+                batch_message = (batch_result or {}).get('message') or 'balance_log batch write was not confirmed'
+                stats['errors'].append(
+                    f"balance_log persistence failed for investor={investor_id}, "
+                    f"sub={sub_account_id}: {batch_message}"
+                )
+                detail['balance_log_persisted'] = False
+                print(f"     ❌ balance_log batch persistence failed: {batch_message}")
+            else:
+                detail['balance_log_persisted'] = True
+        else:
+            detail['balance_log_persisted'] = True
 
         days_written = len(statements)
         last_action = day_actions[-1][1] if day_actions else None
@@ -3488,13 +3460,30 @@ def check_and_record_unauthorized_actions_db(inv_db_id=None, jobs=None):
         print(f"     • {e}")
     print(f"{'='*10} 🏁 COMPLETE {'='*10}\n")
 
-    stats['processing_success'] = True
+    # Every unauthorized live pending order/position must have a confirmed
+    # MT5 removal/close. A failed enforcement attempt is a critical audit error,
+    # even when the database balance_log write itself succeeded.
+    if stats['unauthorized_orders_cancelled'] < stats['unauthorized_orders_found']:
+        stats['errors'].append(
+            f"unauthorized pending-order enforcement incomplete: "
+            f"{stats['unauthorized_orders_cancelled']}/{stats['unauthorized_orders_found']} cancelled"
+        )
+    if stats['unauthorized_positions_closed'] < stats['unauthorized_positions_found']:
+        stats['errors'].append(
+            f"unauthorized position enforcement incomplete: "
+            f"{stats['unauthorized_positions_closed']}/{stats['unauthorized_positions_found']} closed"
+        )
+
+    # A partially completed audit must not be treated as a green light for
+    # subsequent automated trading. All detected DB/MT5 enforcement errors are
+    # surfaced to the worker as a failed critical stage.
+    stats['processing_success'] = not bool(stats['errors'])
     return stats
 
 # ==============================================================================
 #  RESTRICTED TIMERANGE — Restricted Dates FIRST, then Restricted Days
 # ==============================================================================
-def restricted_timerange_db(inv_db_id=None, jobs=None):
+def restricted_timerange(inv_db_id=None, jobs=None):
     print(f"\n{'='*10} ⏰ PROGRAMME RESTRICTED TIMERANGE {'='*10}")
 
     if jobs is None:
@@ -3557,6 +3546,12 @@ def restricted_timerange_db(inv_db_id=None, jobs=None):
     programme_ids_all = [p['programme_id'] for p in programmes]
     meta_map  = fetch_programmes_metadata_batch(programme_ids_all)
     restr_map = fetch_programme_restrictions_batch(programme_ids_all)
+    missing_meta_ids = [int(pid) for pid in programme_ids_all if int(pid) not in meta_map]
+    if missing_meta_ids:
+        raise RuntimeError(
+            'restricted timerange could not verify programme metadata for id(s): '
+            + ', '.join(str(pid) for pid in missing_meta_ids)
+        )
 
     # BATCH owner emails for every programme on this VPS (1 query).
     owner_ids = list({p['userid'] for p in programmes if p.get('userid')})
@@ -4010,7 +4005,7 @@ def restricted_timerange_db(inv_db_id=None, jobs=None):
 # ==============================================================================
 #  RECENT HIGHEST BALANCE TARGET — DB-driven, programme-scoped
 # ==============================================================================
-def recent_highest_balance_revenue_target_db(inv_db_id=None, jobs=None):
+def recent_highest_balance_revenue_target(inv_db_id=None, jobs=None):
     """
     DB-driven recent_highest_balance tracker + daily_target_revenue writer.
 
@@ -4172,7 +4167,31 @@ def recent_highest_balance_revenue_target_db(inv_db_id=None, jobs=None):
             sql, [balance, date_str, investor_id, sub_account_id],
             timeout=15.0, quiet=True,
         )
-        return ok and affected >= 0
+        if not ok:
+            stats["errors"].append(
+                f"harvhub recent-highest-balance/date write failed for {investor_id}/{sub_account_id}: {msg}"
+            )
+            return False
+        verify_rows, verify_error = _strict_db_rows(
+            "SELECT recent_highest_balance, recent_highest_balance_last_update "
+            "FROM harvhub WHERE id = %s AND sub_account_id = %s LIMIT 1",
+            [investor_id, sub_account_id], timeout=15.0,
+        )
+        if verify_error or not verify_rows:
+            stats["errors"].append(
+                f"harvhub recent-highest-balance/date read-back failed for {investor_id}/{sub_account_id}: "
+                f"{verify_error or 'row not found'}"
+            )
+            return False
+        saved_balance = _coerce_float(_raw_first_key(verify_rows[0], 'recent_highest_balance'), default=None)
+        saved_date = str(_raw_first_key(verify_rows[0], 'recent_highest_balance_last_update') or '')[:10]
+        if saved_balance is None or abs(saved_balance - float(balance)) > 0.011 or saved_date != str(date_str)[:10]:
+            stats["errors"].append(
+                f"harvhub recent-highest-balance/date read-back mismatch for {investor_id}/{sub_account_id}: "
+                f"expected {float(balance):.2f}/{str(date_str)[:10]}, got {saved_balance}/{saved_date}"
+            )
+            return False
+        return True
 
     def db_write_recent_balance_balance_only(investor_id, sub_account_id, balance):
         sql = """
@@ -4185,13 +4204,34 @@ def recent_highest_balance_revenue_target_db(inv_db_id=None, jobs=None):
             sql, [balance, investor_id, sub_account_id],
             timeout=15.0, quiet=True,
         )
-        return ok
+        if not ok:
+            stats["errors"].append(
+                f"harvhub recent-highest-balance write failed for {investor_id}/{sub_account_id}: {msg}"
+            )
+            return False
+        verify_rows, verify_error = _strict_db_rows(
+            "SELECT recent_highest_balance FROM harvhub "
+            "WHERE id = %s AND sub_account_id = %s LIMIT 1",
+            [investor_id, sub_account_id], timeout=15.0,
+        )
+        saved_balance = (
+            _coerce_float(_raw_first_key(verify_rows[0], 'recent_highest_balance'), default=None)
+            if verify_rows else None
+        )
+        if verify_error or saved_balance is None or abs(saved_balance - float(balance)) > 0.011:
+            stats["errors"].append(
+                f"harvhub recent-highest-balance read-back failed for {investor_id}/{sub_account_id}: "
+                f"{verify_error or f'expected {float(balance):.2f}, got {saved_balance}'}"
+            )
+            return False
+        return True
 
     def db_fetch_revenue_target_config_for_programme(programme_id):
         rows = db_fetch_all(
             """
             SELECT week_no, day_name, from_balance, to_balance,
-                   target_amount, pre_pending_sum, include_missed_days,
+                   target_amount, pre_pending_sum,
+                   include_target_as_debt_if_missed AS include_missed_days,
                    target_daily_profit, include_current_day_as_owed,
                    loss_streak_chances, revenue_target_period
               FROM programme_revenue_target
@@ -4253,7 +4293,7 @@ def recent_highest_balance_revenue_target_db(inv_db_id=None, jobs=None):
                                    daily_target_owed=None,
                                    daily_target_owed_day_balance=None,
                                    daily_target_owed_date=None):
-        existing = db_fetch_one(
+        existing_rows, existing_error = _strict_db_rows(
             """
             SELECT id FROM daily_target_revenue
              WHERE userid = %s
@@ -4264,8 +4304,14 @@ def recent_highest_balance_revenue_target_db(inv_db_id=None, jobs=None):
              LIMIT 1
             """,
             [userid, sub_account_id, week_label, day_label, date_str],
-            timeout=10.0, quiet=True,
+            timeout=10.0,
         )
+        if existing_error:
+            stats["errors"].append(
+                f"daily_target_revenue lookup failed for {userid}/{sub_account_id}/{date_str}: {existing_error}"
+            )
+            return False
+        existing = existing_rows[0] if existing_rows else None
         if existing and _raw_first_key(existing, 'id'):
             row_id = _coerce_int(_raw_first_key(existing, 'id'))
             ok, _, msg = db_execute(
@@ -5713,6 +5759,13 @@ def recent_highest_balance_revenue_target_db(inv_db_id=None, jobs=None):
                         print(f"       ⬅️ Counted toward pre-pending sum: ${target:.2f}")
 
         rows_written = 0
+        rows_attempted = sum(len(week_data) for week_data in weekly_targets.values())
+        expected_daily_report_dates = sorted({
+            str(day_data.get('date') or '')[:10]
+            for week_data in weekly_targets.values()
+            for day_data in week_data.values()
+            if day_data.get('date')
+        })
         for week_key, week_data in weekly_targets.items():
             for day_name, day_data in week_data.items():
                 status = day_data['status']
@@ -5739,6 +5792,65 @@ def recent_highest_balance_revenue_target_db(inv_db_id=None, jobs=None):
                     rows_written += 1
 
         stats["daily_target_rows_written"] += rows_written
+        if rows_written != rows_attempted:
+            stats["errors"].append(
+                f"daily_target_revenue persistence incomplete for {inv_db_id_db}/{sub_id_db}: "
+                f"{rows_written}/{rows_attempted} daily report rows saved"
+            )
+
+        # Read the committed daily report dates and latest owed-debt handoff back
+        # from MySQL before allowing Recovery Generator to consume them.
+        if expected_daily_report_dates:
+            report_start = expected_daily_report_dates[0]
+            report_end = expected_daily_report_dates[-1]
+            persisted_date_rows, date_read_error = _strict_db_rows(
+                "SELECT DISTINCT DATE_FORMAT(`date`, '%Y-%m-%d') AS report_date "
+                "FROM daily_target_revenue "
+                "WHERE userid = %s AND sub_account_id = %s "
+                "AND `date` >= %s AND `date` <= %s",
+                [inv_db_id_db, sub_id_db, report_start, report_end], timeout=15.0,
+            )
+            persisted_dates = {
+                str(_raw_first_key(row, 'report_date') or '')[:10]
+                for row in (persisted_date_rows or [])
+            }
+            missing_dates = sorted(set(expected_daily_report_dates) - persisted_dates)
+            if date_read_error or missing_dates:
+                stats["errors"].append(
+                    f"daily_target_revenue read-back verification failed for {inv_db_id_db}/{sub_id_db}: "
+                    f"{date_read_error or ('missing dates ' + ', '.join(missing_dates))}"
+                )
+
+        handoff_rows, handoff_error = _strict_db_rows(
+            "SELECT daily_target_owed, daily_target_owed_day_balance, daily_target_owed_date "
+            "FROM daily_target_revenue WHERE userid = %s AND sub_account_id = %s "
+            "ORDER BY updated_at DESC, id DESC LIMIT 1",
+            [inv_db_id_db, sub_id_db], timeout=15.0,
+        )
+        if handoff_error or not handoff_rows:
+            stats["errors"].append(
+                f"daily_target_revenue handoff read-back failed for {inv_db_id_db}/{sub_id_db}: "
+                f"{handoff_error or 'no persisted daily target row'}"
+            )
+        else:
+            saved_handoff = handoff_rows[0]
+            saved_owed = _coerce_float(_raw_first_key(saved_handoff, 'daily_target_owed'), default=None)
+            saved_balance = _coerce_float(_raw_first_key(saved_handoff, 'daily_target_owed_day_balance'), default=None)
+            saved_date_raw = _raw_first_key(saved_handoff, 'daily_target_owed_date')
+            saved_date = str(saved_date_raw)[:10] if saved_date_raw not in (None, '') else ''
+            handoff_matches = (
+                saved_owed is not None and abs(saved_owed - daily_target_owed_value) <= 0.011
+                and ((saved_balance is None and owed_day_balance_value is None)
+                     or (saved_balance is not None and owed_day_balance_value is not None
+                         and abs(saved_balance - float(owed_day_balance_value)) <= 0.011))
+                and saved_date == (str(owed_date_value)[:10] if owed_date_value else '')
+            )
+            if not handoff_matches:
+                stats["errors"].append(
+                    f"daily_target_revenue owed handoff mismatch for {inv_db_id_db}/{sub_id_db}: "
+                    f"expected owed={daily_target_owed_value}, balance={owed_day_balance_value}, date={owed_date_value or None}; "
+                    f"saved owed={saved_owed}, balance={saved_balance}, date={saved_date_raw}"
+                )
 
         print(f"\n  💾 Daily target met updated to {username} sub account {sub_id_db}: "
               f"{rows_written} row(s) written to daily_target_revenue")
@@ -5935,7 +6047,15 @@ def recent_highest_balance_revenue_target_db(inv_db_id=None, jobs=None):
 
     print(f"{'='*10} 🏁 COMPLETE {'='*10}\n")
 
-    stats["processing_success"] = True
+    # A skipped active investor means Recovery Generator could otherwise read
+    # stale Revenue Target state. No skipped investor or DB persistence error is
+    # allowed to pass the dependency gate.
+    if stats.get("investors_skipped", 0) > 0 and not stats.get("errors"):
+        stats["errors"].append(
+            f"Revenue Target skipped {stats['investors_skipped']} investor(s); "
+            "fresh balance/target state was not confirmed for every job"
+        )
+    stats["processing_success"] = not bool(stats["errors"])
     return stats
 
 
@@ -5976,20 +6096,23 @@ def run_stages_sequential(stages, **common_kwargs):
 #  RESTRICTION GATE HELPERS
 # ==============================================================================
 def _programme_restriction_verdict(timerange_stats, programme_id):
-    """
-    Extract the restriction verdict for a specific programme from the
-    result of restricted_timerange_db(). Returns {} if the programme was not
-    classified (treated as "not restricted").
-    """
+    """Return the classified restriction verdict for the current programme."""
     if not isinstance(timerange_stats, dict):
         return {}
     rmap = timerange_stats.get('restriction_map') or {}
     if not isinstance(rmap, dict):
         return {}
-    verdict = rmap.get(programme_id)
-    if not isinstance(verdict, dict):
-        return {}
-    return verdict
+    candidates = [programme_id]
+    parsed = _coerce_int(programme_id)
+    if parsed is not None:
+        candidates.extend([parsed, str(parsed)])
+    else:
+        candidates.append(str(programme_id))
+    for key in candidates:
+        verdict = rmap.get(key)
+        if isinstance(verdict, dict):
+            return verdict
+    return {}
 
 
 def _restriction_skip_banner(inv_db_id, sub_id, programme_id, programme_name,
@@ -6012,7 +6135,7 @@ def _restriction_skip_banner(inv_db_id, sub_id, programme_id, programme_name,
         print(f"           📅 Day: {day_name}")
     if window_desc:
         print(f"           🕐 Window: {window_desc}")
-    print(f"           ⏭️  Skipping recent_highest_balance_revenue_target_db and every "
+    print(f"           ⏭️  Skipping recent_highest_balance_revenue_target and every "
           f"future stage — no trade activity allowed right now.")
 
 
@@ -6075,7 +6198,7 @@ def _revenue_target_alarm_banner(inv_db_id, sub_id, programme_id, programme_name
 #
 #  stoploss_factor semantics: unchanged — risk = target.
 # ==============================================================================
-def recovery_generator_system_db(inv_db_id=None, jobs=None):
+def recovery_generator_system(inv_db_id=None, jobs=None):
     global recovery_generator_alert
     from datetime import datetime, timedelta, timezone
 
@@ -6132,28 +6255,17 @@ def recovery_generator_system_db(inv_db_id=None, jobs=None):
         'details': [],
     }
 
-    # The stage is invoked immediately after Revenue Target. Respect its alarm
-    # before touching trade rows, then preserve the old audit -> sizing -> recovery
-    # dependency order inside this stage so no later sizing pass overwrites volumes.
+    # This function is deliberately invoked immediately after the Revenue Target
+    # stage. Authorization auditing and investor symbol sizing are mandatory
+    # upstream worker stages; they are NOT repeated here. This keeps Recovery
+    # Generator next in sequence and prevents either prerequisite from being
+    # skipped by the Revenue Target alarm gate.
     revenue_alert = recent_highest_alert or {}
     if revenue_alert.get('is_triggered'):
         stats['processing_success'] = True
         stats['skipped'] = True
         stats['skip_reason'] = 'revenue_target_alarm_active'
         print("  🔇 Recovery Generator skipped because Revenue Target alarm is active.")
-        return stats
-
-    try:
-        stats['authorization_audit'] = check_and_record_unauthorized_actions_db(
-            inv_db_id=inv_db_id, jobs=jobs,
-        )
-        stats['investor_order_sizing'] = calculate_investor_symbols_orders_db(
-            inv_db_id=inv_db_id, jobs=jobs,
-        )
-    except Exception as prerequisite_error:
-        stats['errors'].append(f"Recovery prerequisites failed: {prerequisite_error}")
-        print(f"  ❌ Recovery Generator prerequisite failure: {prerequisite_error}")
-        stats['processing_success'] = False
         return stats
 
     # ==================================================================
@@ -7911,7 +8023,9 @@ def recovery_generator_system_db(inv_db_id=None, jobs=None):
         print(f"     • {e}")
     print(f"{'='*10} 🏁 COMPLETE {'='*10}\n")
 
-    stats['processing_success'] = True
+    stats['processing_success'] = not bool(stats['errors'])
+    if not stats['processing_success']:
+        recovery_generator_alert['errors'] = list(stats['errors'])
     return stats
 
 # ==============================================================================
@@ -8016,7 +8130,7 @@ def _validate_single_order_margin_for_calc(order, side, desired_volume, buffer_p
 #
 #  NO files, NO JSON, NO local folders. Pure DB.
 # ==============================================================================
-def calculate_investor_symbols_orders_db(inv_db_id=None, jobs=None):
+def calculate_investor_symbols_orders(inv_db_id=None, jobs=None):
     print(f"\n{'='*10} 📐 CALCULATE INVESTOR SYMBOLS ORDERS (DB) {'='*10}")
 
     stats = {
@@ -8362,7 +8476,7 @@ def calculate_investor_symbols_orders_db(inv_db_id=None, jobs=None):
 
         # ------------------------------------------------------------------
         # ACTIONABLE ROWS
-        # Same predicate as place_usd_orders_db, chunk, recovery_generator:
+        # Same predicate as place_usd_orders, chunk, recovery_generator:
         #   orderstatus = 'pending'  OR  IS NULL  OR  = ''
         # ------------------------------------------------------------------
         start_row = db_fetch_one(
@@ -8402,7 +8516,7 @@ def calculate_investor_symbols_orders_db(inv_db_id=None, jobs=None):
                 continue
 
             try:
-                db_execute(
+                sync_ok, _, sync_msg = db_execute(
                     """
                     UPDATE programme_trades
                        SET interest_risk_reward      = %s,
@@ -8412,9 +8526,18 @@ def calculate_investor_symbols_orders_db(inv_db_id=None, jobs=None):
                     [cfg['rr_value'], cfg['rr_type_raw'], row_id],
                     timeout=10.0, quiet=True,
                 )
-                stats['rows_synced_only'] += 1
-            except Exception:
-                pass
+                if sync_ok:
+                    stats['rows_synced_only'] += 1
+                else:
+                    stats['errors'].append(
+                        f"row {row_id}: risk/reward configuration sync failed: {sync_msg}"
+                    )
+                    print(f"  │ ❌ row {row_id}: risk/reward configuration sync failed: {sync_msg}")
+                    continue
+            except Exception as sync_exc:
+                stats['errors'].append(f"row {row_id}: risk/reward configuration sync exception: {sync_exc}")
+                print(f"  │ ❌ row {row_id}: risk/reward configuration sync exception: {sync_exc}")
+                continue
 
             if not sym or entry is None or sl is None:
                 stats['rows_skipped'] += 1
@@ -8606,7 +8729,7 @@ def calculate_investor_symbols_orders_db(inv_db_id=None, jobs=None):
         print(f"     • {e}")
     print(f"{'='*10} 🏁 COMPLETE {'='*10}\n")
 
-    stats['processing_success'] = True
+    stats['processing_success'] = not bool(stats['errors'])
     return stats
 
 # ==============================================================================
@@ -8643,7 +8766,7 @@ def calculate_investor_symbols_orders_db(inv_db_id=None, jobs=None):
 #  * No JSON. No local folders. No MT5 order submission.
 # ==============================================================================
 
-def chunk_orders_with_volume_beyond_max_db(inv_db_id=None, jobs=None):
+def chunk_orders_with_volume_beyond_max(inv_db_id=None, jobs=None):
     """
     DB version of chunk_orders_with_volume_beyond_max_local_version.
 
@@ -9016,7 +9139,7 @@ def chunk_orders_with_volume_beyond_max_db(inv_db_id=None, jobs=None):
 #  NO GRID LOGIC. NO JSON. NO LOCAL FOLDERS.
 # ==============================================================================
 
-def place_usd_orders_db(inv_db_id=None, jobs=None):
+def place_usd_orders(inv_db_id=None, jobs=None):
     """
     Reconciliation-aware DB placer.
 
@@ -10560,7 +10683,7 @@ def place_usd_orders_db(inv_db_id=None, jobs=None):
         # ==================================================================
         # STEP 9 — LEGACY PROGRAMME MODIFY-TRADE DISABLED
         # Explicit programme authority is handled only by the priority
-        # process_programme_order_requests_db() stage and the PHP
+        # process_programme_order_requests() stage and the PHP
         # order_request_status / order_request_filled columns. The legacy
         # modify_trade field is intentionally not executed here.
         # ==================================================================
@@ -10642,7 +10765,7 @@ def place_usd_orders_db(inv_db_id=None, jobs=None):
 #  Magic semantics: order.magic == programme_trades.tradeid (same as the
 #  rest of signals_trading.py).
 # ==============================================================================
-def check_pending_orders_risk_db(inv_db_id=None, jobs=None):
+def check_pending_orders_risk(inv_db_id=None, jobs=None):
     print(f"\n{'='*10} 🛡️ PENDING ORDERS RISK AUDIT (DB) {'='*10}")
 
     stats = {
@@ -11077,7 +11200,7 @@ def check_pending_orders_risk_db(inv_db_id=None, jobs=None):
 #
 #  Aligns live MT5 pending orders AND open positions' TPs to the programme's
 #  R:R configuration, using the SAME classifier semantics as
-#  calculate_investor_symbols_orders_db.
+#  calculate_investor_symbols_orders.
 #
 #  SOURCES
 #  -------
@@ -11102,7 +11225,7 @@ def check_pending_orders_risk_db(inv_db_id=None, jobs=None):
 #    * programme_trades -> takeprofit is NOT touched. The DB is the source of
 #      the ORIGINAL signal; the R:R applied at MT5 is a live correction.
 #
-#  R:R CLASSIFIER (identical to calculate_investor_symbols_orders_db)
+#  R:R CLASSIFIER (identical to calculate_investor_symbols_orders)
 #  ---------------------------------------------------------------
 #    'minimum_risk_reward'   minimum floor
 #        current_rr <  value   -> raise to value (new TP)
@@ -11130,7 +11253,7 @@ def check_pending_orders_risk_db(inv_db_id=None, jobs=None):
 #
 #  No JSON. No local folders. No grid. Magic == programme_trades.tradeid.
 # ==============================================================================
-def orders_reward_correction_db(inv_db_id=None, jobs=None):
+def orders_reward_correction(inv_db_id=None, jobs=None):
     print(f"\n{'='*10} 📐 ORDERS REWARD CORRECTION (DB) {'='*10}")
 
     stats = {
@@ -11373,7 +11496,7 @@ def orders_reward_correction_db(inv_db_id=None, jobs=None):
             return False, f"exception: {e}"
 
     # ------------------------------------------------------------------
-    # R:R classifier (identical semantics to calculate_investor_symbols_orders_db)
+    # R:R classifier (identical semantics to calculate_investor_symbols_orders)
     # ------------------------------------------------------------------
     def _decide_action(current_rr, target_rr, rr_type, direction_valid=True,
                        rr_tolerance=1e-6):
@@ -11884,7 +12007,7 @@ def orders_reward_correction_db(inv_db_id=None, jobs=None):
 #
 #  Note: MT5 preserves our tp as-is; we only push the SL.
 # ==============================================================================
-def apply_dynamic_breakeven_db(inv_db_id=None, jobs=None):
+def apply_dynamic_breakeven(inv_db_id=None, jobs=None):
     print(f"\n{'='*10} 🎯 DYNAMIC BREAKEVEN (DB) {'='*10}")
 
     stats = {
@@ -12386,7 +12509,7 @@ def apply_dynamic_breakeven_db(inv_db_id=None, jobs=None):
 #
 #  No JSON. No local folders. Magic == programme_trades.tradeid.
 # ==============================================================================
-def trades_analytics_db(inv_db_id=None, jobs=None):
+def trades_analytics(inv_db_id=None, jobs=None):
     print(f"\n{'='*10} 📊 TRADES ANALYTICS (DB) {'='*10}")
 
     from datetime import datetime, timedelta, timezone
@@ -13117,20 +13240,23 @@ def trades_analytics_db(inv_db_id=None, jobs=None):
 # ==============================================================================
 #  WORKER: one process per investor job (DB-driven)
 #
-#  MIRRORS process_single_investor_from_db_local ROUTING, BUT DB-ONLY.
+#  MIRRORS process_single_investor_testlocal ROUTING, BUT DB-ONLY.
 #
-#  Gate order (matches the local file's conditional routing):
-#    1. restricted_timerange_db  -> if restricted, skip everything else.
-#    2. recent_highest_balance_revenue_target_db -> populates recent_highest_alert.
+#  Gate order:
+#    1. restricted_timerange -> if restricted, abort every later operation.
+#    2. check_and_record_unauthorized_actions -> authorization + balance_log audit.
+#    3. calculate_investor_symbols_orders -> programme trade sizing / R:R sync.
+#    4. recent_highest_balance_revenue_target -> persists recent high + daily target handoff.
+#    5. recovery_generator_system -> immediately after the Revenue Target commit.
 #    3. If recent_highest_alert['is_triggered'] -> skip every future
 #       trading stage (local file deletes open orders/positions at this
 #       point; the DB orchestrator will do the same once that stage is
 #       ported, via a DB-driven delete function).
 # ==============================================================================
-def process_single_investor_from_db_(job):
+def process_single_investor_test(job):
     """
     SOLO TEST PATH — runs:
-        1. place_usd_orders_db(inv_db_id=..., jobs=...)
+        1. place_usd_orders(inv_db_id=..., jobs=...)
 
     No restriction gate, no alarm gate, no cleanup, no grid.
     The parent's job is reused directly — no re-discovery.
@@ -13222,12 +13348,12 @@ def process_single_investor_from_db_(job):
         _cached_jobs = [job]
 
         place_stats = run_stage(
-            'place_usd_orders_db',
-            place_usd_orders_db,
+            'place_usd_orders',
+            place_usd_orders,
             inv_db_id=inv_db_id,
             jobs=_cached_jobs,
         )
-        account_stats['stages']['place_usd_orders_db'] = place_stats
+        account_stats['stages']['place_usd_orders'] = place_stats
         account_stats['place_stats'] = place_stats
 
         account_stats['success'] = True
@@ -14115,7 +14241,7 @@ def _pt_request_record_preconnect_failure(job, reason):
         print(f"  [REQUEST] Could not persist pre-connect retry reason: {exc}")
         return 0
 
-def process_programme_order_requests_db(inv_db_id=None, jobs=None):
+def process_programme_order_requests(inv_db_id=None, jobs=None):
     """Execute only the explicit programme manual-request fields on this investor's MT5 account.
 
     Parent programme_trades rows are the request source; the investor-specific
@@ -14597,24 +14723,32 @@ def process_programme_order_requests_db(inv_db_id=None, jobs=None):
 
     return stats
 
-def process_single_investor_from_db(job):
+def process_single_investor_from(job):
     """
-    DB version of process_single_investor_local().
+    Worker execution order:
+        preflight: VPS job identity / active programme contract
+        Stage 1: restricted_timerange — before MT5 path resolution/connection;
+                 restricted means immediate return without executing Stage 2 or later
+        next preflight: resolve MT5 terminal, connect, verify investor identity
+        Stage 2: check_and_record_unauthorized_actions
+        Stage 3: calculate_investor_symbols_orders
+        Stage 4: recent_highest_balance_revenue_target (persist + verify)
+        Stage 5: recovery_generator_system (immediately after Stage 4)
+        then: explicit manual programme close/breakeven requests
+        then: Revenue Target alarm gate
+        then, only when permitted:
+            chunk_orders_with_volume_beyond_max
+            place_usd_orders
+            check_pending_orders_risk
+            orders_reward_correction
+            apply_dynamic_breakeven
+            trades_analytics
 
-    Stage order:
-        programme-requested MT5 Breakeven / Close commands (priority stage)
-        gate 1 (restriction)
-        Revenue Target calculation
-        Recovery Generator (immediately after Revenue Target; internally runs
-        the authorization audit and investor risk-sizing prerequisites)
-        Revenue Target alarm gate
-        if not alarmed:
-            chunk_orders_with_volume_beyond_max_db
-            place_usd_orders_db
-            check_pending_orders_risk_db
-            orders_reward_correction_db
-            apply_dynamic_breakeven_db
-            trades_analytics_db
+    Stage 1 is evaluated before MT5 terminal resolution/connection and every
+    trading, audit, sizing, Revenue Target, Recovery Generator, and manual-request stage.
+    A restricted verdict aborts all Stage 2+ activity. An unavailable or
+    incomplete restriction verdict also blocks the worker fail-closed.
+    Critical Stage 2/3/4 failures prevent dependent later stages from running.
 
     The parent already did discovery — we reuse its job list verbatim
     instead of re-running fetch_vps_investor_jobs() (which has been
@@ -14673,9 +14807,82 @@ def process_single_investor_from_db(job):
     }
 
     _worker_init()
+    _cached_jobs = [job]
+
+    # ==================================================================
+    # STAGE 1 — RESTRICTED TIMERANGE (ABSOLUTE PRIORITY)
+    # This check requires only the programme/job data and database bridge.
+    # Run it before terminal-path resolution or MT5 connection so a restricted
+    # programme performs no Stage 2+ work and does not connect to a trade account.
+    # ==================================================================
+    timerange_stats = run_stage(
+        'restricted_timerange',
+        restricted_timerange,
+        inv_db_id=inv_db_id,
+        jobs=_cached_jobs,
+    )
+    account_stats['stages']['restricted_timerange'] = timerange_stats
+    account_stats['restricted_timerange_stats'] = timerange_stats
+
+    if not timerange_stats.get('processing_success'):
+        account_stats['success'] = False
+        account_stats['error'] = (
+            'restricted_timerange_check_failed; all subsequent operations '
+            'blocked fail-closed'
+        )
+        print("  🛑 Stage 1 restriction verification failed. "
+              "All Stage 2+ operations are aborted.")
+        try:
+            if _db is not None:
+                _db.release_channel()
+        except Exception:
+            pass
+        return account_stats
+
+    verdict = _programme_restriction_verdict(timerange_stats, programme_id)
+    if 'is_restricted' not in verdict:
+        account_stats['success'] = False
+        account_stats['error'] = (
+            'restricted_timerange_verdict_missing; all subsequent operations '
+            'blocked fail-closed'
+        )
+        print("  🛑 Stage 1 did not return a verdict for this programme. "
+              "All Stage 2+ operations are aborted.")
+        try:
+            if _db is not None:
+                _db.release_channel()
+        except Exception:
+            pass
+        return account_stats
+
+    if bool(verdict.get('is_restricted')):
+        _restriction_skip_banner(
+            inv_db_id=inv_db_id,
+            sub_id=sub_id,
+            programme_id=programme_id,
+            programme_name=programme_name,
+            verdict=verdict,
+        )
+        account_stats['restricted'] = True
+        account_stats['restricted_kind'] = verdict.get('kind')
+        account_stats['restricted_window'] = verdict.get('window_desc')
+        account_stats['restricted_day'] = verdict.get('day_name')
+        account_stats['success'] = True
+        account_stats['aborted_after_stage_1'] = True
+        account_stats['skip_reason'] = 'restricted_timerange_active'
+        print("  ⛔ Stage 1 restriction is active. No Stage 2 or later function "
+              "will execute and MT5 will not be connected for this investor in this cycle.")
+        try:
+            if _db is not None:
+                _db.release_channel()
+        except Exception:
+            pass
+        return account_stats
+
+    account_stats['restricted'] = False
 
     # ------------------------------------------------------------------
-    # MT5 PATH RESOLUTION — must succeed, else skip investor entirely
+    # MT5 PATH RESOLUTION — only after Stage 1 confirms the programme is free
     # ------------------------------------------------------------------
     terminal_path = resolve_investor_terminal_path(inv_db_id, sub_id)
 
@@ -14746,19 +14953,7 @@ def process_single_investor_from_db(job):
         return account_stats
 
     try:
-        # ==================================================================
-        # JOB LIST — use the parent's programme-VPS-scoped job unchanged.
-        # The parent discovers programme owner/follower bindings from
-        # programme_vps + active programme_vps_hosts_followers rows, then
-        # discovers actual investor jobs from LIVE pending/running investor
-        # copies in programme_trades. The worker must not broaden that scope
-        # with account-VPS rows or revenue-deal contract-status checks.
-        # ==================================================================
-        _cached_jobs = [job]
-
-        # ==================================================================
-        # ACCOUNT INFO / TYPE
-        # ==================================================================
+        # Account metadata is read only after Stage 1 has cleared the restriction gate.
         try:
             acc = mt5_account_info()
             if acc is not None:
@@ -14771,76 +14966,118 @@ def process_single_investor_from_db(job):
             print(f"[{inv_db_id}] ⚠️ account_info failed: {acc_err}")
 
         # ==================================================================
-        # MANUAL PROGRAMME REQUESTS — PRIORITY EXECUTION STAGE
-        # This deliberately runs BEFORE restricted-timerange and revenue-target
-        # gates. Programme close/breakeven commands must reach each connected
-        # investor subaccount even when normal new-trade activity is restricted.
-        # It does not read programme_training_configuration. Unfilled failures
-        # remain queued with a reason and are retried on the next loop.
+        # STAGE 2 — AUTHORIZATION / UNAUTHORIZED-ACTION AUDIT
+        # Runs only after Stage 1 has cleared the programme for this cycle.
+        # It must finish its MT5 enforcement and balance_log persistence before
+        # the next calculation stage is allowed to start.
         # ==================================================================
-        manual_request_stats = run_stage(
-            'process_programme_order_requests_db',
-            process_programme_order_requests_db,
+        audit_stats = run_stage(
+            'check_and_record_unauthorized_actions',
+            check_and_record_unauthorized_actions,
             inv_db_id=inv_db_id,
             jobs=_cached_jobs,
         )
-        account_stats['stages']['process_programme_order_requests_db'] = manual_request_stats
-        account_stats['programme_order_request_stats'] = manual_request_stats
+        account_stats['stages']['check_and_record_unauthorized_actions'] = audit_stats
+        account_stats['authorization_audit_stats'] = audit_stats
+        account_stats['unauthorized_hit'] = bool((unauthorized_alert or {}).get('is_triggered'))
+        account_stats['unauthorized_types'] = list((unauthorized_alert or {}).get('unauthorized_types') or [])
 
-        # ==================================================================
-        # GATE 1 — RESTRICTED TIMERANGE
-        # ==================================================================
-        timerange_stats = run_stage(
-            'restricted_timerange_db',
-            restricted_timerange_db,
-            inv_db_id=inv_db_id,
-            jobs=_cached_jobs,
-        )
-        account_stats['stages']['restricted_timerange_db'] = timerange_stats
-        account_stats['restricted_timerange_db_stats'] = timerange_stats
-
-        verdict = _programme_restriction_verdict(timerange_stats, programme_id)
-        is_restricted_now = bool(verdict.get('is_restricted'))
-
-        if is_restricted_now:
-            _restriction_skip_banner(
-                inv_db_id=inv_db_id,
-                sub_id=sub_id,
-                programme_id=programme_id,
-                programme_name=programme_name,
-                verdict=verdict,
-            )
-
-            account_stats['restricted'] = True
-            account_stats['restricted_kind'] = verdict.get('kind')
-            account_stats['restricted_window'] = verdict.get('window_desc')
-            account_stats['restricted_day'] = verdict.get('day_name')
-            account_stats['success'] = True
+        if not audit_stats.get('processing_success'):
+            account_stats['success'] = False
+            account_stats['error'] = 'authorization audit failed; all subsequent order activities blocked'
+            print("  🛑 Stage 2 audit did not complete successfully. "
+                  "Stages 3+ are aborted.")
             return account_stats
 
-        account_stats['restricted'] = False
+        # ==================================================================
+        # STAGE 3 — INVESTOR SYMBOL / R:R / VOLUME CALCULATION
+        # Complete synchronous programme_trades DB updates before proceeding.
+        # ==================================================================
+        symbol_calc_stats = run_stage(
+            'calculate_investor_symbols_orders',
+            calculate_investor_symbols_orders,
+            inv_db_id=inv_db_id,
+            jobs=_cached_jobs,
+        )
+        account_stats['stages']['calculate_investor_symbols_orders'] = symbol_calc_stats
+        account_stats['investor_symbol_calculation_stats'] = symbol_calc_stats
+
+        if not symbol_calc_stats.get('processing_success'):
+            account_stats['success'] = False
+            account_stats['error'] = 'investor symbol calculation failed; Revenue Target and all subsequent order activities blocked'
+            print("  🛑 Stage 3 investor symbol calculation failed. "
+                  "Stages 4+ are aborted.")
+            return account_stats
 
         # ==================================================================
-        # GATE 2 — RECENT HIGHEST BALANCE TARGET + DAILY-TARGET ALARM
+        # STAGE 4 — REVENUE TARGET
+        # Persists recent_highest_balance and the daily Revenue Target handoff.
+        # Recovery Generator is forbidden from running until the stage confirms
+        # successful DB persistence/read-back for all relevant investor jobs.
         # ==================================================================
         recent_balance_stats = run_stage(
-            'recent_highest_balance_revenue_target_db',
-            recent_highest_balance_revenue_target_db,
+            'recent_highest_balance_revenue_target',
+            recent_highest_balance_revenue_target,
             inv_db_id=inv_db_id,
             jobs=_cached_jobs,
         )
-        account_stats['stages']['recent_highest_balance_revenue_target_db'] = recent_balance_stats
+        account_stats['stages']['recent_highest_balance_revenue_target'] = recent_balance_stats
         account_stats['recent_highest_balance_stats'] = recent_balance_stats
 
+        if not recent_balance_stats.get('processing_success'):
+            account_stats['success'] = False
+            account_stats['error'] = (
+                'Revenue Target DB persistence/verification failed; '
+                'Recovery Generator and normal trading blocked'
+            )
+            print("  🛑 Stage 4 did not confirm Revenue Target database updates. "
+                  "Recovery Generator will NOT run.")
+            return account_stats
+
+        # ==================================================================
+        # STAGE 5 — RECOVERY GENERATOR (IMMEDIATELY AFTER REVENUE TARGET)
+        # No unrelated stage or DB calculation is placed between Stage 4 and 5.
+        # ==================================================================
         recovery_stats = run_stage(
-            'recovery_generator_system_db',
-            recovery_generator_system_db,
+            'recovery_generator_system',
+            recovery_generator_system,
             inv_db_id=inv_db_id,
             jobs=_cached_jobs,
         )
-        account_stats['stages']['recovery_generator_system_db'] = recovery_stats
+        account_stats['stages']['recovery_generator_system'] = recovery_stats
         account_stats['recovery_generator_stats'] = recovery_stats
 
+        # Explicit programme close/breakeven requests are after the mandatory
+        # safety stages and Revenue Target -> Recovery Generator dependency.
+        manual_request_stats = run_stage(
+            'process_programme_order_requests',
+            process_programme_order_requests,
+            inv_db_id=inv_db_id,
+            jobs=_cached_jobs,
+        )
+        account_stats['stages']['process_programme_order_requests'] = manual_request_stats
+        account_stats['programme_order_request_stats'] = manual_request_stats
+
+        if not recovery_stats.get('processing_success'):
+            account_stats['success'] = False
+            account_stats['error'] = 'Recovery Generator failed; normal automated trading blocked'
+            print("  🛑 Stage 5 Recovery Generator failed. "
+                  "Normal automated order processing is blocked.")
+            return account_stats
+
+        if not manual_request_stats.get('processing_success'):
+            account_stats['success'] = False
+            account_stats['error'] = 'manual programme request stage failed; normal automated trading blocked'
+            print("  🛑 Manual programme request stage failed. "
+                  "Normal automated order processing is blocked.")
+            return account_stats
+
+        # ==================================================================
+        # REVENUE TARGET ALARM GATE
+        # Recovery Generator has already been invoked immediately after Stage 4;
+        # its internal alarm guard prevents recovery actions when target alarm
+        # is active. Explicit manual close/BE requests remain separately handled.
+        # ==================================================================
         alert = recent_highest_alert or {}
         alarm_hit = bool(alert.get('is_triggered'))
 
@@ -14852,7 +15089,6 @@ def process_single_investor_from_db(job):
                 programme_name=programme_name,
                 alert=alert,
             )
-
             account_stats['alarm_hit'] = True
             account_stats['alarm_mode'] = (
                 "PRE-PENDING" if alert.get('pre_pending_enabled') else "DAILY"
@@ -14860,9 +15096,9 @@ def process_single_investor_from_db(job):
             account_stats['alarm_details'] = {
                 'daily_target_owed': alert.get('daily_target_owed'),
                 'pre_pending_total': alert.get('pre_pending_total'),
-                'total_all_debt':    alert.get('total_all_debt'),
-                'effective_today':   alert.get('effective_today'),
-                'action':            alert.get('action'),
+                'total_all_debt': alert.get('total_all_debt'),
+                'effective_today': alert.get('effective_today'),
+                'action': alert.get('action'),
             }
             account_stats['success'] = True
             return account_stats
@@ -14870,7 +15106,7 @@ def process_single_investor_from_db(job):
         account_stats['alarm_hit'] = False
 
         # ==================================================================
-        # CONDITION A — NO RESTRICTIONS: RUN THE FULL TRADING PIPELINE
+        # NO RESTRICTIONS / NO REVENUE ALARM: RUN THE FULL TRADING PIPELINE
         # ==================================================================
         print(f"  ✅ Trading allowed for {inv_db_id}")
 
@@ -14878,81 +15114,73 @@ def process_single_investor_from_db(job):
         # A3. CHUNK ORDERS WITH VOLUME BEYOND MAX
         # ------------------------------------------------------------------
         chunk_stats = run_stage(
-            'chunk_orders_with_volume_beyond_max_db',
-            chunk_orders_with_volume_beyond_max_db,
+            'chunk_orders_with_volume_beyond_max',
+            chunk_orders_with_volume_beyond_max,
             inv_db_id=inv_db_id,
             jobs=_cached_jobs,
         )
-        account_stats['stages']['chunk_orders_with_volume_beyond_max_db'] = chunk_stats
+        account_stats['stages']['chunk_orders_with_volume_beyond_max'] = chunk_stats
         account_stats['chunk_stats'] = chunk_stats
 
         # ------------------------------------------------------------------
         # A5. PLACE USD ORDERS
         # ------------------------------------------------------------------
         place_stats = run_stage(
-            'place_usd_orders_db',
-            place_usd_orders_db,
+            'place_usd_orders',
+            place_usd_orders,
             inv_db_id=inv_db_id,
             jobs=_cached_jobs,
         )
-        account_stats['stages']['place_usd_orders_db'] = place_stats
+        account_stats['stages']['place_usd_orders'] = place_stats
         account_stats['place_stats'] = place_stats
 
         # ------------------------------------------------------------------
         # A6. CHECK PENDING ORDERS RISK
         # ------------------------------------------------------------------
         risk_stats = run_stage(
-            'check_pending_orders_risk_db',
-            check_pending_orders_risk_db,
+            'check_pending_orders_risk',
+            check_pending_orders_risk,
             inv_db_id=inv_db_id,
             jobs=_cached_jobs,
         )
-        account_stats['stages']['check_pending_orders_risk_db'] = risk_stats
+        account_stats['stages']['check_pending_orders_risk'] = risk_stats
         account_stats['pending_risk_stats'] = risk_stats
 
         # ------------------------------------------------------------------
         # A7. ORDERS REWARD CORRECTION
         # ------------------------------------------------------------------
         reward_stats = run_stage(
-            'orders_reward_correction_db',
-            orders_reward_correction_db,
+            'orders_reward_correction',
+            orders_reward_correction,
             inv_db_id=inv_db_id,
             jobs=_cached_jobs,
         )
-        account_stats['stages']['orders_reward_correction_db'] = reward_stats
+        account_stats['stages']['orders_reward_correction'] = reward_stats
         account_stats['reward_correction_stats'] = reward_stats
 
         # ------------------------------------------------------------------
         # A8. APPLY DYNAMIC BREAKEVEN
         # ------------------------------------------------------------------
         breakeven_stats = run_stage(
-            'apply_dynamic_breakeven_db',
-            apply_dynamic_breakeven_db,
+            'apply_dynamic_breakeven',
+            apply_dynamic_breakeven,
             inv_db_id=inv_db_id,
             jobs=_cached_jobs,
         )
-        account_stats['stages']['apply_dynamic_breakeven_db'] = breakeven_stats
+        account_stats['stages']['apply_dynamic_breakeven'] = breakeven_stats
         account_stats['breakeven_stats'] = breakeven_stats
 
         # ------------------------------------------------------------------
-        # A9. TRADES ANALYTICS DB
+        # A9. TRADES ANALYTICS
         # ------------------------------------------------------------------
         analytics_stats = run_stage(
-            'trades_analytics_db',
-            trades_analytics_db,
+            'trades_analytics',
+            trades_analytics,
             inv_db_id=inv_db_id,
             jobs=_cached_jobs,
         )
-        account_stats['stages']['trades_analytics_db'] = analytics_stats
+        account_stats['stages']['trades_analytics'] = analytics_stats
         account_stats['analytics_stats'] = analytics_stats
-
-        ua = unauthorized_alert or {}
-        account_stats['unauthorized_hit'] = bool(ua.get('is_triggered'))
-        account_stats['unauthorized_types'] = list(ua.get('unauthorized_types') or [])
-
-        account_stats['success'] = True
-        print(f"[SUCCESS] Finished full pipeline execution context for "
-              f"Investor {inv_db_id} ({account_stats['account_mode']})")
 
     except Exception as e:
         print(f"[CRITICAL ERROR] investor={inv_db_id}: {e}")
@@ -15066,7 +15294,7 @@ def main_loop():
 
                 t0 = time.time()
                 async_jobs = [
-                    pool.apply_async(process_single_investor_from_db, args=(job,))
+                    pool.apply_async(process_single_investor_from, args=(job,))
                     for job in jobs
                 ]
 
