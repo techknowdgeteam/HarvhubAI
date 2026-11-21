@@ -69,39 +69,3 @@ The standalone `HarvHubAI.vbs` checks for a compatible 64-bit Python/Tkinter run
 ## MetaTrader 5 setup recovery
 
 HarvHub AI launches the signed official MetaQuotes installer using its documented `/auto` and `/path` switches. It verifies the actual `mt5\MetaTrader 5\terminal64.exe` output instead of relying only on the installer exit code. If the automatic install does not create that file, the official interactive installer opens and asks the user to choose the exact HarvHub AI MT5 template folder.
-
-
-## Normal launch without an elevation prompt
-
-The desktop EXE is built without PyInstaller's `--uac-admin` option, so it uses
-the normal current-user execution level. The VBS launcher and manager do not
-automatically relaunch themselves with `runas`. Opening HarvHub AI therefore
-runs in the signed-in Windows user's security context and does not request
-administrator permission merely to display the application window.
-
-Actual setup/repair operations still check for administrator privileges before
-installing system-wide components or changing protected locations. If Windows
-denies access during those operations, run the explicit setup/repair operation
-with administrator rights. UAC cannot be silently approved by an unsigned app.
-
-
-## Applying this source update
-
-1. Replace these four project-root files in the HarvHub AI GitHub repository:
-   `HarvHubAI.vbs`, `Build_HarvHubProgram.vbs`,
-   `Build_HarvHubProgram.pyw`, and `harvcore_manager.py`.
-2. Also replace the same files in your local HarvHub source/project folder.
-3. Run the updated `HarvHubAI.vbs` to download the updated project and rebuild
-   the Windows desktop executable.
-4. The newly built `release\HarvHubAI.exe` is the executable that must be
-   installed/used by the Desktop and Start Menu shortcuts.
-
-The currently supplied `HarvHubAI.exe` was built with the old
-`--uac-admin` setting. It will continue to request elevation until it is
-replaced by a newly built executable. This source ZIP intentionally does not
-include that old EXE.
-
-This patch addresses the UAC dialog that says an app from an **unknown
-publisher** wants to make changes to the device. It does not suppress a separate
-SmartScreen warning such as **Windows protected your PC**; that warning is a
-different Windows reputation/signing mechanism.

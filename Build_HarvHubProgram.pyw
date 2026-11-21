@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import os
 import queue
@@ -650,7 +651,7 @@ class Builder:
             (APP_DIR / "release").mkdir(exist_ok=True)
             command = [
                 str(BUILD_PYTHON), "-m", "PyInstaller",
-                "--noconfirm", "--clean", "--onefile", "--windowed",
+                "--noconfirm", "--clean", "--onefile", "--windowed", "--uac-admin",
                 "--name", "HarvHubAI",
                 "--collect-data", "certifi",
                 "--distpath", str(APP_DIR / "release"),
@@ -839,18 +840,39 @@ class Builder:
         self.root.destroy()
 
 
-def launch_output_exe() -> None:
-    """Open the built desktop app in the current user's security context."""
+def is_admin() -> bool:
+    if os.name != "nt":
+        return False
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def relaunch_self_as_admin() -> bool:
+    """Elevate the no-console bootstrap before installing to protected paths."""
+    if is_admin():
+        return True
+    try:
+        script = str(Path(__file__).resolve())
+        params = subprocess.list2cmdline([script])
+        result = ctypes.windll.shell32.ShellExecuteW(
+            None, "runas", sys.executable, params, str(APP_DIR), 1
+        )
+        return int(result) > 32
+    except Exception:
+        return False
+
+
+def launch_output_exe_elevated() -> None:
+    """Use ShellExecute so the EXE's requireAdministrator manifest is honoured."""
     if not OUTPUT_EXE.is_file():
         raise FileNotFoundError(f"HarvHubAI.exe was not found: {OUTPUT_EXE}")
-    subprocess.Popen(
-        [str(OUTPUT_EXE)],
-        cwd=str(OUTPUT_EXE.parent),
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        close_fds=True,
+    result = ctypes.windll.shell32.ShellExecuteW(
+        None, "runas", str(OUTPUT_EXE), None, str(OUTPUT_EXE.parent), 1
     )
+    if int(result) <= 32:
+        raise OSError(f"Windows could not launch HarvHub AI (ShellExecute code {int(result)}).")
 
 
 BUNDLED_SOURCE_FILES = (
@@ -1085,9 +1107,14 @@ foreach ($folder in $folders) {
 
 
 def install_current_release_and_launch() -> None:
-    """Install an already-current release EXE, create shortcuts, then open it normally."""
-    install_current_release_files()
-    launch_output_exe()
+    """Install an already-current release EXE, create shortcuts, then open it."""
+    destination = install_current_release_files()
+    install_root = destination.parent
+    result = ctypes.windll.shell32.ShellExecuteW(
+        None, "runas", str(destination), None, str(install_root), 1
+    )
+    if int(result) <= 32:
+        raise OSError(f"Windows could not install/open HarvHub AI (ShellExecute code {int(result)}).")
 
 
 def main():
@@ -1130,14 +1157,21 @@ def main():
     # EXE plus changed HarvHub AI sources. No stale EXE can short-circuit the update.
     if not (install_mode and force_rebuild) and output_is_current():
         if install_mode:
+            if not is_admin():
+                if not relaunch_self_as_admin():
+                    raise RuntimeError("Administrator permission is required to install HarvHub AI.")
+                return
             install_current_release_and_launch()
         else:
-            launch_output_exe()
+            launch_output_exe_elevated()
         return
 
-    # Build and launch in the current user's security context. Do not request
-    # UAC merely to open HarvHub AI. If an installation target is protected,
-    # the builder reports the exact access-denied operation instead.
+    # The progress window transitions directly into HarvCoreManager after build
+    # and installation. Elevate first so all protected paths can be updated.
+    if not is_admin():
+        if not relaunch_self_as_admin():
+            raise RuntimeError("Administrator permission is required to prepare HarvHub AI. Please approve the Windows permission prompt.")
+        return
 
     root = tk.Tk()
     Builder(root)
