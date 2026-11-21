@@ -1,7 +1,6 @@
-#current signals_trading.py
+
 """
-old name programmesignals_trading.py
-current name signals_trading.py
+ signals_trading.py
 Programme-scoped trade pipeline orchestrator.
 
 Runs programme-requested MT5 Breakeven / Close actions first, then the
@@ -20,11 +19,13 @@ ARCHITECTURE
 * Helpers (db_query, _BridgeClient, channel mgmt, time helpers) live at
   MODULE scope so all future functions in this file can share one channel
   per worker.
-* MT5 magic-number alignment is subaccount-aware: magic == programme_trades.tradeid,
-  but authorization also requires the canonical programme trade -> chart identity
-  -> group-aware programme_analytics identity -> exact investor/subaccount copy chain.
-* A magic reused across programmes on the same investor subaccount is ambiguous;
-  programme-specific workers never manage it by guessing.
+* Normal investor-side reconciliation remains subaccount-aware and uses the
+  investor copy's tradeid/magic plus chart identity and programme_analytics groups.
+  This is part of the investor's own execution pipeline, not programme authority.
+* The programme's explicit manual request path selects MT5 tickets primarily
+  by `magic == programme_trades.tradeid`, then verifies exact symbol and BUY/SELL
+  direction. All child tickets sharing that magic are managed; volume and prices
+  are not used as identity fields.
 
 RESTRICTED TIMERANGE SEMANTICS
 ------------------------------
@@ -61,11 +62,35 @@ programme.
 
 ACTIVE INVESTOR DETECTION
 -------------------------
-An investor is considered active for a programme when a row exists in
-`programme_revenue_deals` joined to `harvhub` on
-(investor_id, sub_account_id) with `harvhub.account_contract_status =
-'contract_active'`. This mirrors the signals dashboard exactly. No
-accepted_at / contract_duration date math is performed here.
+VPS eligibility and investor entitlement are separate:
+
+* The programme VPS IP identifies the owner programme and its active
+  programme-VPS followers. Account-VPS tables are not consulted here.
+* An investor/subaccount is eligible only when a `programme_revenue_deals`
+  row associates that exact pair with the programme AND the matching
+  `harvhub.id` + `harvhub.sub_account_id` row has
+  `account_contract_status = 'contract_active'`. This mirrors the PHP investor
+  synchronization rule exactly.
+* The programme VPS IP scopes which programmes can run on this computer; it
+  does not replace or weaken the active investor eligibility check.
+* `programme_trades` remains the sole signal-copy and manual-request authority.
+  An active investor worker can run its own programme account-management stages
+  even before a new inherited signal copy exists.
+* Programme-owned `programme_trades` rows (`investor_id IS NULL`) remain the
+  canonical signal and manual-request source. Investor copies are the
+  account-specific signal records.
+
+PROGRAMME AUTHORITY
+-------------------
+Programme master trades do not control investor sizing or account-management
+stages. The investor pipeline continues to use the programme's own
+`accountmanagement_*` configuration against that investor's MT5 account.
+The programme has a narrow execution authority only through the explicit
+`order_request_status` manual-request fields (`order closing requested`,
+`position closing requested`, `breakeven requested`). Those requests are
+matched by canonical MT5 magic (`programme_trades.tradeid`) and verified by
+symbol/direction. They may affect all child tickets for that signal; volume is
+used only when MT5 requires it to send a close, never to identify a ticket.
 
 PIPELINE ORDER AND GATES
 ------------------------
@@ -771,41 +796,42 @@ def _identity_int_or_zero(value):
 
 
 def fetch_subaccount_magic_catalog(investor_id, sub_account_id):
-    """Map all database-known MT5 magic values for one investor subaccount.
+    """Map MT5 magic values only from this exact subaccount's inherited programme_trades copies.
 
-    MT5 terminals are attached to investor subaccounts, not programmes. The
-    catalogue therefore unions investor-side programme_trades copies with
-    every programme_revenue_deals association for the exact subaccount, then
-    includes canonical programme_trades magic values for those programmes.
-    Including canonical rows catches a programme trade even when its
-    investor-side copy has not yet been restored/synchronised.
-
-    MT5 magic contains only the integer tradeid, never programme_id. Any
-    integer found under multiple programmes is ambiguous and must not be
-    modified or attributed by a programme-specific worker.
+    programme_revenue_deals is deliberately not an ownership/authorization
+    source for this trading process. A programme/subaccount relationship is
+    evidenced by the investor-specific programme_trades rows themselves.
+    Canonical master rows are included only for programme IDs already evidenced
+    by at least one inherited copy for this exact investor/subaccount; this is
+    used solely to detect reused magic numbers safely.
     """
     inv_id = _coerce_int(investor_id)
     sub_id = _coerce_int(sub_account_id)
-    empty = {'by_magic': {}, 'all_magic': set(), 'ambiguous': set(),
-             'programme_ids': set(), 'ok': False, 'reason': None}
+    empty = {
+        'by_magic': {}, 'all_magic': set(), 'ambiguous': set(),
+        'programme_ids': set(), 'ok': False, 'reason': None
+    }
     if not inv_id or inv_id <= 0 or not sub_id or sub_id <= 0:
         empty['reason'] = 'missing investor/subaccount identifiers'
         return empty
 
     pt_cols = _db_table_columns('programme_trades')
-    required = {'programmeid', 'investor_id', 'investor_sub_account_id', 'tradeid'}
+    required = {
+        'programmeid', 'investor_id', 'investor_sub_account_id', 'tradeid'
+    }
     if not required.issubset(pt_cols):
         empty['reason'] = 'programme_trades is missing programme/subaccount/tradeid columns'
         return empty
 
-    copy_rows, err = _strict_db_rows(
+    copy_sql = (
         "SELECT programmeid, tradeid FROM programme_trades "
-        "WHERE investor_id = %s AND investor_sub_account_id = %s "
-        "AND tradeid IS NOT NULL",
-        [inv_id, sub_id], timeout=15.0,
+        f"WHERE investor_id = {int(inv_id)} "
+        f"AND investor_sub_account_id = {int(sub_id)} "
+        "AND tradeid IS NOT NULL"
     )
+    copy_rows, err = _strict_db_rows(copy_sql, None, timeout=15.0)
     if copy_rows is None:
-        empty['reason'] = f'could not read investor subaccount trade copies: {err}'
+        empty['reason'] = f'could not read inherited programme-trades copies: {err}'
         return empty
 
     by_magic = {}
@@ -818,32 +844,18 @@ def fetch_subaccount_magic_catalog(investor_id, sub_account_id):
         programme_ids.add(pid)
         by_magic.setdefault(magic, set()).add(pid)
 
-    # Include all historical and current programme associations for this
-    # exact (investor_id, investor_sub_account_id), not only active contracts.
-    revenue_rows, err = _strict_db_rows(
-        "SELECT DISTINCT programme_id FROM programme_revenue_deals "
-        "WHERE investor_id = %s AND investor_sub_account_id = %s "
-        "AND programme_id IS NOT NULL",
-        [inv_id, sub_id], timeout=15.0,
-    )
-    if revenue_rows is None:
-        empty['reason'] = f'could not read investor programme associations: {err}'
-        return empty
-    for row in revenue_rows:
-        pid = _coerce_int(_raw_first_key(row, 'programme_id'))
-        if pid is not None and pid > 0:
-            programme_ids.add(pid)
-
-    # Pull canonical tradeids for every associated programme. A separate
-    # SELECT keeps this compatible with the bridge's simple-query path.
+    # Also inspect canonical master trade IDs for the programmes already
+    # evidenced by this account's inherited copies. Do not import unrelated
+    # revenue-deal or account-VPS programme relationships.
     if programme_ids:
-        ordered_ids = sorted(programme_ids)
-        placeholders = ','.join(['%s'] * len(ordered_ids))
-        canonical_rows, err = _strict_db_rows(
+        programme_id_sql = ','.join(str(int(pid)) for pid in sorted(programme_ids))
+        canonical_sql = (
             "SELECT programmeid, tradeid FROM programme_trades "
             "WHERE investor_id IS NULL AND tradeid IS NOT NULL "
-            f"AND programmeid IN ({placeholders})",
-            ordered_ids, timeout=20.0,
+            f"AND programmeid IN ({programme_id_sql})"
+        )
+        canonical_rows, err = _strict_db_rows(
+            canonical_sql, None, timeout=20.0
         )
         if canonical_rows is None:
             empty['reason'] = f'could not read canonical programme magic catalogue: {err}'
@@ -864,7 +876,6 @@ def fetch_subaccount_magic_catalog(investor_id, sub_account_id):
         'ok': True,
         'reason': None,
     }
-
 
 def fetch_programme_analytics_magic_groups(
     programme_id, programme_userid, require_live=False,
@@ -1699,10 +1710,15 @@ def resolve_investor_terminal_path(inv_db_id, sub_id):
       * login/server are missing/NULL
       * the rebuilt terminal64.exe does not exist on disk
     """
+    inv_id_int = _coerce_int(inv_db_id)
+    sub_id_int = _coerce_int(sub_id)
+    if not inv_id_int or not sub_id_int:
+        print(f"[MT5-PATH] invalid investor/subaccount identifiers: {inv_db_id}/{sub_id}")
+        return None
     row = db_fetch_one(
-        "SELECT login, server FROM harvhub "
-        "WHERE id = %s AND sub_account_id = %s LIMIT 1",
-        [inv_db_id, sub_id], timeout=10.0, quiet=True,
+        f"SELECT login, server FROM harvhub "
+        f"WHERE id = {int(inv_id_int)} AND sub_account_id = {int(sub_id_int)} LIMIT 1",
+        None, timeout=10.0, quiet=True,
     )
     if not row:
         print(f"[MT5-PATH] no harvhub row for investor={inv_db_id} "
@@ -1728,10 +1744,9 @@ def resolve_investor_terminal_path(inv_db_id, sub_id):
         # it in sync helps anyone inspecting the DB manually.
         try:
             db_execute(
-                "UPDATE harvhub SET Terminal_path = %s "
-                "WHERE id = %s AND sub_account_id = %s",
-                [terminal_exe, inv_db_id, sub_id],
-                timeout=10.0, quiet=True,
+                "UPDATE harvhub SET Terminal_path = " + _pt_sql_literal(terminal_exe) +
+                f" WHERE id = {int(inv_id_int)} AND sub_account_id = {int(sub_id_int)}",
+                None, timeout=10.0, quiet=True,
             )
         except Exception:
             pass
@@ -1941,67 +1956,106 @@ def mt5_order_calc_margin(order_type, symbol, volume, price):
 # ==============================================================================
 def fetch_vps_programmes(local_ip):
     """
-    Return list of {programme_id, userid} for every programme whose VPS
-    is this machine, INCLUDING follower programmes of those owners.
+    Return {programme_id, userid} for every programme hosted on this VPS:
+      - the owner programme in programme_vps;
+      - active follower programmes in programme_vps_hosts_followers.
 
-    Single query. No N+1.
+    IMPORTANT: This is deliberately programme-VPS scoped. The separate
+    account VPS tables (`vps`, `vps_hosts_followers`) are not imported here.
+    The SQL uses one IP placeholder because the remote bridge supports one
+    bound placeholder per request.
     """
     sql = """
         SELECT DISTINCT
-               v.programme_id AS programme_id,
-               p.userid       AS userid
+               CASE
+                   WHEN programme_scope.scope_type = 0 THEN v.programme_id
+                   ELSE f.follower_programme_id
+               END AS programme_id,
+               p.userid AS userid
           FROM programme_vps v
-          LEFT JOIN programme p ON p.id = v.programme_id
+          CROSS JOIN (
+                SELECT 0 AS scope_type
+                UNION ALL
+                SELECT 1 AS scope_type
+          ) AS programme_scope
+          LEFT JOIN programme_vps_hosts_followers f
+                 ON programme_scope.scope_type = 1
+                AND f.owner_programme_id = v.programme_id
+                AND f.host_status = 'active'
+          LEFT JOIN programme p
+                 ON p.id = CASE
+                               WHEN programme_scope.scope_type = 0
+                                   THEN v.programme_id
+                               ELSE f.follower_programme_id
+                           END
          WHERE v.programme_vps_ip_address = %s
-
-        UNION
-
-        SELECT DISTINCT
-               f.follower_programme_id AS programme_id,
-               fp.userid               AS userid
-          FROM programme_vps_hosts_followers f
-          JOIN programme_vps v  ON v.programme_id = f.owner_programme_id
-          LEFT JOIN programme fp ON fp.id = f.follower_programme_id
-         WHERE v.programme_vps_ip_address = %s
-           AND f.host_status = 'active'
+           AND (
+                programme_scope.scope_type = 0
+                OR f.id IS NOT NULL
+           )
     """
-    rows = db_fetch_all(sql, [local_ip, local_ip], timeout=15.0, quiet=True)
+    print(f"[fetch_vps_programmes] querying programme VPS bindings for ip={local_ip!r}")
+    result = db_query(sql, [local_ip], timeout=20.0, quiet=True)
+    if not _is_ok(result):
+        print(
+            "[fetch_vps_programmes] DATABASE QUERY FAILED: "
+            f"status={result.get('status')!r}; "
+            f"message={result.get('message') or 'No database error message supplied'}"
+        )
+        return []
+
+    rows = [_normalize_row(r) for r in (result.get('results') or [])]
     out = []
     seen = set()
     for row in rows:
+        if not isinstance(row, dict):
+            continue
         pid = _coerce_int(_pick_first_key(row, 'programme_id'))
         uid = _coerce_int(_pick_first_key(row, 'userid'))
         if pid is None or pid <= 0 or pid in seen:
             continue
         seen.add(pid)
         out.append({'programme_id': pid, 'userid': uid})
+
+    print(f"[fetch_vps_programmes] programme VPS bindings returned: {len(out)}")
     return out
 
 
 def fetch_active_investors_for_programme(programme_id):
+    """Return the exact active investor/subaccount pairs used by the PHP sync.
+
+    Eligibility requires a programme_revenue_deals association AND the exact
+    harvhub (id, sub_account_id) row to have account_contract_status='contract_active'.
+    A LIVE programme_trades copy alone is not enough to make a subaccount active.
     """
-    Mirror of signals_dashboard.getActiveInvestorsForProgramme.
-    Single query. Unchanged behaviour, kept for any caller that wants
-    just one programme.
-    """
-    sql = """
+    pid = _coerce_int(programme_id)
+    if pid is None or pid <= 0:
+        return []
+
+    sql = f"""
         SELECT DISTINCT
-            d.investor_id,
-            d.investor_sub_account_id
-        FROM programme_revenue_deals d
-        INNER JOIN harvhub h
-                ON h.id = d.investor_id
-               AND h.sub_account_id = d.investor_sub_account_id
-        WHERE d.programme_id = %s
-          AND d.investor_id > 0
-          AND h.account_contract_status = 'contract_active'
+               d.investor_id,
+               d.investor_sub_account_id AS sub_account_id
+          FROM programme_revenue_deals d
+          INNER JOIN harvhub h
+                  ON h.id = d.investor_id
+                 AND h.sub_account_id = d.investor_sub_account_id
+         WHERE d.programme_id = {int(pid)}
+           AND d.investor_id > 0
+           AND d.investor_sub_account_id > 0
+           AND h.account_contract_status = 'contract_active'
+         ORDER BY d.investor_id ASC, d.investor_sub_account_id ASC
     """
-    rows = db_fetch_all(sql, [programme_id], timeout=15.0, quiet=True)
+    rows, error = _strict_db_rows(sql, None, timeout=15.0)
+    if rows is None:
+        print(f"[fetch_active_investors_for_programme] programme={pid} query failed: {error}")
+        return []
+
     out = []
     seen = set()
     for row in rows:
         inv = _coerce_int(_pick_first_key(row, 'investor_id'))
-        sub = _coerce_int(_pick_first_key(row, 'investor_sub_account_id'))
+        sub = _coerce_int(_pick_first_key(row, 'sub_account_id'))
         if inv is None or inv <= 0 or sub is None or sub <= 0:
             continue
         key = (inv, sub)
@@ -2011,88 +2065,111 @@ def fetch_active_investors_for_programme(programme_id):
         out.append({'investor_id': inv, 'sub_account_id': sub})
     return out
 
-
 def fetch_vps_investor_jobs(local_ip):
+    """Discover active investor jobs for programmes hosted on this computer.
+
+    Two independent checks are intentionally combined, but not conflated:
+      1. programme_vps + active programme_vps_hosts_followers restrict the
+         programme IDs to this computer's programme-VPS allocation.
+      2. programme_revenue_deals + exact harvhub subaccount +
+         account_contract_status='contract_active' define PHP-equivalent
+         investor eligibility.
+
+    programme_trades remains the signal-copy/request authority. A worker may
+    still need to run investor-owned account-management stages before a new
+    signal copy exists, so job discovery must not require a LIVE copy row.
+    Account-VPS tables are never read here.
     """
-    SINGLE-QUERY batched discovery.
+    if not local_ip:
+        print("[fetch_vps_investor_jobs] No local IP supplied; no jobs discovered.")
+        return []
 
-    Returns every (programme, investor) pair bound to this VPS, plus the
-    programme name, in a single round-trip to the bridge.
+    programme_bindings = fetch_vps_programmes(local_ip)
+    programme_map = {}
+    for item in programme_bindings or []:
+        pid = _coerce_int(item.get('programme_id'))
+        uid = _coerce_int(item.get('userid'))
+        if pid and pid > 0:
+            programme_map[pid] = uid
 
-    NOTE: The previous version of this function had stray debug lines at
-    the top that assigned `sql = \"\"\" ... \"\"\"` (a literal placeholder
-    string, not valid SQL). That first bogus query was sent to the bridge
-    first, poisoning the shared channel so the subsequent real query
-    returned 0 rows. Those debug lines have been removed.
+    programme_ids = sorted(programme_map)
+    print(
+        f"[fetch_vps_investor_jobs] programme-VPS scope for ip={local_ip!r}: "
+        f"{programme_ids}"
+    )
+    if not programme_ids:
+        print(
+            "[fetch_vps_investor_jobs] No programme owner/active-follower binding "
+            "exists for this IP. Account-VPS bindings are independent and are ignored."
+        )
+        return []
 
-    Expected shape of each returned job:
-        {
-            'investor_id':    int,
-            'sub_account_id': int,
-            'programme_id':   int,
-            'programme_name': str,
-        }
-
-    Investors with no active contract (or programmes with no active
-    investors) are silently skipped — the caller gets only actionable
-    pairs.
-    """
-    sql = """
+    # IDs originate from the database and are converted to positive integers.
+    # Inlineing these validated numeric IDs avoids repeated IP placeholders in
+    # the bridge, which supports a single bound placeholder per request.
+    programme_id_sql = ",".join(str(int(pid)) for pid in programme_ids)
+    sql = f"""
         SELECT DISTINCT
-               allp.programme_id        AS programme_id,
-               allp.programme_name      AS programme_name,
-               allp.programme_userid    AS programme_userid,
-               d.investor_id            AS investor_id,
+               d.programme_id AS programme_id,
+               p.program_name AS programme_name,
+               p.userid AS programme_userid,
+               d.investor_id AS investor_id,
                d.investor_sub_account_id AS sub_account_id
-          FROM (
-                SELECT v.programme_id       AS programme_id,
-                       p.program_name       AS programme_name,
-                       p.userid             AS programme_userid
-                  FROM programme_vps v
-                  LEFT JOIN programme p ON p.id = v.programme_id
-                 WHERE v.programme_vps_ip_address = %s
-
-                UNION
-
-                SELECT f.follower_programme_id AS programme_id,
-                       fp.program_name         AS programme_name,
-                       fp.userid               AS programme_userid
-                  FROM programme_vps_hosts_followers f
-                  JOIN programme_vps v  ON v.programme_id = f.owner_programme_id
-                  LEFT JOIN programme fp ON fp.id = f.follower_programme_id
-                 WHERE v.programme_vps_ip_address = %s
-                   AND f.host_status = 'active'
-               ) AS allp
-          LEFT JOIN programme_revenue_deals d
-                 ON d.programme_id = allp.programme_id
-          LEFT JOIN harvhub h
-                 ON h.id = d.investor_id
-                AND h.sub_account_id = d.investor_sub_account_id
-                AND h.account_contract_status = 'contract_active'
-         WHERE allp.programme_id > 0
-           AND h.id IS NOT NULL
+          FROM programme_revenue_deals d
+          INNER JOIN programme p
+                  ON p.id = d.programme_id
+          INNER JOIN harvhub h
+                  ON h.id = d.investor_id
+                 AND h.sub_account_id = d.investor_sub_account_id
+         WHERE d.programme_id IN ({programme_id_sql})
+           AND d.investor_id > 0
+           AND d.investor_sub_account_id > 0
+           AND h.account_contract_status = 'contract_active'
+         ORDER BY d.programme_id ASC,
+                  d.investor_id ASC,
+                  d.investor_sub_account_id ASC
     """
-    print(f"🔎 [fetch_vps_investor_jobs] querying for ip={local_ip!r}")
-    rows = db_fetch_all(sql, [local_ip, local_ip], timeout=20.0, quiet=True)
-    print(f"🔎 [fetch_vps_investor_jobs] raw rows returned by bridge: {len(rows)}")
-    if rows:
-        print(f"🔎 [fetch_vps_investor_jobs] sample row: {rows[0]}")
 
+    print(
+        "[fetch_vps_investor_jobs] Applying PHP-equivalent active eligibility: "
+        "programme_revenue_deals + exact harvhub subaccount + contract_active."
+    )
+    result = db_query(sql, None, timeout=25.0, quiet=True)
+    if not _is_ok(result):
+        print(
+            "[fetch_vps_investor_jobs] DATABASE QUERY FAILED: "
+            f"status={result.get('status')!r}; "
+            f"message={result.get('message') or 'No database error message supplied'}"
+        )
+        return []
+
+    rows = [_normalize_row(r) for r in (result.get('results') or [])]
     jobs = []
     seen = set()
     for row in rows:
-        pid = _coerce_int(_pick_first_key(row, 'programme_id'))
-        if pid is None or pid <= 0:
+        if not isinstance(row, dict):
             continue
-        pname = (_pick_first_key(row, 'programme_name') or '').strip()
-
+        pid = _coerce_int(_pick_first_key(row, 'programme_id'))
         inv = _coerce_int(_pick_first_key(row, 'investor_id'))
         sub = _coerce_int(_pick_first_key(row, 'sub_account_id'))
+        if not all((pid and pid > 0, inv and inv > 0, sub and sub > 0)):
+            continue
 
-        # Programme with no active investors → skip entirely.
-        # (The LEFT JOINs above produce a row with NULL investor_id in that
-        # case; we don't want to forward those as jobs.)
-        if inv is None or inv <= 0 or sub is None or sub <= 0:
+        programme_userid = _coerce_int(_pick_first_key(row, 'programme_userid'))
+        expected_owner = programme_map.get(pid)
+        if expected_owner and programme_userid and programme_userid != expected_owner:
+            print(
+                f"[fetch_vps_investor_jobs] Skipping inconsistent owner mapping "
+                f"for programme={pid}: VPS owner={expected_owner}, row owner={programme_userid}"
+            )
+            continue
+        if not programme_userid:
+            programme_userid = expected_owner
+        if not programme_userid or programme_userid <= 0:
+            print(
+                f"[fetch_vps_investor_jobs] Skipping programme={pid}; "
+                "programme owner userid could not be resolved."
+            )
             continue
 
         key = (inv, sub, pid)
@@ -2100,13 +2177,57 @@ def fetch_vps_investor_jobs(local_ip):
             continue
         seen.add(key)
         jobs.append({
-            'investor_id':    inv,
+            'investor_id': inv,
             'sub_account_id': sub,
-            'programme_id':   pid,
-            'programme_name': pname,
-            'programme_userid': _coerce_int(_pick_first_key(row, 'programme_userid')),
+            'programme_id': pid,
+            'programme_name': str(_pick_first_key(row, 'programme_name') or '').strip()
+                              or f'programme_{pid}',
+            'programme_userid': programme_userid,
         })
+
+    if jobs:
+        print(
+            f"[fetch_vps_investor_jobs] Active programme jobs: {len(jobs)} "
+            f"across {len({j['programme_id'] for j in jobs})} VPS-scoped programme(s)."
+        )
+        for job in jobs:
+            print(
+                "  [JOB] programme={programme_id} investor={investor_id} "
+                "subaccount={sub_account_id}".format(**job)
+            )
+    else:
+        print(
+            "[fetch_vps_investor_jobs] Programme VPS binding(s) exist, but no "
+            "investor/subaccount passed the PHP contract_active eligibility rule."
+        )
     return jobs
+
+
+def is_active_investor_for_programme(investor_id, sub_account_id, programme_id):
+    """Recheck the same active-deal rule as PHP immediately before processing."""
+    inv = _coerce_int(investor_id)
+    sub = _coerce_int(sub_account_id)
+    pid = _coerce_int(programme_id)
+    if not all((inv and inv > 0, sub and sub > 0, pid and pid > 0)):
+        return False, 'invalid investor/subaccount/programme identifiers'
+    sql = f"""
+        SELECT 1 AS eligible
+          FROM programme_revenue_deals d
+          INNER JOIN harvhub h
+                  ON h.id = d.investor_id
+                 AND h.sub_account_id = d.investor_sub_account_id
+         WHERE d.programme_id = {int(pid)}
+           AND d.investor_id = {int(inv)}
+           AND d.investor_sub_account_id = {int(sub)}
+           AND h.account_contract_status = 'contract_active'
+         LIMIT 1
+    """
+    rows, error = _strict_db_rows(sql, None, timeout=12.0)
+    if rows is None:
+        return False, f'active-contract eligibility query failed: {error}'
+    if not rows:
+        return False, 'no matching programme revenue-deal with contract_active status'
+    return True, None
 
 def fetch_programmes_metadata_batch(programme_ids):
     """
@@ -3751,14 +3872,19 @@ def restricted_timerange_db(inv_db_id=None, jobs=None):
         print(f"      👥 {len(investors)} active investor(s) associated:")
 
         # BATCH identity lookup for every investor on this programme (1 query).
-        investor_ids = [inv['investor_id'] for inv in investors]
+        investor_ids = sorted({
+            int(inv['investor_id']) for inv in investors
+            if _coerce_int(inv.get('investor_id')) and int(inv['investor_id']) > 0
+        })
         identity_map = {}
         if investor_ids:
-            ph = ','.join(['%s'] * len(investor_ids))
+            # The remote bridge accepts one bound placeholder per request;
+            # these IDs are positive integers read directly from the database.
+            investor_id_sql = ','.join(str(i) for i in investor_ids)
             rows = db_fetch_all(
-                f"SELECT id, fullname, username, email FROM harvhub "
-                f"WHERE id IN ({ph})",
-                investor_ids, timeout=15.0, quiet=True,
+                "SELECT id, fullname, username, email FROM harvhub "
+                f"WHERE id IN ({investor_id_sql})",
+                None, timeout=15.0, quiet=True,
             )
             for row in rows:
                 iid = _coerce_int(_pick_first_key(row, 'id'))
@@ -8206,13 +8332,12 @@ def chunk_orders_with_volume_beyond_max_db(inv_db_id=None, jobs=None):
               f"programme '{programme_name}' (id={programme_id})")
         print(f"{'─'*72}")
 
-        # Only configured live programme trades for this investor subaccount
-        # and current contract period may be chunked.
+        # Only configured live programme trades inherited by this exact investor
+        # subaccount may be chunked. execution_start_date remains the time boundary.
         hub = db_fetch_one(
-            "SELECT execution_start_date FROM harvhub "
-            "WHERE id = %s AND sub_account_id = %s "
-            "AND account_contract_status = 'contract_active' LIMIT 1",
-            [investor_id, sub_account_id], timeout=10.0, quiet=True,
+            f"SELECT execution_start_date FROM harvhub "
+            f"WHERE id = {int(investor_id)} AND sub_account_id = {int(sub_account_id)} LIMIT 1",
+            None, timeout=10.0, quiet=True,
         ) or {}
         rows, eligibility = fetch_live_investor_programme_trades(
             programme_id, programme_userid, investor_id, sub_account_id,
@@ -9546,16 +9671,11 @@ def place_usd_orders_db(inv_db_id=None, jobs=None):
             continue
         print(f"  🎯 Risk guard: default=${default_risk:.2f}  maximum=${maximum_risk:.2f}")
 
-        # --- fetch execution_start_date once; this belongs to the investor subaccount ---
+        # --- fetch execution_start_date once from the exact investor subaccount row ---
         exec_row = db_fetch_one(
-            """
-            SELECT execution_start_date
-              FROM harvhub
-             WHERE id = %s AND sub_account_id = %s
-               AND account_contract_status = 'contract_active'
-             LIMIT 1
-            """,
-            [investor_id, sub_account_id], timeout=10.0, quiet=True,
+            f"SELECT execution_start_date FROM harvhub "
+            f"WHERE id = {int(investor_id)} AND sub_account_id = {int(sub_account_id)} LIMIT 1",
+            None, timeout=10.0, quiet=True,
         ) or {}
         execution_start_date = _raw_first_key(exec_row, 'execution_start_date')
 
@@ -10001,11 +10121,12 @@ def place_usd_orders_db(inv_db_id=None, jobs=None):
             })
 
         # ==================================================================
-        # STEP 9 — MODIFY-TRADE ENFORCEMENT
+        # STEP 9 — LEGACY PROGRAMME MODIFY-TRADE DISABLED
+        # Explicit programme authority is handled only by the priority
+        # process_programme_order_requests_db() stage and the PHP
+        # order_request_status / order_request_filled columns. The legacy
+        # modify_trade field is intentionally not executed here.
         # ==================================================================
-        _enforce_modify_trade_requests(
-            investor_id, sub_account_id, programme_id, programme_name, programme_userid
-        )
 
     # ==================================================================
     # SECTION 8 — SUMMARY
@@ -10357,10 +10478,9 @@ def check_pending_orders_risk_db(inv_db_id=None, jobs=None):
         # Build a lookup from current live trades only; unrelated or stale
         # MT5 orders must never be modified by this programme's risk audit.
         hub = db_fetch_one(
-            "SELECT execution_start_date FROM harvhub "
-            "WHERE id = %s AND sub_account_id = %s "
-            "AND account_contract_status = 'contract_active' LIMIT 1",
-            [investor_id, sub_account_id], timeout=10.0, quiet=True,
+            f"SELECT execution_start_date FROM harvhub "
+            f"WHERE id = {int(investor_id)} AND sub_account_id = {int(sub_account_id)} LIMIT 1",
+            None, timeout=10.0, quiet=True,
         ) or {}
         live_rows, eligibility = fetch_live_investor_programme_trades(
             programme_id, programme_userid, investor_id, sub_account_id,
@@ -10948,13 +11068,12 @@ def orders_reward_correction_db(inv_db_id=None, jobs=None):
         print(f"  │ Normalised type     : '{rr_type}'")
         print(f"  │ Source              : {rr_source}")
 
-        # Only adjust MT5 entities whose magic belongs to a live programme
+        # Only adjust MT5 entities whose magic belongs to a LIVE inherited programme
         # signal created on/after this investor subaccount's execution start.
         hub = db_fetch_one(
-            "SELECT execution_start_date FROM harvhub "
-            "WHERE id = %s AND sub_account_id = %s "
-            "AND account_contract_status = 'contract_active' LIMIT 1",
-            [investor_id, sub_account_id], timeout=10.0, quiet=True,
+            f"SELECT execution_start_date FROM harvhub "
+            f"WHERE id = {int(investor_id)} AND sub_account_id = {int(sub_account_id)} LIMIT 1",
+            None, timeout=10.0, quiet=True,
         ) or {}
         live_rows, eligibility = fetch_live_investor_programme_trades(
             programme_id, programme_userid, investor_id, sub_account_id,
@@ -10967,7 +11086,7 @@ def orders_reward_correction_db(inv_db_id=None, jobs=None):
         if eligibility.get('reason'):
             print(f"  │ ⚠️ Live-trade R:R correction gate closed: {eligibility['reason']}")
         if not known_tradeids:
-            print(f"  │ ℹ️ No live current-contract trade IDs — no MT5 positions/orders will be changed")
+            print(f"  │ ℹ️ No live inherited programme trade IDs — no MT5 positions/orders will be changed")
             stats['investors_skipped'] += 1
             continue
 
@@ -11520,12 +11639,11 @@ def apply_dynamic_breakeven_db(inv_db_id=None, jobs=None):
                   f"{rule['if_floating_profit_at_risk_reward']}R → "
                   f"SL at {rule['breakeven_at_risk_reward']}R")
 
-        # -------- load current LIVE tradeids from this subaccount's contract --------
+        # -------- load current LIVE tradeids from this subaccount's inherited programme-trades copies --------
         hub = db_fetch_one(
-            "SELECT execution_start_date FROM harvhub "
-            "WHERE id = %s AND sub_account_id = %s "
-            "AND account_contract_status = 'contract_active' LIMIT 1",
-            [investor_id, sub_account_id], timeout=10.0, quiet=True,
+            f"SELECT execution_start_date FROM harvhub "
+            f"WHERE id = {int(investor_id)} AND sub_account_id = {int(sub_account_id)} LIMIT 1",
+            None, timeout=10.0, quiet=True,
         ) or {}
         live_rows, eligibility = fetch_live_investor_programme_trades(
             programme_id, programme_userid, investor_id, sub_account_id,
@@ -12721,6 +12839,23 @@ def _pt_request_normalize(value):
     return aliases.get(value, value)
 
 
+def _pt_sql_literal(value):
+    """Safely inline a single SQL literal for the one-placeholder DB bridge."""
+    if value is None:
+        return 'NULL'
+    if isinstance(value, bool):
+        return '1' if value else '0'
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        if value != value or value in (float('inf'), float('-inf')):
+            return 'NULL'
+        return repr(value)
+    text = str(value).replace('\x00', '')
+    text = text.replace('\\', '\\\\').replace("'", "''")
+    return "'" + text + "'"
+
+
 def _pt_request_retry_reason(message):
     message = ' '.join(str(message or '').split()).strip()
     if not message:
@@ -12755,13 +12890,103 @@ def _pt_request_mt5_snapshot():
             return False, [], [], f'MT5 trade snapshot failed: {exc}'
 
 
-def _pt_request_magic_matches(item, tradeid):
-    return _coerce_int(getattr(item, 'magic', None)) == _coerce_int(tradeid)
-
-
 def _pt_request_symbol_key(value):
     return str(value or '').strip().upper()
 
+
+def _pt_request_signal_side(value):
+    """Normalize programme/investor order type to BUY, SELL, or None."""
+    raw = str(value or '').strip().lower()
+    if not raw:
+        return None
+    compact = raw.replace('_', ' ').replace('-', ' ')
+    if 'buy' in compact or compact in {'long', '0', '2', '4', '6'}:
+        return 'buy'
+    if 'sell' in compact or compact in {'short', '1', '3', '5', '7'}:
+        return 'sell'
+    try:
+        numeric = int(float(compact))
+        if numeric in (0, 2, 4, 6):
+            return 'buy'
+        if numeric in (1, 3, 5, 7):
+            return 'sell'
+    except Exception:
+        pass
+    return None
+
+
+def _pt_request_item_side(item, is_position=False):
+    raw_type = _coerce_int(getattr(item, 'type', None))
+    if raw_type is None:
+        return None
+    if is_position:
+        if raw_type == getattr(mt5, 'POSITION_TYPE_BUY', 0):
+            return 'buy'
+        if raw_type == getattr(mt5, 'POSITION_TYPE_SELL', 1):
+            return 'sell'
+        return None
+    buy_types = {
+        getattr(mt5, 'ORDER_TYPE_BUY', 0),
+        getattr(mt5, 'ORDER_TYPE_BUY_LIMIT', 2),
+        getattr(mt5, 'ORDER_TYPE_BUY_STOP', 4),
+        getattr(mt5, 'ORDER_TYPE_BUY_STOP_LIMIT', 6),
+        0, 2, 4, 6,
+    }
+    sell_types = {
+        getattr(mt5, 'ORDER_TYPE_SELL', 1),
+        getattr(mt5, 'ORDER_TYPE_SELL_LIMIT', 3),
+        getattr(mt5, 'ORDER_TYPE_SELL_STOP', 5),
+        getattr(mt5, 'ORDER_TYPE_SELL_STOP_LIMIT', 7),
+        1, 3, 5, 7,
+    }
+    if raw_type in buy_types:
+        return 'buy'
+    if raw_type in sell_types:
+        return 'sell'
+    return None
+
+
+def _pt_request_signal_has_price_levels(signal):
+    """Compatibility helper: validate the magic's symbol/direction metadata.
+
+    The name is retained to avoid breaking any external helper callers. Price
+    levels are intentionally not required because the canonical MT5 magic is
+    the stronger identity and account-management can adjust those levels.
+    """
+    signal = signal or {}
+    symbol = _pt_request_symbol_key(signal.get('symbol'))
+    side = _pt_request_signal_side(signal.get('ordertype'))
+    return bool(symbol and side in ('buy', 'sell'))
+
+def _pt_request_matches_signal(item, signal, tradeid, is_position=False):
+    """Match an MT5 child order/position by its canonical programme trade magic.
+
+    Primary identity: item.magic == programme_trades.tradeid.
+    Safety checks: exact symbol and compatible BUY/SELL direction.
+
+    A martingale/chunking stage may produce multiple broker tickets from one
+    programme signal. Those child tickets retain the same magic and are all
+    included, regardless of their individual volume or execution prices.
+    Prices are deliberately not used as identifiers: unrelated trades can
+    share identical price levels, while account-management may legitimately
+    adjust entry/SL/TP after signal inheritance.
+    """
+    expected_magic = _coerce_int(tradeid)
+    actual_magic = _coerce_int(getattr(item, 'magic', None))
+    if expected_magic is None or expected_magic <= 0 or actual_magic != expected_magic:
+        return False
+
+    signal = signal or {}
+    expected_symbol = _pt_request_symbol_key(signal.get('symbol'))
+    actual_symbol = _pt_request_symbol_key(getattr(item, 'symbol', ''))
+    if not expected_symbol or actual_symbol != expected_symbol:
+        return False
+
+    expected_side = _pt_request_signal_side(signal.get('ordertype'))
+    actual_side = _pt_request_item_side(item, is_position=is_position)
+    if expected_side not in ('buy', 'sell') or actual_side not in ('buy', 'sell'):
+        return False
+    return expected_side == actual_side
 
 def _pt_request_remove_order(order):
     ticket = _coerce_int(getattr(order, 'ticket', None))
@@ -12793,6 +13018,9 @@ def _pt_request_remove_order(order):
 def _pt_request_close_position(position, tradeid):
     ticket = _coerce_int(getattr(position, 'ticket', None))
     symbol = str(getattr(position, 'symbol', '') or '').strip()
+    # Volume is read only after the position has already matched the canonical
+    # tradeid/magic plus symbol/direction. MT5 requires the ticket volume to
+    # send its close request; it is never used to identify/group duplicates.
     volume = _coerce_float(getattr(position, 'volume', None), None)
     position_type = _coerce_int(getattr(position, 'type', None))
     if not ticket or not symbol or volume is None or volume <= 0 or position_type not in (0, 1):
@@ -12863,74 +13091,99 @@ def _pt_request_close_position(position, tradeid):
     return False, f'Could not close MT5 position #{ticket} ({symbol}): {last_error or "no accepted filling mode"}'
 
 
-def _pt_request_close_trade_on_mt5(tradeid, expected_symbol):
-    """Remove pending orders and close positions for this exact magic/symbol."""
+
+def _pt_request_close_order_on_mt5(tradeid, signal):
+    """Remove every pending order matching this canonical trade magic."""
     ok, orders, positions, snapshot_error = _pt_request_mt5_snapshot()
     if not ok:
         return False, _pt_request_retry_reason(snapshot_error)
 
-    magic_orders = [o for o in orders if _pt_request_magic_matches(o, tradeid)]
-    magic_positions = [p for p in positions if _pt_request_magic_matches(p, tradeid)]
-    all_matching = magic_orders + magic_positions
-    expected_key = _pt_request_symbol_key(expected_symbol)
-    mismatched = [
-        item for item in all_matching
-        if expected_key and _pt_request_symbol_key(getattr(item, 'symbol', '')) != expected_key
+    matches = [
+        order for order in orders
+        if _pt_request_matches_signal(order, signal, tradeid, is_position=False)
     ]
-    if mismatched:
-        actual_symbols = sorted({str(getattr(x, 'symbol', '') or '?') for x in mismatched})
-        return False, _pt_request_retry_reason(
-            f'Magic {tradeid} is present on unexpected symbol(s) {", ".join(actual_symbols)}; '
-            f'expected {expected_symbol}. Refusing to close a mismatched instrument.'
-        )
-
-    # No active broker object means the close/delete request is already achieved.
-    if not all_matching:
+    if not matches:
+        # If the matching signal has already become a position, the selected
+        # UI action is no longer valid; do not silently close the position.
+        running_matches = [
+            position for position in positions
+            if _pt_request_matches_signal(position, signal, tradeid, is_position=True)
+        ]
+        if running_matches:
+            return False, _pt_request_retry_reason(
+                "The inherited signal is now an open position, not a pending order; "
+                "submit a Position Closing request for this trade."
+            )
         return True, None
 
     failures = []
-    for order in magic_orders:
+    for order in matches:
         removed, error = _pt_request_remove_order(order)
         if not removed and error:
             failures.append(error)
 
-    for position in magic_positions:
+    verify_ok, remaining_orders, _, verify_error = _pt_request_mt5_snapshot()
+    if not verify_ok:
+        return False, _pt_request_retry_reason(verify_error)
+
+    remaining = [
+        order for order in remaining_orders
+        if _pt_request_matches_signal(order, signal, tradeid, is_position=False)
+    ]
+    if not remaining:
+        return True, None
+
+    detail = failures[-1] if failures else "MT5 still reports matching pending orders."
+    return False, _pt_request_retry_reason(
+        f"{detail} Matching pending orders remaining: {len(remaining)}."
+    )
+
+
+def _pt_request_close_positions_on_mt5(tradeid, signal):
+    """Close every open position matching this canonical trade magic."""
+    ok, orders, positions, snapshot_error = _pt_request_mt5_snapshot()
+    if not ok:
+        return False, _pt_request_retry_reason(snapshot_error)
+
+    matches = [
+        position for position in positions
+        if _pt_request_matches_signal(position, signal, tradeid, is_position=True)
+    ]
+    if not matches:
+        pending_matches = [
+            order for order in orders
+            if _pt_request_matches_signal(order, signal, tradeid, is_position=False)
+        ]
+        if pending_matches:
+            return False, _pt_request_retry_reason(
+                "The inherited signal is still represented by pending order(s), "
+                "not open positions; submit an Order Closing request."
+            )
+        # A close-position request is already achieved when the matching signal
+        # has no live positions left on this account.
+        return True, None
+
+    failures = []
+    for position in matches:
         closed, error = _pt_request_close_position(position, tradeid)
         if not closed and error:
             failures.append(error)
 
-    # Do not mark the request filled from an order_send retcode alone. Confirm
-    # that MT5 no longer reports either a pending order or an open position.
-    verify_ok, remaining_orders, remaining_positions, verify_error = _pt_request_mt5_snapshot()
+    verify_ok, _, remaining_positions, verify_error = _pt_request_mt5_snapshot()
     if not verify_ok:
         return False, _pt_request_retry_reason(verify_error)
 
-    remaining_magic = [
-        x for x in list(remaining_orders) + list(remaining_positions)
-        if _pt_request_magic_matches(x, tradeid)
+    remaining = [
+        position for position in remaining_positions
+        if _pt_request_matches_signal(position, signal, tradeid, is_position=True)
     ]
-    remaining_mismatched = [
-        x for x in remaining_magic
-        if expected_key and _pt_request_symbol_key(getattr(x, 'symbol', '')) != expected_key
-    ]
-    if remaining_mismatched:
-        actual_symbols = sorted({str(getattr(x, 'symbol', '') or '?') for x in remaining_mismatched})
-        return False, _pt_request_retry_reason(
-            f'MT5 still reports magic {tradeid} on unexpected symbol(s) {", ".join(actual_symbols)} after the close attempt; refusing to mark the request filled.'
-        )
-    remaining = remaining_magic
     if not remaining:
         return True, None
 
-    remaining_orders_count = sum(1 for x in remaining_orders if _pt_request_magic_matches(x, tradeid))
-    remaining_positions_count = sum(1 for x in remaining_positions if _pt_request_magic_matches(x, tradeid))
-    if failures:
-        detail = failures[-1]
-    else:
-        detail = 'MT5 still reports active tickets after the close request.'
-    detail += f' Remaining pending orders: {remaining_orders_count}; open positions: {remaining_positions_count}.'
-    return False, _pt_request_retry_reason(detail)
-
+    detail = failures[-1] if failures else "MT5 still reports matching open positions."
+    return False, _pt_request_retry_reason(
+        f"{detail} Matching open positions remaining: {len(remaining)}."
+    )
 
 def _pt_request_set_position_breakeven(position, tradeid):
     """Move one open position's SL to its entry, preserving its TP."""
@@ -13037,98 +13290,113 @@ def _pt_request_set_position_breakeven(position, tradeid):
     return False, f'MT5 rejected breakeven for {symbol} position #{ticket}: retcode {retcode} {comment}; will keep trying.'
 
 
-def _pt_request_breakeven_trade_on_mt5(tradeid, expected_symbol):
+
+def _pt_request_breakeven_trade_on_mt5(tradeid, signal):
     ok, orders, positions, snapshot_error = _pt_request_mt5_snapshot()
     if not ok:
         return False, _pt_request_retry_reason(snapshot_error)
 
-    magic_positions = [p for p in positions if _pt_request_magic_matches(p, tradeid)]
-    magic_orders = [o for o in orders if _pt_request_magic_matches(o, tradeid)]
-    all_matching = magic_positions + magic_orders
-    expected_key = _pt_request_symbol_key(expected_symbol)
-    mismatched = [
-        item for item in all_matching
-        if expected_key and _pt_request_symbol_key(getattr(item, 'symbol', '')) != expected_key
+    matching_positions = [
+        position for position in positions
+        if _pt_request_matches_signal(position, signal, tradeid, is_position=True)
     ]
-    if mismatched:
-        actual_symbols = sorted({str(getattr(x, 'symbol', '') or '?') for x in mismatched})
-        return False, _pt_request_retry_reason(
-            f'Magic {tradeid} is present on unexpected symbol(s) {", ".join(actual_symbols)}; '
-            f'expected {expected_symbol}. Refusing to modify a mismatched instrument.'
-        )
+    matching_orders = [
+        order for order in orders
+        if _pt_request_matches_signal(order, signal, tradeid, is_position=False)
+    ]
 
-    if not magic_positions:
-        if magic_orders:
+    if not matching_positions:
+        if matching_orders:
             return False, _pt_request_retry_reason(
-                f'Breakeven is waiting for {expected_symbol} pending order to become an open position; no position exists yet.'
+                "Breakeven is waiting for the inherited pending order to become "
+                "an open position; no matching position exists yet."
             )
         return False, _pt_request_retry_reason(
-            f'No open MT5 position was found for {expected_symbol} magic {tradeid}; waiting for the position before breakeven.'
+            "No open position matching the inherited programme trade magic, "
+            "symbol and direction was found; waiting for the investor position."
         )
 
     failures = []
-    for position in magic_positions:
+    for position in matching_positions:
         updated, error = _pt_request_set_position_breakeven(position, tradeid)
         if not updated and error:
             failures.append(error)
 
-    # Verify broker-side SL values, not only the order_send result.
-    verify_ok, verify_orders, verify_positions, verify_error = _pt_request_mt5_snapshot()
+    verify_ok, _, verify_positions, verify_error = _pt_request_mt5_snapshot()
     if not verify_ok:
         return False, _pt_request_retry_reason(verify_error)
-    remaining_positions = [p for p in verify_positions if _pt_request_magic_matches(p, tradeid)]
-    remaining_wrong_symbols = [
-        p for p in remaining_positions
-        if expected_key and _pt_request_symbol_key(getattr(p, 'symbol', '')) != expected_key
+
+    remaining = [
+        position for position in verify_positions
+        if _pt_request_matches_signal(position, signal, tradeid, is_position=True)
     ]
-    if remaining_wrong_symbols:
+    if not remaining:
         return False, _pt_request_retry_reason(
-            'MT5 verification found a matching magic on an unexpected symbol; refusing to claim breakeven success.'
-        )
-    if not remaining_positions:
-        return False, _pt_request_retry_reason(
-            f'{expected_symbol} position disappeared before breakeven could be verified; waiting for a live position.'
+            "Matching positions disappeared before their breakeven stop could be verified."
         )
 
     not_at_breakeven = []
-    for position in remaining_positions:
+    for position in remaining:
         entry = _coerce_float(getattr(position, 'price_open', None), None)
-        sl = _coerce_float(getattr(position, 'sl', 0.0), 0.0)
+        sl = _coerce_float(getattr(position, 'sl', 0.0), 0.0) or 0.0
         position_type = _coerce_int(getattr(position, 'type', None))
         info = mt5_symbol_info(str(getattr(position, 'symbol', '') or ''))
         point = _coerce_float(getattr(info, 'point', None), 0.0) if info is not None else 0.0
-        tolerance = max((point or 0.0) * 0.51, 1e-8)
+        tolerance = max((point or 0.0) * 1.51, 1e-8)
         if entry is None or position_type not in (0, 1):
-            not_at_breakeven.append('position entry/direction could not be verified')
+            not_at_breakeven.append(
+                f"position #{getattr(position, 'ticket', '?')} entry/direction could not be verified"
+            )
         elif position_type == getattr(mt5, 'POSITION_TYPE_BUY', 0):
             if sl <= 0 or sl < entry - tolerance:
-                not_at_breakeven.append(f'position #{getattr(position, "ticket", "?")} SL is not at entry')
+                not_at_breakeven.append(
+                    f"position #{getattr(position, 'ticket', '?')} SL is not at entry"
+                )
         else:
             if sl <= 0 or sl > entry + tolerance:
-                not_at_breakeven.append(f'position #{getattr(position, "ticket", "?")} SL is not at entry')
+                not_at_breakeven.append(
+                    f"position #{getattr(position, 'ticket', '?')} SL is not at entry"
+                )
 
     if not_at_breakeven:
-        detail = failures[-1] if failures else '; '.join(not_at_breakeven)
+        detail = failures[-1] if failures else "One or more matching positions have not reached breakeven."
+        detail += " " + "; ".join(not_at_breakeven[:3])
+        if len(not_at_breakeven) > 3:
+            detail += f" (+{len(not_at_breakeven) - 3} more position(s))"
         return False, _pt_request_retry_reason(detail)
-    return True, None
 
+    return True, None
 
 def _pt_request_update_analytics(master_id, programme_userid, programme_id,
                                  request_status, filled, failure_reason):
-    """Mirror request execution state to matching Analytics rows when identity exists."""
+    """Mirror manual-request state to matching Analytics rows when identity exists."""
     try:
         ci_cols = _db_table_columns('programme_trade_chart_identity')
         pa_cols = _db_table_columns('programme_analytics')
-        required_ci = {'programme_trade_id', 'userid', 'programmeid', 'root_id',
-                       'confirmation_root_id', 'family_number', 'setup_group_id',
-                       'symbol', 'timeframe', 'source_timeframe'}
-        required_pa = {'userid', 'programme_id', 'root_id', 'confirmation_root_id',
-                       'family_number', 'setup_group_id', 'symbol', 'timeframe',
-                       'order_request_status', 'order_request_filled',
-                       'order_request_filled_failure_reason'}
+        required_ci = {
+            'programme_trade_id', 'userid', 'programmeid', 'root_id',
+            'confirmation_root_id', 'family_number', 'setup_group_id',
+            'symbol', 'timeframe', 'source_timeframe'
+        }
+        required_pa = {
+            'userid', 'programme_id', 'root_id', 'confirmation_root_id',
+            'family_number', 'setup_group_id', 'symbol', 'timeframe',
+            'order_request_status', 'order_request_filled',
+            'order_request_filled_failure_reason'
+        }
         if not required_ci.issubset(ci_cols) or not required_pa.issubset(pa_cols):
             return
-        sql = """
+
+        mid = _coerce_int(master_id)
+        uid = _coerce_int(programme_userid)
+        pid = _coerce_int(programme_id)
+        if not all((mid and mid > 0, uid and uid > 0, pid and pid > 0)):
+            return
+        status_sql = _pt_sql_literal(request_status)
+        filled_sql = '1' if int(bool(filled)) else '0'
+        failure_sql = _pt_sql_literal(failure_reason)
+
+        sql = f"""
             UPDATE programme_analytics pa
             INNER JOIN programme_trade_chart_identity ci
                     ON ci.userid = pa.userid
@@ -13142,61 +13410,72 @@ def _pt_request_update_analytics(master_id, programme_userid, programme_id,
                         LOWER(ci.timeframe) = LOWER(pa.timeframe)
                         OR LOWER(ci.source_timeframe) = LOWER(pa.timeframe)
                    )
-               SET pa.order_request_status = %s,
-                   pa.order_request_filled = %s,
-                   pa.order_request_filled_failure_reason = %s
-             WHERE ci.programme_trade_id = %s
-               AND ci.userid = %s
-               AND ci.programmeid = %s
+               SET pa.order_request_status = {status_sql},
+                   pa.order_request_filled = {filled_sql},
+                   pa.order_request_filled_failure_reason = {failure_sql}
+             WHERE ci.programme_trade_id = {mid}
+               AND ci.userid = {uid}
+               AND ci.programmeid = {pid}
                AND (
                     TRIM(COALESCE(pa.order_request_status, '')) = ''
-                    OR LOWER(REPLACE(REPLACE(TRIM(COALESCE(pa.order_request_status, '')), '_', ' '), '-', ' ')) = %s
+                    OR LOWER(REPLACE(REPLACE(TRIM(COALESCE(pa.order_request_status, '')), '_', ' '), '-', ' ')) = {status_sql}
                )
                AND EXISTS (
                     SELECT 1 FROM programme_trades p
                      WHERE p.id = ci.programme_trade_id
-                       AND p.userid = %s
-                       AND p.programmeid = %s
+                       AND p.userid = {uid}
+                       AND p.programmeid = {pid}
                        AND p.investor_id IS NULL
-                       AND LOWER(REPLACE(REPLACE(TRIM(COALESCE(p.order_request_status, '')), '_', ' '), '-', ' ')) = %s
+                       AND LOWER(REPLACE(REPLACE(TRIM(COALESCE(p.order_request_status, '')), '_', ' '), '-', ' ')) = {status_sql}
                )
         """
-        db_execute(sql, [request_status, int(filled), failure_reason,
-                         int(master_id), int(programme_userid), int(programme_id), request_status,
-                         int(programme_userid), int(programme_id), request_status],
-                   timeout=20.0, quiet=True)
+        ok, _, error = db_execute(sql, None, timeout=20.0, quiet=True)
+        if not ok:
+            print(f"  [REQUEST] Analytics request-state mirror failed: {error}")
     except Exception as exc:
-        # Analytics mirroring is supplementary; the canonical trade row remains
-        # the execution source of truth and is still updated independently.
+        # Analytics mirroring is supplementary; canonical programme_trades is
+        # the manual-request source of truth.
         print(f"  [REQUEST] Analytics request-state mirror skipped: {exc}")
-
 
 def _pt_request_aggregate_programme_fill(master_id, tradeid, programme_userid,
                                          programme_id, request_status,
                                          forced_failure=None):
-    """Set canonical filled=1 only after every active investor copy is filled."""
+    """Fill parent only after every currently contract_active deal pair is confirmed."""
+    mid = _coerce_int(master_id)
+    tid = _coerce_int(tradeid)
+    uid = _coerce_int(programme_userid)
+    pid = _coerce_int(programme_id)
+    if not all((mid and mid > 0, tid and tid > 0, uid and uid > 0, pid and pid > 0)):
+        return False, 'Manual request aggregation is missing a valid parent/trade/programme identity.'
+
+    status_sql = _pt_sql_literal(request_status)
+    parent_guard = (
+        f"id = {mid} AND userid = {uid} AND programmeid = {pid} "
+        "AND investor_id IS NULL "
+        f"AND LOWER(REPLACE(REPLACE(TRIM(COALESCE(order_request_status, '')), '_', ' '), '-', ' ')) = {status_sql}"
+    )
+
     if forced_failure:
         reason = _pt_request_retry_reason(forced_failure)
         db_execute(
-            "UPDATE programme_trades SET order_request_status = %s, "
-            "order_request_filled = 0, order_request_filled_failure_reason = %s "
-            "WHERE id = %s AND userid = %s AND programmeid = %s AND investor_id IS NULL "
-            "AND LOWER(REPLACE(REPLACE(TRIM(COALESCE(order_request_status, '')), '_', ' '), '-', ' ')) = %s",
-            [request_status, reason, int(master_id), int(programme_userid), int(programme_id), request_status],
-            timeout=15.0, quiet=True,
+            f"UPDATE programme_trades SET order_request_filled = 0, "
+            f"order_request_filled_failure_reason = {_pt_sql_literal(reason)} "
+            f"WHERE {parent_guard}",
+            None, timeout=15.0, quiet=True,
         )
-        _pt_request_update_analytics(master_id, programme_userid, programme_id,
-                                     request_status, 0, reason)
+        _pt_request_update_analytics(mid, uid, pid, request_status, 0, reason)
         return False, reason
 
-    # Start from every ACTIVE revenue-deal/subaccount association and LEFT JOIN
-    # its investor copy.  An INNER JOIN here would silently omit an active
-    # investor whose copy has not synchronized yet, allowing the programme
-    # master to be marked filled before every subscribed account was handled.
-    rows = db_fetch_all(
-        """
-        SELECT DISTINCT d.investor_id, d.investor_sub_account_id,
-               cp.id, cp.order_request_status, cp.order_request_filled,
+    # Start with PHP-eligible revenue-deal pairs, then LEFT JOIN this signal's
+    # investor copy. That way an active investor whose copy has not synchronized
+    # yet prevents the programme master from being marked filled prematurely.
+    sql = f"""
+        SELECT DISTINCT
+               d.investor_id,
+               d.investor_sub_account_id,
+               cp.id AS investor_trade_id,
+               cp.order_request_status,
+               cp.order_request_filled,
                cp.order_request_filled_failure_reason
           FROM programme_revenue_deals d
           INNER JOIN harvhub h
@@ -13204,165 +13483,216 @@ def _pt_request_aggregate_programme_fill(master_id, tradeid, programme_userid,
                  AND h.sub_account_id = d.investor_sub_account_id
                  AND h.account_contract_status = 'contract_active'
           LEFT JOIN programme_trades cp
-                 ON cp.userid = %s
-                AND cp.programmeid = d.programme_id
-                AND cp.tradeid = %s
+                 ON cp.userid = {uid}
+                AND cp.programmeid = {pid}
+                AND cp.tradeid = {tid}
                 AND cp.investor_id = d.investor_id
                 AND cp.investor_sub_account_id = d.investor_sub_account_id
-         WHERE d.programme_id = %s
-         ORDER BY d.investor_id ASC, d.investor_sub_account_id ASC, cp.id ASC
-        """,
-        [int(programme_userid), int(tradeid), int(programme_id)],
-        timeout=20.0, quiet=True,
-    )
+                AND cp.live = 1
+         WHERE d.programme_id = {pid}
+           AND d.investor_id > 0
+           AND d.investor_sub_account_id > 0
+         ORDER BY d.investor_id ASC, d.investor_sub_account_id ASC
+    """
+    rows, query_error = _strict_db_rows(sql, None, timeout=20.0)
+    if rows is None:
+        reason = _pt_request_retry_reason(
+            'Could not read active investor deal/copy rows for request aggregation: '
+            + str(query_error)
+        )
+        db_execute(
+            f"UPDATE programme_trades SET order_request_filled = 0, "
+            f"order_request_filled_failure_reason = {_pt_sql_literal(reason)} "
+            f"WHERE {parent_guard}",
+            None, timeout=15.0, quiet=True,
+        )
+        _pt_request_update_analytics(mid, uid, pid, request_status, 0, reason)
+        return False, reason
 
     if not rows:
         reason = _pt_request_retry_reason(
-            'No active investor trade copies are currently available to confirm this programme request.'
+            'No investor/subaccount currently qualifies under the PHP contract_active rule for this programme.'
         )
         db_execute(
-            "UPDATE programme_trades SET order_request_status = %s, "
-            "order_request_filled = 0, order_request_filled_failure_reason = %s "
-            "WHERE id = %s AND userid = %s AND programmeid = %s AND investor_id IS NULL "
-            "AND LOWER(REPLACE(REPLACE(TRIM(COALESCE(order_request_status, '')), '_', ' '), '-', ' ')) = %s",
-            [request_status, reason, int(master_id), int(programme_userid), int(programme_id), request_status],
-            timeout=15.0, quiet=True,
+            f"UPDATE programme_trades SET order_request_filled = 0, "
+            f"order_request_filled_failure_reason = {_pt_sql_literal(reason)} "
+            f"WHERE {parent_guard}",
+            None, timeout=15.0, quiet=True,
         )
-        _pt_request_update_analytics(master_id, programme_userid, programme_id,
-                                     request_status, 0, reason)
+        _pt_request_update_analytics(mid, uid, pid, request_status, 0, reason)
         return False, reason
 
     incomplete = []
+    seen_pairs = set()
     for row in rows:
         inv_id = _coerce_int(_raw_first_key(row, 'investor_id')) or 0
         sub_id = _coerce_int(_raw_first_key(row, 'investor_sub_account_id')) or 0
+        if inv_id <= 0 or sub_id <= 0:
+            continue
+        pair = (inv_id, sub_id)
+        if pair in seen_pairs:
+            continue
+        seen_pairs.add(pair)
+
         label = f'investor {inv_id}/subaccount {sub_id}'
-        copy_id = _coerce_int(_raw_first_key(row, 'id'))
-        if not copy_id:
-            incomplete.append(f'{label}: investor trade copy is missing; waiting for programme trade synchronization')
-            continue
+        copy_id = _coerce_int(_raw_first_key(row, 'investor_trade_id'))
         copy_status = _pt_request_normalize(_raw_first_key(row, 'order_request_status'))
-        if (copy_status == request_status and
-                int(_coerce_int(_raw_first_key(row, 'order_request_filled')) or 0) == 1):
+        copy_filled = int(_coerce_int(_raw_first_key(row, 'order_request_filled')) or 0)
+        copy_reason = str(_raw_first_key(row, 'order_request_filled_failure_reason') or '').strip()
+        if not copy_id:
+            incomplete.append(f'{label}: LIVE inherited programme_trades copy is missing')
+        elif copy_status == request_status and copy_filled == 1 and not copy_reason:
             continue
-        detail = str(_raw_first_key(row, 'order_request_filled_failure_reason') or '').strip()
-        incomplete.append(f'{label}: {detail}' if detail else f'{label}: awaiting MT5 confirmation')
+        else:
+            incomplete.append(f'{label}: {copy_reason or "awaiting MT5 confirmation"}')
 
     if not incomplete:
         filled = 1
         reason = None
     else:
         filled = 0
-        reason = _pt_request_retry_reason(' | '.join(incomplete[:3]))
+        details = ' | '.join(incomplete[:3])
         if len(incomplete) > 3:
-            reason = _pt_request_retry_reason(reason.rstrip('.') + f' (+{len(incomplete) - 3} more account(s))')
+            details += f' (+{len(incomplete) - 3} more account(s))'
+        reason = _pt_request_retry_reason(details)
 
-    update_ok, _, update_error = db_execute(
-        "UPDATE programme_trades SET order_request_status = %s, "
-        "order_request_filled = %s, order_request_filled_failure_reason = %s "
-        "WHERE id = %s AND userid = %s AND programmeid = %s AND investor_id IS NULL "
-        "AND LOWER(REPLACE(REPLACE(TRIM(COALESCE(order_request_status, '')), '_', ' '), '-', ' ')) = %s",
-        [request_status, int(filled), reason, int(master_id),
-         int(programme_userid), int(programme_id), request_status],
-        timeout=15.0, quiet=True,
-    )
+    update_sql = f"""
+        UPDATE programme_trades
+           SET order_request_filled = {1 if filled else 0},
+               order_request_filled_failure_reason = {_pt_sql_literal(reason)}
+         WHERE {parent_guard}
+    """
+    update_ok, _, update_error = db_execute(update_sql, None, timeout=15.0, quiet=True)
     if not update_ok:
-        reason = _pt_request_retry_reason(f'Investor MT5 actions completed, but canonical programme_trades fill update failed: {update_error}')
+        reason = _pt_request_retry_reason(
+            'Investor MT5 actions completed, but canonical programme_trades fill update failed: '
+            + str(update_error)
+        )
         db_execute(
-            "UPDATE programme_trades SET order_request_filled = 0, order_request_filled_failure_reason = %s "
-            "WHERE id = %s AND userid = %s AND programmeid = %s AND investor_id IS NULL "
-            "AND LOWER(REPLACE(REPLACE(TRIM(COALESCE(order_request_status, '')), '_', ' '), '-', ' ')) = %s",
-            [reason, int(master_id), int(programme_userid), int(programme_id), request_status],
-            timeout=15.0, quiet=True,
+            f"UPDATE programme_trades SET order_request_filled = 0, "
+            f"order_request_filled_failure_reason = {_pt_sql_literal(reason)} "
+            f"WHERE {parent_guard}",
+            None, timeout=15.0, quiet=True,
         )
         filled = 0
 
-    _pt_request_update_analytics(master_id, programme_userid, programme_id,
-                                 request_status, filled, reason)
+    _pt_request_update_analytics(mid, uid, pid, request_status, filled, reason)
     return bool(filled), reason
 
-
 def _pt_request_record_preconnect_failure(job, reason):
-    """Persist a retry reason when this account cannot safely reach MT5."""
+    """Persist a retry reason on this investor copy if MT5 cannot be reached."""
     try:
         investor_id = _coerce_int((job or {}).get('investor_id'))
         sub_account_id = _coerce_int((job or {}).get('sub_account_id'))
         programme_id = _coerce_int((job or {}).get('programme_id'))
         programme_userid = resolve_programme_userid(programme_id, job)
-        if not all((investor_id, sub_account_id, programme_id, programme_userid)):
+        if not all((investor_id and investor_id > 0, sub_account_id and sub_account_id > 0,
+                    programme_id and programme_id > 0, programme_userid and programme_userid > 0)):
             return 0
+
         columns = _db_table_columns('programme_trades')
-        if not {
-            'id', 'userid', 'programmeid', 'investor_id', 'investor_sub_account_id',
-            'tradeid', 'order_request_status', 'order_request_filled',
+        required = {
+            'id', 'userid', 'programmeid', 'investor_id',
+            'investor_sub_account_id', 'tradeid', 'live', 'orderstatus',
+            'order_request_status', 'order_request_filled',
             'order_request_filled_failure_reason'
-        }.issubset(columns):
+        }
+        if not required.issubset(columns):
             return 0
-        rows = db_fetch_all(
-            """
-            SELECT p.id AS programme_trade_id, p.tradeid,
-                   p.order_request_status, t.id AS investor_trade_id
+
+        uid = int(programme_userid)
+        pid = int(programme_id)
+        inv = int(investor_id)
+        sub = int(sub_account_id)
+        rows, query_error = _strict_db_rows(
+            f"""
+            SELECT p.id AS programme_trade_id, p.tradeid, p.order_request_status
               FROM programme_trades p
-              LEFT JOIN programme_trades t
-                     ON t.userid = p.userid
-                    AND t.programmeid = p.programmeid
-                    AND t.tradeid = p.tradeid
-                    AND t.investor_id = %s
-                    AND t.investor_sub_account_id = %s
-             WHERE p.userid = %s AND p.programmeid = %s
+             WHERE p.userid = {uid}
+               AND p.programmeid = {pid}
                AND p.investor_id IS NULL
+               AND p.live = 1
                AND p.tradeid IS NOT NULL
                AND TRIM(COALESCE(p.order_request_status, '')) <> ''
             """,
-            [int(investor_id), int(sub_account_id), int(programme_userid), int(programme_id)],
-            timeout=15.0, quiet=True,
+            None, timeout=15.0,
         )
+        if rows is None:
+            print(f"  [REQUEST] Could not load pre-connect requests: {query_error}")
+            return 0
+
         saved = 0
         retry_reason = _pt_request_retry_reason(reason)
         for row in rows:
-            request_status = _pt_request_normalize(_raw_first_key(row, 'order_request_status'))
+            request_status = _pt_request_normalize(
+                _raw_first_key(row, 'order_request_status')
+            )
             if request_status not in (
-                'position closing requested', 'order closing requested', 'breakeven requested'
+                'position closing requested',
+                'order closing requested',
+                'breakeven requested',
             ):
                 continue
             master_id = _coerce_int(_raw_first_key(row, 'programme_trade_id'))
             tradeid = _coerce_int(_raw_first_key(row, 'tradeid'))
-            investor_row_id = _coerce_int(_raw_first_key(row, 'investor_trade_id'))
-            if investor_row_id:
-                db_execute(
-                    "UPDATE programme_trades cp "
-                    "INNER JOIN programme_trades p ON p.id = %s AND p.userid = %s "
-                    "AND p.programmeid = %s AND p.investor_id IS NULL "
-                    "AND LOWER(REPLACE(REPLACE(TRIM(COALESCE(p.order_request_status, '')), '_', ' '), '-', ' ')) = %s "
-                    "SET cp.order_request_status = %s, cp.order_request_filled = 0, "
-                    "cp.order_request_filled_failure_reason = %s "
-                    "WHERE cp.id = %s AND cp.userid = %s AND cp.programmeid = %s "
-                    "AND cp.investor_id = %s AND cp.investor_sub_account_id = %s",
-                    [int(master_id), int(programme_userid), int(programme_id), request_status,
-                     request_status, retry_reason, int(investor_row_id), int(programme_userid),
-                     int(programme_id), int(investor_id), int(sub_account_id)],
-                    timeout=12.0, quiet=True,
+            if not master_id or not tradeid:
+                continue
+
+            status_sql = _pt_sql_literal(request_status)
+            update_sql = f"""
+                UPDATE programme_trades cp
+                INNER JOIN programme_trades p
+                        ON p.id = {int(master_id)}
+                       AND p.userid = {uid}
+                       AND p.programmeid = {pid}
+                       AND p.investor_id IS NULL
+                       AND LOWER(REPLACE(REPLACE(TRIM(COALESCE(p.order_request_status, '')), '_', ' '), '-', ' ')) = {status_sql}
+                   SET cp.order_request_status = {status_sql},
+                       cp.order_request_filled = 0,
+                       cp.order_request_filled_failure_reason = {_pt_sql_literal(retry_reason)}
+                 WHERE cp.userid = {uid}
+                   AND cp.programmeid = {pid}
+                   AND cp.tradeid = {int(tradeid)}
+                   AND cp.investor_id = {inv}
+                   AND cp.investor_sub_account_id = {sub}
+                   AND cp.live = 1
+                   AND LOWER(TRIM(COALESCE(cp.orderstatus, ''))) IN ('pending', 'running')
+            """
+            copy_ok, _, copy_error = db_execute(
+                update_sql, None, timeout=15.0, quiet=True
+            )
+            if copy_ok:
+                saved += 1
+            else:
+                print(
+                    f"  [REQUEST] Could not persist pre-connect failure for "
+                    f"investor={inv} sub={sub} tradeid={tradeid}: {copy_error}"
                 )
-            if master_id and tradeid:
-                _pt_request_aggregate_programme_fill(
-                    master_id, tradeid, programme_userid, programme_id,
-                    request_status, forced_failure=retry_reason,
-                )
-            saved += 1
+
+            _pt_request_aggregate_programme_fill(
+                int(master_id), int(tradeid), uid, pid,
+                request_status, forced_failure=retry_reason,
+            )
         return saved
     except Exception as exc:
         print(f"  [REQUEST] Could not persist pre-connect retry reason: {exc}")
         return 0
 
-
 def process_programme_order_requests_db(inv_db_id=None, jobs=None):
-    """Execute canonical programme requests on this investor's connected MT5 subaccount."""
+    """Execute only the explicit programme manual-request fields on this investor's MT5 account.
+
+    Parent programme_trades rows are the request source; the investor-specific
+    copy supplies the per-subaccount symbol/direction, and tradeid is matched
+    against MT5 magic. All same-magic child tickets are acted on regardless
+    of their individual volume or execution prices.
+    """
     stats = {
         'processing_success': True,
         'requests_seen': 0,
         'requests_succeeded_for_account': 0,
         'requests_retrying': 0,
         'requests_skipped': 0,
+        'matched_mt5_objects': 0,
         'errors': [],
     }
     if not mt5_available():
@@ -13379,14 +13709,21 @@ def process_programme_order_requests_db(inv_db_id=None, jobs=None):
     trade_columns = _db_table_columns('programme_trades')
     required_columns = {
         'id', 'userid', 'programmeid', 'investor_id', 'investor_sub_account_id',
-        'tradeid', 'symbol', 'order_request_status', 'order_request_filled',
+        'tradeid', 'symbol', 'ordertype', 'entry', 'stoploss', 'takeprofit',
+        'live', 'orderstatus', 'order_request_status', 'order_request_filled',
         'order_request_filled_failure_reason',
     }
     if not required_columns.issubset(trade_columns):
         missing = sorted(required_columns - trade_columns)
         stats['processing_success'] = False
-        stats['errors'].append('programme_trades is missing request columns: ' + ', '.join(missing))
-        print('  [REQUEST] Cannot execute manual requests; missing columns: ' + ', '.join(missing))
+        stats['errors'].append(
+            'programme_trades is missing manual-request/signal columns: '
+            + ', '.join(missing)
+        )
+        print(
+            '  [REQUEST] Cannot execute manual requests; missing columns: '
+            + ', '.join(missing)
+        )
         return stats
 
     for job in jobs:
@@ -13395,24 +13732,57 @@ def process_programme_order_requests_db(inv_db_id=None, jobs=None):
         programme_id = _coerce_int(job.get('programme_id'))
         if inv_db_id is not None and investor_id != _coerce_int(inv_db_id):
             continue
+
         programme_userid = resolve_programme_userid(programme_id, job)
-        if not all((investor_id, sub_account_id, programme_id, programme_userid)):
+        if not all((investor_id and investor_id > 0, sub_account_id and sub_account_id > 0,
+                    programme_id and programme_id > 0, programme_userid and programme_userid > 0)):
             stats['requests_skipped'] += 1
             continue
 
-        request_rows = db_fetch_all(
-            """
+        inv = int(investor_id)
+        sub = int(sub_account_id)
+        pid = int(programme_id)
+        uid = int(programme_userid)
+
+        active_now, active_reason = is_active_investor_for_programme(inv, sub, pid)
+        if not active_now:
+            stats['requests_skipped'] += 1
+            stats['errors'].append(
+                f"Investor {inv}/subaccount {sub} is not currently eligible for programme {pid}: {active_reason}"
+            )
+            print(
+                f"  [REQUEST] ⏭️ Skipping inactive/unverified investor={inv} sub={sub} "
+                f"programme={pid}: {active_reason}"
+            )
+            continue
+
+        # tradeid links the programme-owned master row and is also the MT5 magic
+        # identity used to find every child order/position. SQL literals are inlined
+        # because mysqlremote substitutes one bound placeholder per request.
+        request_sql = f"""
             SELECT p.id AS programme_trade_id,
                    p.userid AS programme_userid,
                    p.programmeid AS programme_id,
                    p.tradeid,
                    p.symbol AS programme_symbol,
+                   p.ordertype AS programme_ordertype,
+                   p.entry AS programme_entry,
+                   p.stoploss AS programme_stoploss,
+                   p.takeprofit AS programme_takeprofit,
+                   p.orderstatus AS programme_orderstatus,
+                   p.live AS programme_live,
                    p.order_request_status,
                    p.order_request_filled AS programme_request_filled,
                    p.order_request_filled_failure_reason AS programme_failure_reason,
                    t.id AS investor_trade_id,
                    t.symbol AS investor_symbol,
+                   t.ordertype AS investor_ordertype,
+                   t.entry AS investor_entry,
+                   t.stoploss AS investor_stoploss,
+                   t.takeprofit AS investor_takeprofit,
                    t.orderstatus AS investor_orderstatus,
+                   t.live AS investor_live,
+                   t.order_request_status AS investor_request_status,
                    t.order_request_filled AS investor_request_filled,
                    t.order_request_filled_failure_reason AS investor_failure_reason
               FROM programme_trades p
@@ -13420,41 +13790,82 @@ def process_programme_order_requests_db(inv_db_id=None, jobs=None):
                      ON t.userid = p.userid
                     AND t.programmeid = p.programmeid
                     AND t.tradeid = p.tradeid
-                    AND t.investor_id = %s
-                    AND t.investor_sub_account_id = %s
-             WHERE p.userid = %s
-               AND p.programmeid = %s
+                    AND t.investor_id = {inv}
+                    AND t.investor_sub_account_id = {sub}
+                    AND t.live = 1
+                    AND LOWER(TRIM(COALESCE(t.orderstatus, ''))) IN ('pending', 'running')
+             WHERE p.userid = {uid}
+               AND p.programmeid = {pid}
                AND p.investor_id IS NULL
+               AND p.live = 1
                AND p.tradeid IS NOT NULL
                AND TRIM(COALESCE(p.order_request_status, '')) <> ''
-             ORDER BY p.id ASC
-            """,
-            [int(investor_id), int(sub_account_id), int(programme_userid), int(programme_id)],
-            timeout=20.0, quiet=True,
+               AND EXISTS (
+                    SELECT 1
+                      FROM programme_revenue_deals d
+                      INNER JOIN harvhub h
+                              ON h.id = d.investor_id
+                             AND h.sub_account_id = d.investor_sub_account_id
+                     WHERE d.programme_id = p.programmeid
+                       AND d.investor_id = {inv}
+                       AND d.investor_sub_account_id = {sub}
+                       AND h.account_contract_status = 'contract_active'
+               )
+             ORDER BY p.id ASC, t.id ASC
+        """
+        request_rows, request_error = _strict_db_rows(
+            request_sql, None, timeout=20.0
         )
+        if request_rows is None:
+            stats['processing_success'] = False
+            stats['errors'].append(
+                f"Could not read manual requests for investor={inv}/sub={sub}, "
+                f"programme={pid}: {request_error}"
+            )
+            continue
         if not request_rows:
             continue
 
-        # Detect duplicate canonical magic values inside this programme before
-        # any MT5 action, including trades that do not currently carry a request.
-        # The MT5 magic field itself does not contain programme_id.
-        master_magic_counts = {}
-        canonical_count_rows = db_fetch_all(
-            "SELECT tradeid, COUNT(*) AS row_count FROM programme_trades "
-            "WHERE userid = %s AND programmeid = %s AND investor_id IS NULL "
-            "AND tradeid IS NOT NULL GROUP BY tradeid",
-            [int(programme_userid), int(programme_id)],
-            timeout=15.0, quiet=True,
+        counts_sql = f"""
+            SELECT tradeid, COUNT(*) AS row_count
+              FROM programme_trades
+             WHERE userid = {uid}
+               AND programmeid = {pid}
+               AND investor_id IS NULL
+               AND tradeid IS NOT NULL
+             GROUP BY tradeid
+        """
+        canonical_count_rows, counts_error = _strict_db_rows(
+            counts_sql, None, timeout=15.0
         )
+        if canonical_count_rows is None:
+            stats['processing_success'] = False
+            stats['errors'].append(
+                f"Could not verify programme trade identities for programme={pid}: {counts_error}"
+            )
+            continue
+        master_tradeid_counts = {}
         for item in canonical_count_rows:
             tid = _coerce_int(_raw_first_key(item, 'tradeid'))
             count = _coerce_int(_raw_first_key(item, 'row_count')) or 0
             if tid:
-                master_magic_counts[tid] = count
+                master_tradeid_counts[tid] = count
 
-        catalogue = fetch_subaccount_magic_catalog(investor_id, sub_account_id)
+        # The inherited copy establishes the programme/subaccount relationship.
+        # The magic catalogue proves that this MT5 magic is not shared with a
+        # different programme on this exact investor terminal.
+        magic_catalogue = fetch_subaccount_magic_catalog(inv, sub)
+
+        processed_master_ids = set()
         for row in request_rows:
-            request_status = _pt_request_normalize(_raw_first_key(row, 'order_request_status'))
+            master_id = _coerce_int(_raw_first_key(row, 'programme_trade_id'))
+            if not master_id or master_id in processed_master_ids:
+                continue
+            processed_master_ids.add(master_id)
+
+            request_status = _pt_request_normalize(
+                _raw_first_key(row, 'order_request_status')
+            )
             if request_status not in (
                 'position closing requested',
                 'order closing requested',
@@ -13463,180 +13874,291 @@ def process_programme_order_requests_db(inv_db_id=None, jobs=None):
                 continue
 
             stats['requests_seen'] += 1
-            master_id = _coerce_int(_raw_first_key(row, 'programme_trade_id'))
-            investor_row_id = _coerce_int(_raw_first_key(row, 'investor_trade_id'))
             tradeid = _coerce_int(_raw_first_key(row, 'tradeid'))
-            symbol = str(_raw_first_key(row, 'programme_symbol') or _raw_first_key(row, 'investor_symbol') or '').strip()
+            investor_row_id = _coerce_int(_raw_first_key(row, 'investor_trade_id'))
+            status_sql = _pt_sql_literal(request_status)
 
-            if not master_id or not tradeid:
-                stats['requests_skipped'] += 1
-                continue
-
+            latest_master_sql = f"""
+                SELECT order_request_status, orderstatus, live
+                  FROM programme_trades
+                 WHERE id = {int(master_id)}
+                   AND userid = {uid}
+                   AND programmeid = {pid}
+                   AND investor_id IS NULL
+                 LIMIT 1
+            """
             latest_master = db_fetch_one(
-                "SELECT order_request_status FROM programme_trades "
-                "WHERE id = %s AND userid = %s AND programmeid = %s "
-                "AND investor_id IS NULL LIMIT 1",
-                [int(master_id), int(programme_userid), int(programme_id)],
-                timeout=10.0, quiet=True,
+                latest_master_sql, None, timeout=10.0, quiet=True
             ) or {}
-            if _pt_request_normalize(_raw_first_key(latest_master, 'order_request_status')) != request_status:
+            if _pt_request_normalize(
+                _raw_first_key(latest_master, 'order_request_status')
+            ) != request_status:
                 stats['requests_skipped'] += 1
                 continue
 
-            # Breakeven is a one-time confirmed change. Once both the canonical
-            # programme request and this investor copy say filled=1 with no
-            # failure reason, do not re-run it on later cycles (the position may
-            # since have closed at the breakeven stop). Closure requests remain
-            # reconciled against live MT5 tickets because an earlier bulk/manual
-            # fill flag must never leave an actually-open position/order untouched.
-            if request_status == 'breakeven requested':
-                programme_filled = int(_coerce_int(_raw_first_key(row, 'programme_request_filled')) or 0)
-                investor_filled = int(_coerce_int(_raw_first_key(row, 'investor_request_filled')) or 0)
-                programme_reason = str(_raw_first_key(row, 'programme_failure_reason') or '').strip()
-                investor_reason = str(_raw_first_key(row, 'investor_failure_reason') or '').strip()
-                if programme_filled == 1 and investor_filled == 1 and not programme_reason and not investor_reason:
-                    stats['requests_skipped'] += 1
-                    continue
+            if not tradeid:
+                reason = _pt_request_retry_reason(
+                    'The canonical programme trade has no tradeid; its investor copy cannot be resolved.'
+                )
+                db_execute(
+                    f"UPDATE programme_trades SET order_request_filled = 0, "
+                    f"order_request_filled_failure_reason = {_pt_sql_literal(reason)} "
+                    f"WHERE id = {int(master_id)} AND userid = {uid} "
+                    f"AND programmeid = {pid} AND investor_id IS NULL "
+                    f"AND LOWER(REPLACE(REPLACE(TRIM(COALESCE(order_request_status, '')), '_', ' '), '-', ' ')) = {status_sql}",
+                    None, timeout=15.0, quiet=True,
+                )
+                _pt_request_update_analytics(
+                    master_id, uid, pid, request_status, 0, reason
+                )
+                stats['requests_retrying'] += 1
+                stats['errors'].append(reason)
+                continue
+
+            required_parent_status = (
+                'pending' if request_status == 'order closing requested' else 'running'
+            )
+            latest_status = str(
+                _raw_first_key(latest_master, 'orderstatus') or ''
+            ).strip().lower()
+            if int(_coerce_int(_raw_first_key(latest_master, 'live')) or 0) != 1:
+                reason = _pt_request_retry_reason(
+                    'The canonical programme signal is no longer marked LIVE; manual execution is blocked.'
+                )
+                _pt_request_aggregate_programme_fill(
+                    master_id, tradeid, uid, pid, request_status,
+                    forced_failure=reason,
+                )
+                stats['requests_retrying'] += 1
+                stats['errors'].append(reason)
+                continue
+            if latest_status != required_parent_status:
+                reason = _pt_request_retry_reason(
+                    f"Request '{request_status}' requires programme orderstatus "
+                    f"'{required_parent_status}', but the master row is '{latest_status or 'empty'}'."
+                )
+                _pt_request_aggregate_programme_fill(
+                    master_id, tradeid, uid, pid, request_status,
+                    forced_failure=reason,
+                )
+                stats['requests_retrying'] += 1
+                stats['errors'].append(reason)
+                continue
 
             if not investor_row_id:
                 reason = _pt_request_retry_reason(
-                    f'No investor-specific programme_trades copy exists for trade magic {tradeid} on this subaccount; request cannot be routed yet.'
+                    f'No LIVE investor programme_trades copy exists for tradeid {tradeid} '
+                    f'on investor {inv}/subaccount {sub}; waiting for sync.'
                 )
                 db_execute(
-                    "UPDATE programme_trades SET order_request_status = %s, order_request_filled = 0, "
-                    "order_request_filled_failure_reason = %s WHERE id = %s AND userid = %s "
-                    "AND programmeid = %s AND investor_id IS NULL "
-                    "AND LOWER(REPLACE(REPLACE(TRIM(COALESCE(order_request_status, '')), '_', ' '), '-', ' ')) = %s",
-                    [request_status, reason, int(master_id), int(programme_userid), int(programme_id), request_status],
-                    timeout=15.0, quiet=True,
+                    f"UPDATE programme_trades SET order_request_filled = 0, "
+                    f"order_request_filled_failure_reason = {_pt_sql_literal(reason)} "
+                    f"WHERE id = {int(master_id)} AND userid = {uid} "
+                    f"AND programmeid = {pid} AND investor_id IS NULL "
+                    f"AND LOWER(REPLACE(REPLACE(TRIM(COALESCE(order_request_status, '')), '_', ' '), '-', ' ')) = {status_sql}",
+                    None, timeout=15.0, quiet=True,
                 )
-                _pt_request_update_analytics(master_id, programme_userid, programme_id,
-                                             request_status, 0, reason)
+                _pt_request_update_analytics(
+                    master_id, uid, pid, request_status, 0, reason
+                )
                 stats['requests_retrying'] += 1
                 stats['errors'].append(reason)
                 continue
 
-            investor_symbol = str(_raw_first_key(row, 'investor_symbol') or '').strip()
-            if investor_symbol and symbol and _pt_request_symbol_key(investor_symbol) != _pt_request_symbol_key(symbol):
+            investor_orderstatus = str(
+                _raw_first_key(row, 'investor_orderstatus') or ''
+            ).strip().lower()
+            investor_live = int(
+                _coerce_int(_raw_first_key(row, 'investor_live')) or 0
+            )
+            if investor_live != 1 or investor_orderstatus not in ('pending', 'running'):
                 reason = _pt_request_retry_reason(
-                    f'Investor trade copy symbol {investor_symbol} does not match programme symbol {symbol}; refusing to modify the wrong instrument.'
+                    'The investor signal copy is not LIVE and pending/running; refusing an unrelated or historical trade row.'
                 )
-                db_execute(
-                    "UPDATE programme_trades cp "
-                    "INNER JOIN programme_trades p ON p.id = %s AND p.userid = %s "
-                    "AND p.programmeid = %s AND p.investor_id IS NULL "
-                    "AND LOWER(REPLACE(REPLACE(TRIM(COALESCE(p.order_request_status, '')), '_', ' '), '-', ' ')) = %s "
-                    "SET cp.order_request_status = %s, cp.order_request_filled = 0, "
-                    "cp.order_request_filled_failure_reason = %s "
-                    "WHERE cp.id = %s AND cp.userid = %s AND cp.programmeid = %s "
-                    "AND cp.investor_id = %s AND cp.investor_sub_account_id = %s",
-                    [int(master_id), int(programme_userid), int(programme_id), request_status,
-                     request_status, reason, int(investor_row_id), int(programme_userid),
-                     int(programme_id), int(investor_id), int(sub_account_id)],
-                    timeout=15.0, quiet=True,
+                update_copy_failure_sql = f"""
+                    UPDATE programme_trades
+                       SET order_request_filled = 0,
+                           order_request_filled_failure_reason = {_pt_sql_literal(reason)}
+                     WHERE userid = {uid} AND programmeid = {pid}
+                       AND tradeid = {int(tradeid)} AND investor_id = {inv}
+                       AND investor_sub_account_id = {sub} AND live = 1
+                """
+                db_execute(update_copy_failure_sql, None, timeout=15.0, quiet=True)
+                _pt_request_aggregate_programme_fill(
+                    master_id, tradeid, uid, pid,
+                    request_status, forced_failure=reason,
                 )
-                _pt_request_aggregate_programme_fill(master_id, tradeid, programme_userid,
-                                                     programme_id, request_status)
                 stats['requests_retrying'] += 1
                 stats['errors'].append(reason)
                 continue
 
-            if master_magic_counts.get(tradeid, 0) != 1:
+            reason = None
+            matched_this_request = 0
+            if master_tradeid_counts.get(tradeid, 0) != 1:
+                action_ok = False
                 reason = _pt_request_retry_reason(
-                    f'Programme trade magic {tradeid} is duplicated across canonical programme_trades rows; refusing an ambiguous MT5 action.'
+                    f'Canonical programme tradeid {tradeid} is duplicated inside programme {pid}; refusing an ambiguous source row.'
                 )
+            elif not magic_catalogue.get('ok'):
                 action_ok = False
-            elif not catalogue.get('ok'):
                 reason = _pt_request_retry_reason(
-                    'Could not verify this subaccount trade magic against the programme/subaccount catalogue: ' +
-                    str(catalogue.get('reason') or 'catalogue unavailable')
+                    'Could not verify this subaccount magic catalogue: '
+                    + str(magic_catalogue.get('reason') or 'catalogue unavailable')
                 )
+            elif tradeid in (magic_catalogue.get('ambiguous') or set()):
                 action_ok = False
-            elif tradeid in (catalogue.get('ambiguous') or set()):
                 reason = _pt_request_retry_reason(
-                    f'MT5 magic {tradeid} is shared by more than one programme on this subaccount; refusing to affect another programme trade.'
+                    f'MT5 magic {tradeid} is associated with more than one programme on this investor subaccount; refusing cross-programme action.'
                 )
+            elif pid not in set(magic_catalogue.get('by_magic', {}).get(tradeid, set())):
                 action_ok = False
-            elif int(programme_id) not in set(catalogue.get('by_magic', {}).get(tradeid, set())):
                 reason = _pt_request_retry_reason(
-                    f'MT5 magic {tradeid} is not authorized for programme {programme_id} on this investor subaccount.'
+                    f'MT5 magic {tradeid} is not mapped to programme {pid} on this investor subaccount.'
                 )
-                action_ok = False
-            elif not symbol:
-                reason = _pt_request_retry_reason('Programme trade symbol is empty; cannot locate the MT5 instrument.')
-                action_ok = False
             else:
-                if request_status in ('position closing requested', 'order closing requested'):
-                    action_ok, reason = _pt_request_close_trade_on_mt5(tradeid, symbol)
+                # The inherited copy supplies the instrument and direction.
+                # tradeid/magic is the unique primary identity; price levels
+                # are not used to select broker tickets.
+                def row_value(copy_key, parent_key):
+                    value = _raw_first_key(row, copy_key)
+                    return value if value not in (None, '', 'NULL') else _raw_first_key(row, parent_key)
+
+                signal = {
+                    'symbol': str(
+                        row_value('investor_symbol', 'programme_symbol') or ''
+                    ).strip(),
+                    'ordertype': row_value('investor_ordertype', 'programme_ordertype'),
+                    'entry': row_value('investor_entry', 'programme_entry'),
+                    'stoploss': row_value('investor_stoploss', 'programme_stoploss'),
+                    'takeprofit': row_value('investor_takeprofit', 'programme_takeprofit'),
+                }
+                programme_symbol = str(
+                    _raw_first_key(row, 'programme_symbol') or ''
+                ).strip()
+                if (
+                    not signal['symbol'] or not programme_symbol
+                    or _pt_request_symbol_key(signal['symbol']) != _pt_request_symbol_key(programme_symbol)
+                ):
+                    action_ok = False
+                    reason = _pt_request_retry_reason(
+                        'The investor programme-trade copy symbol does not match the canonical programme signal.'
+                    )
+                elif not _pt_request_signal_has_price_levels(signal):
+                    action_ok = False
+                    reason = _pt_request_retry_reason(
+                        'The inherited programme-trade copy has no valid symbol/direction metadata for its canonical magic; refusing to guess.'
+                    )
                 else:
-                    action_ok, reason = _pt_request_breakeven_trade_on_mt5(tradeid, symbol)
+                    snap_ok, snap_orders, snap_positions, snap_error = _pt_request_mt5_snapshot()
+                    if not snap_ok:
+                        action_ok = False
+                        reason = _pt_request_retry_reason(snap_error)
+                    else:
+                        if request_status == 'order closing requested':
+                            matches = [
+                                obj for obj in snap_orders
+                                if _pt_request_matches_signal(obj, signal, tradeid, is_position=False)
+                            ]
+                        else:
+                            matches = [
+                                obj for obj in snap_positions
+                                if _pt_request_matches_signal(obj, signal, tradeid, is_position=True)
+                            ]
+                        matched_this_request = len(matches)
+                        stats['matched_mt5_objects'] += matched_this_request
+                        if request_status == 'order closing requested':
+                            action_ok, reason = _pt_request_close_order_on_mt5(tradeid, signal)
+                        elif request_status == 'position closing requested':
+                            action_ok, reason = _pt_request_close_positions_on_mt5(tradeid, signal)
+                        else:
+                            action_ok, reason = _pt_request_breakeven_trade_on_mt5(tradeid, signal)
 
             if action_ok:
                 reason = None
                 print(
-                    f"  [REQUEST] ✅ {request_status} completed for investor={investor_id} "
-                    f"sub={sub_account_id}, programme={programme_id}, magic={tradeid} ({symbol})"
+                    f"  [REQUEST] ✅ {request_status} magic-identity match completed for "
+                    f"investor={inv} sub={sub}, programme={pid}, tradeid={tradeid}; "
+                    f"matched MT5 object(s)={matched_this_request}"
                 )
             else:
                 reason = _pt_request_retry_reason(reason)
                 print(
-                    f"  [REQUEST] ⏳ {request_status} not yet completed for investor={investor_id} "
-                    f"sub={sub_account_id}, programme={programme_id}, magic={tradeid}: {reason}"
+                    f"  [REQUEST] ⏳ {request_status} not yet completed for "
+                    f"investor={inv} sub={sub}, programme={pid}, tradeid={tradeid}: {reason}"
                 )
 
-            # A user may cancel or replace the request while MT5 is processing it.
-            # Do not write an obsolete request back into the investor-side copy.
+            # Guard against a request being cancelled/replaced while MT5 acts.
+            latest_after_action_sql = f"""
+                SELECT order_request_status
+                  FROM programme_trades
+                 WHERE id = {int(master_id)}
+                   AND userid = {uid}
+                   AND programmeid = {pid}
+                   AND investor_id IS NULL
+                 LIMIT 1
+            """
             latest_after_action = db_fetch_one(
-                "SELECT order_request_status FROM programme_trades "
-                "WHERE id = %s AND userid = %s AND programmeid = %s "
-                "AND investor_id IS NULL LIMIT 1",
-                [int(master_id), int(programme_userid), int(programme_id)],
-                timeout=10.0, quiet=True,
+                latest_after_action_sql, None, timeout=10.0, quiet=True
             ) or {}
-            if _pt_request_normalize(_raw_first_key(latest_after_action, 'order_request_status')) != request_status:
+            if _pt_request_normalize(
+                _raw_first_key(latest_after_action, 'order_request_status')
+            ) != request_status:
                 stats['requests_skipped'] += 1
-                print(f"  [REQUEST] Parent request changed during MT5 handling for magic={tradeid}; not updating stale request flags.")
+                print(
+                    f"  [REQUEST] Parent request changed during MT5 handling for "
+                    f"tradeid={tradeid}; not updating stale request flags."
+                )
                 continue
 
+            update_copy_sql = f"""
+                UPDATE programme_trades cp
+                INNER JOIN programme_trades p
+                        ON p.id = {int(master_id)}
+                       AND p.userid = {uid}
+                       AND p.programmeid = {pid}
+                       AND p.investor_id IS NULL
+                       AND LOWER(REPLACE(REPLACE(TRIM(COALESCE(p.order_request_status, '')), '_', ' '), '-', ' ')) = {status_sql}
+                   SET cp.order_request_status = {status_sql},
+                       cp.order_request_filled = {1 if action_ok else 0},
+                       cp.order_request_filled_failure_reason = {_pt_sql_literal(reason)}
+                 WHERE cp.userid = {uid}
+                   AND cp.programmeid = {pid}
+                   AND cp.tradeid = {int(tradeid)}
+                   AND cp.investor_id = {inv}
+                   AND cp.investor_sub_account_id = {sub}
+                   AND cp.live = 1
+                   AND LOWER(TRIM(COALESCE(cp.orderstatus, ''))) IN ('pending', 'running')
+            """
             copy_ok, _, copy_error = db_execute(
-                "UPDATE programme_trades cp "
-                "INNER JOIN programme_trades p ON p.id = %s AND p.userid = %s "
-                "AND p.programmeid = %s AND p.investor_id IS NULL "
-                "AND LOWER(REPLACE(REPLACE(TRIM(COALESCE(p.order_request_status, '')), '_', ' '), '-', ' ')) = %s "
-                "SET cp.order_request_status = %s, cp.order_request_filled = %s, "
-                "cp.order_request_filled_failure_reason = %s "
-                "WHERE cp.id = %s AND cp.userid = %s AND cp.programmeid = %s "
-                "AND cp.investor_id = %s AND cp.investor_sub_account_id = %s AND cp.tradeid = %s",
-                [int(master_id), int(programme_userid), int(programme_id), request_status,
-                 request_status, 1 if action_ok else 0, reason,
-                 int(investor_row_id), int(programme_userid), int(programme_id),
-                 int(investor_id), int(sub_account_id), int(tradeid)],
-                timeout=15.0, quiet=True,
+                update_copy_sql, None, timeout=15.0, quiet=True
             )
-
             forced_failure = None
             if not copy_ok:
                 forced_failure = _pt_request_retry_reason(
-                    f'MT5 action status could not be saved to this investor trade copy: {copy_error}'
+                    'MT5 action status could not be saved to this investor trade copy: '
+                    + str(copy_error)
                 )
                 action_ok = False
                 reason = forced_failure
 
             all_investors_filled, aggregate_reason = _pt_request_aggregate_programme_fill(
-                master_id, tradeid, programme_userid, programme_id,
+                master_id, tradeid, uid, pid,
                 request_status, forced_failure=forced_failure,
             )
             if action_ok:
                 stats['requests_succeeded_for_account'] += 1
             else:
                 stats['requests_retrying'] += 1
-                stats['errors'].append(reason or aggregate_reason or 'Manual request is awaiting MT5 confirmation.')
-
+                stats['errors'].append(
+                    reason or aggregate_reason or 'Manual request is awaiting MT5 confirmation.'
+                )
             if all_investors_filled:
-                print(f"  [REQUEST] ✅ Programme trade magic={tradeid} is filled on all active investor copies.")
+                print(
+                    f"  [REQUEST] ✅ Programme request for master tradeid={tradeid} "
+                    'is filled across all active inherited investor copies.'
+                )
 
     return stats
-
 
 def process_single_investor_from_db(job):
     """
@@ -13672,6 +14194,23 @@ def process_single_investor_from_db(job):
     sub_id = job.get('sub_account_id')
     programme_id = job.get('programme_id')
     programme_name = job.get('programme_name') or ''
+
+    eligible, eligibility_reason = is_active_investor_for_programme(
+        job.get('investor_id'), job.get('sub_account_id'), job.get('programme_id')
+    )
+    if not eligible:
+        print(
+            f"[ELIGIBILITY] SKIPPED investor={job.get('investor_id')} "
+            f"sub={job.get('sub_account_id')} programme={job.get('programme_id')}: "
+            f"{eligibility_reason}"
+        )
+        return {
+            'investor_id': job.get('investor_id'),
+            'sub_account_id': job.get('sub_account_id'),
+            'programme_id': job.get('programme_id'),
+            'success': False,
+            'error': 'inactive_or_unverified_programme_contract',
+        }
 
     print(f"\n[START] ⚙️ Investor {inv_db_id} (sub {sub_id}) | "
           f"programme '{programme_name}' (id={programme_id})")
@@ -13771,18 +14310,12 @@ def process_single_investor_from_db(job):
 
     try:
         # ==================================================================
-        # JOB LIST — pass the parent's job list straight down.
-        #
-        # Previously this was:
-        #     local_ip = get_local_ip()
-        #     _cached_jobs = fetch_vps_investor_jobs(local_ip) if local_ip else []
-        #
-        # But the worker's fetch_vps_investor_jobs() has been observed to
-        # return 0 rows even when the parent's identical call returns 3
-        # (with the same local_ip in both contexts). Rather than chase
-        # that down, we simply reuse the job we were handed. It's already
-        # fully-formed — {investor_id, sub_account_id, programme_id,
-        # programme_name} — which is exactly what every stage wants.
+        # JOB LIST — use the parent's programme-VPS-scoped job unchanged.
+        # The parent discovers programme owner/follower bindings from
+        # programme_vps + active programme_vps_hosts_followers rows, then
+        # discovers actual investor jobs from LIVE pending/running investor
+        # copies in programme_trades. The worker must not broaden that scope
+        # with account-VPS rows or revenue-deal contract-status checks.
         # ==================================================================
         _cached_jobs = [job]
 
@@ -14077,8 +14610,8 @@ def main_loop():
     print("\n" + "=" * 60)
     print("         SIGNALS TRADING — PROGRAMME REQUEST + TRADE ORCHESTRATOR", flush=True)
     print("=" * 60)
-    print("  Magic mapping: subaccount-scoped + setup_group_id/family_number-aware analytics identity")
-    print("  Safety: cross-programme duplicate magic values are excluded from MT5 management")
+    print("  Investor jobs: contract_active programme revenue-deal pairs on programmes hosted by this VPS")
+    print("  Programme authority: explicit manual requests matched by programme tradeid/MT5 magic only")
     print(f"  Loop Mode: {'ENABLED' if run_as_loop else 'DISABLED'}")
     if run_as_loop:
         print(f"  Interval: {loop_interval}s")
